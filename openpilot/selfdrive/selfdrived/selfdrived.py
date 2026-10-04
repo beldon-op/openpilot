@@ -637,6 +637,19 @@ class SelfdriveD:
         if self.use_wide_camera and VisionStreamType.VISION_STREAM_WIDE_ROAD not in available_streams:
           self.sm.ignore_alive.append('wideRoadCameraState')
           self.sm.ignore_valid.append('wideRoadCameraState')
+        if VisionStreamType.VISION_STREAM_DRIVER not in available_streams:
+          # e.g. c3l clone boards without a driver monitoring camera (BYD
+          # device). carrot's selfdrived does not subscribe driverCameraState
+          # (get_camera_packets), so that pair is a no-op here - kept for
+          # parity with the ported sunnypilot fix.
+          self.sm.ignore_alive.append('driverCameraState')
+          self.sm.ignore_valid.append('driverCameraState')
+          # dm2d keeps running (enable_dm gates on started) but never gets a
+          # driver stream, so driverMonitoringState is never published; ignore
+          # it too or selfdrived flags a Communication Issue that blocks
+          # engagement
+          self.sm.ignore_alive.append('driverMonitoringState')
+          self.sm.ignore_valid.append('driverMonitoringState')
 
         if REPLAY and any(ps.controlsAllowed for ps in self.sm['pandaStates']):
           self.state_machine.state = State.enabled
