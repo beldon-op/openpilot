@@ -996,6 +996,17 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
     ET.NO_ENTRY: NoEntryAlert("Controls Mismatch"),
   },
 
+  # BYD M1 firmware capability gate: AlphaLongitudinalEnabled is on but the
+  # flashed panda firmware has no BYD_PARAM_LONGITUDINAL support, so it
+  # rejects the whole 0x32D/E/F stream (safetyTxBlocked watchdog in selfdrived.py).
+  EventName.bydLongFirmwareMissing: {
+    ET.SOFT_DISABLE: SoftDisableAlert("Longitudinal firmware missing"),
+    ET.NO_ENTRY: NoEntryAlert("Reflash the byd panda bin or disable AlphaLongitudinal",
+                              alert_text_1="Longitudinal Firmware Missing"),
+    ET.PERMANENT: NormalPermanentAlert("Longitudinal Firmware Missing",
+                                       "Firmware rejects ACC_CMD - reflash or disable AlphaLongitudinal"),
+  },
+
   # Sometimes the USB stack on the device can get into a bad state
   # causing the connection to the panda to be lost
   EventName.usbError: {

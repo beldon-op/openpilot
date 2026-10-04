@@ -20,3 +20,12 @@ if [ -z "$AGNOS_VERSION" ]; then
 fi
 
 export STAGING_ROOT="/data/safe_staging"
+
+# BYD Song Plus DM-i: the DiPilot camera (MPC) faults with 'check multifunction
+# video controller' when it sees the UDS/isotp firmware-query frames that card
+# broadcasts on the powertrain bus during startup (relayed to bus 2 by the
+# panda while still in elm327 mode). The platform is fixed via the vehicle
+# selection UI (CarSelected3) and CAN auto-match, so the query is unnecessary
+# - skip it entirely. card.py also sets this as a default (the env route alone
+# proved unreliable on this device).
+export SKIP_FW_QUERY=1

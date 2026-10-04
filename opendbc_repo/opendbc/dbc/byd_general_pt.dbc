@@ -1,0 +1,231 @@
+VERSION ""
+
+NS_ :
+	NS_DESC_
+	CM_
+	BA_DEF_
+	BA_
+	VAL_
+	CAT_DEF_
+	CAT_
+	FILTER
+	BA_DEF_DEF_
+	EV_DATA_
+	ENVVAR_DATA_
+	SGTYPE_
+	SGTYPE_VAL_
+	BA_DEF_SGTYPE_
+	BA_SGTYPE_
+	SIG_TYPE_REF_
+	VAL_TABLE_
+	SIG_GROUP_
+	SIG_VALTYPE_
+	SIGTYPE_VALTYPE_
+	BO_TX_BU_
+	BA_DEF_REL_
+	BA_REL_
+	BA_DEF_DEF_REL_
+	BU_SG_REL_
+	BU_EV_REL_
+	BU_BO_REL_
+	SG_MUL_VAL_
+
+BS_:
+
+BU_: XXX
+
+; Message layouts for 287/301/307/578/790/792/813/814/834/884/944/1048 are from
+; byd_han_dmev_2020.dbc, extracted from a working BYD device. 482/508 are the
+; Atto 3 (bukapilot) DiPilot camera layouts, kept for the experimental angle path.
+
+BO_ 287 EPS: 5 XXX
+ SG_ SteeringAngle : 0|16@1- (0.1,0) [-450|450] "" XXX
+ SG_ SteeringAngleRate : 16|8@1+ (4,0) [0|1020] "" XXX
+ SG_ Counter : 32|8@1+ (1,0) [0|255] "" XXX
+
+BO_ 290 WHEEL_SPEED: 8 XXX
+ SG_ WHEELSPEED_FL : 0|16@1+ (0.1,0) [0|65535] "" XXX
+ SG_ WHEELSPEED_FR : 16|16@1+ (0.1,0) [0|65535] "" XXX
+ SG_ WHEELSPEED_BL : 32|16@1+ (0.1,0) [0|65535] "" XXX
+ SG_ WHEELSPEED_BR : 48|16@1+ (0.1,0) [0|65535] "" XXX
+
+BO_ 301 BCM: 8 XXX
+ SG_ FrontLeftDoor : 0|1@0+ (1,0) [0|1] "" XXX
+ SG_ FrontRightDoor : 1|1@0+ (1,0) [0|1] "" XXX
+ SG_ RearLeftDoor : 2|1@0+ (1,0) [0|1] "" XXX
+ SG_ RearRightDoor : 3|1@0+ (1,0) [0|1] "" XXX
+ SG_ BootDoor : 4|1@0+ (1,0) [0|1] "" XXX
+ SG_ DriverSeatBeltFasten : 6|1@0+ (1,0) [0|1] "" XXX
+ SG_ BrakeLight : 8|1@0+ (1,0) [0|1] "" XXX
+
+BO_ 307 STALKS: 8 XXX
+ SG_ LightsOn : 1|1@1+ (1,0) [0|1] "" XXX
+ SG_ LeftIndicator : 4|1@0+ (1,0) [0|1] "" XXX
+ SG_ RightIndicator : 5|1@0+ (1,0) [0|1] "" XXX
+ SG_ TURN_SIGNAL_SWITCH : 36|3@1+ (1,0) [0|7] "" XXX
+ SG_ Heartbeat : 63|4@0+ (1,0) [0|15] "" XXX
+
+BO_ 496 ESP_SPEED: 8 XXX
+ SG_ VehicleSpeed : 32|8@1+ (1,0) [0|255] "km/h" XXX
+
+BO_ 482 STEERING_MODULE_ADAS: 8 XXX
+ SG_ STEER_ANGLE : 24|16@1- (0.1,0) [0|255] "" XXX
+ SG_ COUNTER : 55|4@0+ (1,0) [0|15] "" XXX
+ SG_ CHECKSUM : 56|8@1+ (1,0) [0|255] "" XXX
+ SG_ SET_ME_FF : 47|8@0+ (1,0) [0|255] "" XXX
+ SG_ SET_ME_F : 48|4@1+ (1,0) [0|15] "" XXX
+ SG_ SET_ME_XE : 16|4@1+ (1,0) [0|15] "" XXX
+ SG_ SET_ME_X01 : 8|2@1+ (1,0) [0|3] "" XXX
+ SG_ SET_ME_1_1 : 23|1@0+ (1,0) [0|1] "" XXX
+ SG_ STEER_REQ_ACTIVE_LOW : 20|1@0+ (1,0) [0|1] "" XXX
+ SG_ SET_ME_1_2 : 22|1@0+ (1,0) [0|3] "" XXX
+ SG_ STEER_REQ : 21|1@0+ (1,0) [0|1] "" XXX
+ SG_ UNKNOWN : 7|14@0- (1,0) [0|65535] "" XXX
+
+BO_ 508 STEERING_TORQUE: 8 XXX
+ SG_ MAIN_TORQUE : 0|16@1- (0.1,0) [0|65535] "" XXX
+ SG_ COUNTER : 55|4@0+ (1,0) [0|15] "" XXX
+ SG_ CHECKSUM : 56|8@1+ (1,0) [0|255] "" XXX
+
+BO_ 578 DRIVE_STATE: 8 XXX
+ SG_ ReqThrottle : 30|7@0+ (1,0) [0|127] "" XXX
+ SG_ BrakePressed : 37|1@0+ (1,0) [0|1] "" XXX
+ SG_ Gear : 40|3@1+ (1,0) [0|7] "" XXX
+ SG_ Counter : 55|4@0+ (1,0) [0|15] "" XXX
+ SG_ CheckSum : 56|8@1+ (1,0) [0|255] "" XXX
+
+BO_ 790 ACC_MPC_STATE: 8 XXX
+ SG_ AutoFullBeamState : 3|4@0+ (1,0) [0|1] "" XXX
+ SG_ LeftLaneState : 4|2@1+ (1,0) [0|3] "" XXX
+ SG_ LKAS_Config : 6|2@1+ (1,0) [0|3] "" XXX
+ SG_ SETME2_0x1 : 8|2@1+ (1,0) [0|3] "" XXX
+ SG_ ReqHandsOnSteeringWheel : 10|1@1+ (1,0) [0|1] "" XXX
+ SG_ MPC_State : 11|4@1+ (1,0) [0|1] "" XXX
+ SG_ AutoFullBeam_OnOff : 15|1@0+ (1,0) [0|1] "" XXX
+ SG_ LKAS_Output : 16|11@1- (1,0) [-1024|1023] "" XXX
+ SG_ LKAS_ReqPrepare : 27|1@1+ (1,0) [0|1] "" XXX
+ SG_ LKAS_Active : 28|1@1+ (1,0) [0|3] "" XXX
+ SG_ SETME3_0x0 : 29|1@0+ (1,0) [0|1] "" XXX
+ SG_ TrafficSignRecognition_OnOff : 30|1@0+ (1,0) [0|1] "" XXX
+ SG_ SETME4_0x0 : 31|1@0+ (1,0) [0|1] "" XXX
+ SG_ SETME5_0x1 : 32|2@1+ (1,0) [0|3] "" XXX
+ SG_ RightLaneState : 34|2@1+ (1,0) [0|3] "" XXX
+ SG_ LKAS_State : 36|4@1+ (1,0) [0|3] "" XXX
+ SG_ TrafficSignRecognition_Result : 40|8@1+ (5,-5) [-5|1270] "" XXX
+ SG_ LKAS_AlarmType : 49|2@0+ (1,0) [0|3] "" XXX
+ SG_ SETME7_0x3 : 51|2@0+ (1,0) [0|3] "" XXX
+ SG_ Counter : 52|4@1+ (1,0) [0|15] "" XXX
+ SG_ CheckSum : 56|8@1+ (1,0) [0|255] "" XXX
+
+BO_ 792 ACC_EPS_STATE: 8 XXX
+ SG_ LKAS_Prepared : 0|1@1+ (1,0) [0|1] "" XXX
+ SG_ CruiseActivated : 1|1@1+ (1,0) [0|1] "" XXX
+ SG_ TorqueFailed : 2|1@1+ (1,0) [0|1] "" XXX
+ SG_ SETME1_0x1 : 3|1@1+ (1,0) [0|1] "" XXX
+ SG_ SteerWarning : 4|1@1+ (1,0) [0|1] "" XXX
+ SG_ SteerErrorCode : 5|3@1+ (1,0) [0|1] "" XXX
+ SG_ MainTorque : 8|12@1- (1,0) [-2048|2047] "" XXX
+ SG_ SETME3_0x1 : 20|1@1+ (1,0) [0|1] "" XXX
+ SG_ ReportHandsNotOnSteeringWheel : 21|1@1+ (1,0) [0|1] "" XXX
+ SG_ SETME4_0x3 : 22|2@1+ (1,0) [0|15] "" XXX
+ SG_ SteerDriverTorque : 24|12@1- (1,0) [-2048|2047] "" XXX
+ SG_ SETME5_0xFF : 36|4@1+ (1,0) [0|15] "" XXX
+ SG_ SETME6_0xFFF : 40|12@1+ (1,0) [0|4095] "" XXX
+ SG_ Counter : 52|4@1+ (1,0) [0|15] "" XXX
+ SG_ CheckSum : 56|8@1+ (1,0) [0|255] "" XXX
+
+BO_ 813 ACC_HUD_ADAS: 8 XXX
+ SG_ SetSpeed : 0|9@1+ (0.5,0) [0|255.5] "" XXX
+ SG_ HasLead : 9|1@1+ (1,0) [0|1] "" XXX
+ SG_ SetDistance : 10|3@1+ (1,0) [0|7] "" XXX
+ SG_ LeadingDistance : 13|3@1+ (1,0) [0|7] "" XXX
+ SG_ AEB : 16|1@1+ (1,0) [0|1] "" XXX
+ SG_ FCW : 17|1@1+ (1,0) [0|1] "" XXX
+ SG_ SETME1_0x1 : 18|1@1+ (1,0) [0|1] "" XXX
+ SG_ AccState : 19|3@1+ (1,0) [0|1] "" XXX
+ SG_ AccOn1 : 22|1@0+ (1,0) [0|1] "" XXX
+ SG_ CloseWarning : 23|1@0+ (1,0) [0|1] "" XXX
+ SG_ SETME2_0x1 : 24|1@1+ (1,0) [0|1] "" XXX
+ SG_ Notify : 25|7@1+ (1,0) [0|127] "" XXX
+ SG_ Status : 32|4@1+ (1,0) [0|15] "" XXX
+ SG_ SETME3_0xFFF : 36|12@1+ (1,0) [0|4095] "" XXX
+ SG_ Counter : 48|4@1+ (1,0) [0|15] "" XXX
+ SG_ SETME4_0xF : 55|4@0+ (1,0) [0|15] "" XXX
+ SG_ CheckSum : 56|8@1+ (1,0) [0|255] "" XXX
+
+BO_ 814 ACC_CMD: 8 XXX
+ SG_ AccelCmd : 0|8@1+ (0.05,-5) [-100|155] "" XXX
+ SG_ ComfortBandUpper : 8|8@1+ (0.05,-5) [0|1.26] "" XXX
+ SG_ ComfortBandLower : 16|8@1+ (0.05,-5) [0|1.26] "" XXX
+ SG_ JerkUpperLimit : 24|7@1+ (0.2,0) [0|12.7] "" XXX
+ SG_ SETME1_0x1 : 31|1@0+ (1,0) [0|1] "" XXX
+ SG_ JerkLowerLimit : 32|7@1+ (0.2,-16) [0|12.7] "" XXX
+ SG_ ResumeFromStandstill : 39|1@0+ (1,0) [0|1] "" XXX
+ SG_ StandstillState : 40|1@0+ (1,0) [0|1] "" XXX
+ SG_ BrakeBehaviour : 41|2@1+ (1,0) [0|3] "" XXX
+ SG_ AccReqNotStandstill : 43|1@1+ (1,0) [0|1] "" XXX
+ SG_ AccControlActive : 44|1@0+ (1,0) [0|1] "" XXX
+ SG_ AccOverrideOrStandstill : 45|1@0+ (1,0) [0|1] "" XXX
+ SG_ EspBehaviour : 46|2@1+ (1,0) [0|3] "" XXX
+ SG_ Counter : 48|4@1+ (1,0) [0|15] "" XXX
+ SG_ SETME2_0xF : 55|4@0+ (1,0) [0|15] "" XXX
+ SG_ CheckSum : 56|8@1+ (1,0) [0|255] "" XXX
+
+; 0x32F ACC_AEB heartbeat, byte-verified against the vendor build's TX in
+; route 00000037 (docs_site/op_byd_logs): static payload `05 80 02 0f ff ff`,
+; 4-bit counter in byte 6 low nibble, 0xF constant in byte 6 high nibble,
+; byd_checksum(0xAF) in byte 7. PAYLOAD is little-endian so the parse->pack
+; echo round-trips byte-identical (48-bit Motorola start bit 0 does not).
+BO_ 815 ACC_AEB: 8 XXX
+ SG_ PAYLOAD : 0|48@1+ (1,0) [0|281474976710655] "" XXX
+ SG_ Counter : 48|4@1+ (1,0) [0|15] "" XXX
+ SG_ SETME4_0xF : 52|4@1+ (1,0) [0|15] "" XXX
+ SG_ CheckSum : 56|8@1+ (1,0) [0|255] "" XXX
+
+BO_ 834 PEDAL: 8 XXX
+ SG_ AcceleratorPedal : 0|8@1+ (0.01,0) [0|2.55] "" XXX
+ SG_ BrakePedal : 8|8@1+ (0.01,0) [0|2.55] "" XXX
+ SG_ ForceGeneratorMode : 19|1@1+ (1,0) [0|1] "" XXX
+ SG_ DriveMode : 20|2@1+ (1,0) [0|255] "" XXX
+ SG_ PowerMode : 28|2@1+ (1,0) [0|1] "" XXX
+ SG_ CheckSum : 56|8@1+ (1,0) [0|255] "" XXX
+
+BO_ 884 RADAR_MRR: 8 XXX
+ SG_ TargetID : 1|2@0+ (1,0) [0|3] "" XXX
+ SG_ Type : 7|4@0+ (1,0) [0|15] "" XXX
+ SG_ LatDist : 15|8@0+ (0.1,-12) [0|255] "" XXX
+ SG_ LongDist : 23|8@0+ (1,-100) [0|255] "" XXX
+ SG_ IsValid : 40|1@0+ (1,0) [0|3] "" XXX
+ SG_ Counter : 52|4@1+ (1,0) [0|15] "" XXX
+ SG_ CheckSum : 56|8@1+ (1,0) [0|255] "" XXX
+
+BO_ 944 PCM_BUTTONS: 8 XXX
+ SG_ SETME_1 : 2|1@0+ (1,0) [0|1] "" XXX
+ SG_ BTN_AccUpDown_Cmd : 4|2@0+ (1,0) [0|3] "" XXX
+ SG_ BTN_AccCancel : 6|1@0+ (1,0) [0|1] "" XXX
+ SG_ BTN_TOGGLE_ACC_OnOff : 8|1@0+ (1,0) [0|1] "" XXX
+ SG_ SETME2_1 : 12|1@0+ (1,0) [0|1] "" XXX
+ SG_ BTN_AccDistanceDecrease : 15|1@0+ (1,0) [0|1] "" XXX
+ SG_ BTN_AccDistanceIncrease : 16|1@0+ (1,0) [0|1] "" XXX
+ SG_ Counter : 52|4@1+ (1,0) [0|15] "" XXX
+ SG_ CheckSum : 56|8@1+ (1,0) [0|255] "" XXX
+
+BO_ 1048 BSD_RADAR: 8 XXX
+; NOTE(Song Plus DM-i): VEHICLE_SPEED here is a constant (~8.5) and is NOT the
+; real vehicle speed; use ESP_SPEED (0x1f0) for speed instead.
+ SG_ LEFT_APPROACH : 9|2@0+ (1,0) [0|1] "" XXX
+ SG_ RIGHT_APPROACH : 11|2@0+ (1,0) [0|1] "" XXX
+ SG_ APPROACH : 17|1@0+ (1,0) [0|1] "" XXX
+ SG_ VEHICLE_SPEED : 16|16@1+ (0.1,0) [0|6553.5] "" XXX
+
+VAL_ 578 Gear 4 "D" 3 "N" 2 "R" 1 "P" ;
+VAL_ 790 LKAS_Config 3 "ALARM_AND_LKA" 2 "LKA" 1 "ALARM" 0 "DISABLE" ;
+VAL_ 790 LeftLaneState 0 "GRAY" 1 "GREEN" 2 "YELLOW" 3 "RED" ;
+VAL_ 790 RightLaneState 0 "GRAY" 1 "GREEN" 2 "YELLOW" 3 "RED" ;
+VAL_ 790 LKAS_AlarmType 0 "VIBRATION" 1 "AUDIO" 2 "AUDIO_AND_VIBRATION" ;
+VAL_ 813 SetDistance 4 "4BAR" 3 "3BAR" 2 "2BAR" 1 "1BAR" ;
+VAL_ 813 AccState 0 "OFF" 1 "ACC_ACTIVE" 2 "ACC_ON" 3 "ACC_ACTIVE_HAN" 5 "FORCE_ACCEL" 7 "ERROR" ;
+VAL_ 813 Notify 36 "ACC_ERROR" 22 "OVERRIDE" 12 "ENGAGE" 8 "DISENGAGE" 20 "ACC_ON" 32 "ACC_OFF" 48 "CHECK_GEAR_D" 16 "FORCE_ACCEL" 0 "NONE" ;
+VAL_ 834 DriveMode 2 "SPORT" 1 "ECO" 0 "SNOW" ;
+VAL_ 834 PowerMode 3 "HEV" 2 "FORCE_EV" 1 "EV" ;
+VAL_ 944 BTN_AccUpDown_Cmd 0 "NOTPRESSED" 1 "DOWN_SETSPEED" 3 "UP_RESETSPEED" ;

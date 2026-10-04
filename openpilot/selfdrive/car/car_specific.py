@@ -70,6 +70,9 @@ class CarSpecificEvents:
     elif self.CP.brand == 'nissan':
       events = self.create_common_events(CS, CS_prev, extra_gears=[GearShifter.brake])
 
+    elif self.CP.brand == 'byd':
+      events = self.create_common_events(CS, CS_prev)
+
     elif self.CP.brand == 'chrysler':
       events = self.create_common_events(CS, CS_prev, extra_gears=[GearShifter.low])
 

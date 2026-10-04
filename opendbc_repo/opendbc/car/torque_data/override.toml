@@ -31,6 +31,10 @@ legend = ["LAT_ACCEL_FACTOR", "MAX_LAT_ACCEL_MEASURED", "FRICTION"]
 "FORD_RANGER_MK2" = [nan, 1.5, nan]
 ###
 
+# BYD torque based controller (default path steers via LKAS_Output torque request);
+# values measured on the open BYD device port (Song Plus DM-i)
+"BYD_SONG_PLUS_DMI_22" = [2.5, 2.5, 0.10]
+
 # No steering wheel
 "COMMA_BODY" = [nan, 1000, nan]
 

@@ -53,6 +53,14 @@ MonitoringPolicy = log.DriverMonitoringState.MonitoringPolicy
 
 IGNORED_SAFETY_MODES = (SafetyModel.silent, SafetyModel.noOutput)
 
+# BYD M1 longitudinal firmware capability gate: with AlphaLongitudinalEnabled
+# the controller streams the 0x32D/E/F ACC-domain trio (ACC_HUD_ADAS/ACC_CMD/
+# ACC_AEB) at 50 Hz; panda firmware without the BYD_PARAM_LONGITUDINAL safety
+# param rejects ~150 frames/s while engaged. Latch the watchdog when the
+# rejected-frame delta exceeds this per second (safetyTxBlocked counters are
+# cumulative per panda init, see the resync in update).
+BYD_LONG_FW_BLOCKED_PER_SEC = 60
+
 
 class SelfdriveD:
   def __init__(self, CP=None):
@@ -123,6 +131,11 @@ class SelfdriveD:
     self.CS_prev = car.CarState.new_message()
     self.AM = AlertManager()
     self.events = Events()
+
+    # BYD M1 watchdog state (see BYD_LONG_FW_BLOCKED_PER_SEC above)
+    self.byd_long_fw_blocked = False
+    self._byd_long_blocked_prev = None
+    self._byd_long_blocked_acc = 0
 
     self.initialized = False
     self.enabled = False
@@ -298,8 +311,19 @@ class SelfdriveD:
           self.events.add(EventName.pcmEnable)
 
       # Disable on rising edge of accelerator or brake. Also disable on brake when speed > 0
+      # BYD: the brake is not a disengage. cruiseState.enabled tracks the ACC
+      # main posture (byd carstate), which the brake does not drop - a
+      # pedalPressed here would soft-disable the longitudinal state machine
+      # after 3 s with no rising edge left to recover it, and would take the
+      # lateral down with the session churn the main latch exists to absorb.
+      # Yielding is handled downstream instead: longitudinal via the
+      # controller's session/brake gate; lateral does not yield to the brake
+      # at all (only main-off exits).
+      brake_disables = CS.brakePressed and (not self.CS_prev.brakePressed or not CS.standstill)
+      if self.CP.brand == 'byd':
+        brake_disables = False
       if (CS.gasPressed and not self.CS_prev.gasPressed and self.params.get_bool("DisengageOnAccelerator")) or \
-        (CS.brakePressed and (not self.CS_prev.brakePressed or not CS.standstill)) or \
+        brake_disables or \
         (CS.regenBraking and (not self.CS_prev.regenBraking or not CS.standstill)):
         self.events.add(EventName.pedalPressed)
 
@@ -400,6 +424,25 @@ class SelfdriveD:
 
       if log.PandaState.FaultType.relayMalfunction in pandaState.faults:
         self.events.add(EventName.relayMalfunction)
+
+    # BYD M1: longitudinal firmware capability watchdog - AlphaLongitudinalEnabled on
+    # firmware without the LONGITUDINAL safety param means every 0x32D/E/F frame the
+    # controller transmits is rejected; latch once and keep the driver informed so the
+    # car is never driven believing OP longitudinal is active when it is inert.
+    if (self.CP.brand == "byd" and self.CP.openpilotLongitudinalControl and
+        not REPLAY and self.sm.all_checks(['pandaStates'])):
+      blocked = sum(ps.safetyTxBlocked for ps in self.sm['pandaStates'])
+      # safety re-init (mode/param switch, reflash) resets the counters - resync
+      if self._byd_long_blocked_prev is None or blocked < self._byd_long_blocked_prev:
+        self._byd_long_blocked_prev = blocked
+      self._byd_long_blocked_acc += blocked - self._byd_long_blocked_prev
+      self._byd_long_blocked_prev = blocked
+      if self.sm.frame % int(1.0 / DT_CTRL) == 0:
+        if self._byd_long_blocked_acc > BYD_LONG_FW_BLOCKED_PER_SEC:
+          self.byd_long_fw_blocked = True
+        self._byd_long_blocked_acc = 0
+      if self.byd_long_fw_blocked:
+        self.events.add(EventName.bydLongFirmwareMissing)
 
     # Handle HW and system malfunctions
     # Order is very intentional here. Be careful when modifying this.
