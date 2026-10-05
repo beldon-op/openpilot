@@ -70,6 +70,7 @@ def main():
   with open(path, "a") as f:
     f.write(json.dumps({"t": 0.0, "k": "start", "wall": datetime.now().isoformat(),
                         "topics": sm.services}) + "\n")
+    f.flush()
     while True:
       sm.update(100)
       t = round(time.monotonic() - t0, 3)
