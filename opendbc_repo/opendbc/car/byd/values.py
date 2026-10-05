@@ -133,8 +133,11 @@ class CarControllerParams:
     ANGLE_RATE_LIMIT_DOWN,
   )
 
-  # per-platform nonlinear torque limit fits (the vendor's
-  # NON_LINEAR_TORQUE_PARAMS); ours is the Song Plus DM-i 22 row
+  # coefficients of the vendor's siglin torque-FROM-LATERAL-ACCEL model (NOT a torque limit -
+  # see docs/byd-lateral-vendor-model.md; interface.py wires this into torque_from_lateral_accel).
+  # row = (f1 sigmoid steepness, f2 sigmoid amplitude, f3 left linear gain, f4 speed knee kph,
+  #        f5 left balance factor, f6 right balance multiplier, f7 right linear gain)
+  # ours is the Song Plus DM-i 22 row, verbatim from the vendor's values.py runtime dump
   NON_LINEAR_TORQUE_PARAMS = {
     'BYD_SONG_PLUS_DMI_22': [14.99976405, -0.55974149, 0.09633187, 12.47500536, 2.99999827, 1.49999146, 0.06850084],
   }

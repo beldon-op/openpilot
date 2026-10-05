@@ -1,13 +1,58 @@
-from opendbc.car import get_safety_config, structs
-from opendbc.car.interfaces import CarInterfaceBase
+import math
+
+import numpy as np
+
+from opendbc.car import get_safety_config, get_friction, structs
+from opendbc.car.interfaces import FRICTION_THRESHOLD, CarInterfaceBase
 from opendbc.car.byd.carcontroller import CarController
 from opendbc.car.byd.carstate import CarState
 from opendbc.car.byd.values import HUD_MULTIPLIER, USE_ANGLE_STEERING, BydSafetyFlags, CarControllerParams
 
 
+def sig(val: float) -> float:
+  # vendor byd/interface.py (cp_byd pyarmor_decrypted, interface.py.disasm.txt L183):
+  # clamp to +-700 to keep exp() finite, sigmoid re-centered so sig(0)==0
+  val = max(min(val, 700.0), -700.0)
+  return 1.0 / (1.0 + math.exp(-val)) - 0.5
+
+
+def non_linear_torque(lateral_accel_value: float, v_ego: float,
+                      f1: float, f2: float, f3: float, f4: float, f5: float, f6: float, f7: float) -> float:
+  # vendor L380 (the 9-arg form - non_linear_torque_old at L269 is dead code). Stack-traced
+  # against docs/byd-lateral-vendor-model.md:
+  #   torque = f2 * sig(lat * uf2 * hsf * f1 * hsf * (1 - uf)) + lat * uf2 * v_ego / 10
+  # uf/uf2 are left/right asymmetric: Song Plus computes ~-0.47 left vs +0.42 right at
+  # |lat|=1 m/s2 @ 20 m/s, i.e. a structural pre-compensation for the road-crown pull.
+  unbalanced_factor = f5 if lateral_accel_value < 0 else f5 * f6
+  unbalanced_factor_2 = f3 if lateral_accel_value < 0 else f7
+  # kph ramp 1.0 -> 1.5 across [f4, 2*f4]; with the max(8 m/s) floor the siglin entry passes
+  # in, this is pinned to 1.5 in normal driving (model intentionally frozen below ~29 km/h)
+  high_speed_factor = 1.0 + min(0.5, max(0.0, (v_ego * 3.6 - f4) / f4))
+  sigmoid_term = f2 * sig(lateral_accel_value * unbalanced_factor_2 * high_speed_factor * f1 *
+                          high_speed_factor * (1.0 - unbalanced_factor))
+  linear_term = lateral_accel_value * unbalanced_factor_2 * v_ego / 10.0
+  return sigmoid_term + linear_term
+
+
 class CarInterface(CarInterfaceBase):
   CarState = CarState
   CarController = CarController
+
+  def __init__(self, CP: structs.CarParams):
+    super().__init__(CP)
+    # last lateralControlState seen in apply() - vendor reads it through a module-level
+    # SubMaster on controlsState (interface.py.disasm L1287+); apply() runs every control
+    # loop, so caching here reaches the same value one frame late, without the extra pipe.
+    self._lat_state_is_torque = False
+    self._lat_torque_i = 0.0
+
+  def apply(self, c: structs.CarControl, now_nanos: int | None = None, model_v2=None, radar_state=None) -> tuple[structs.CarControl.Actuators, list]:
+    lat_state = c.actuators.lateralControlState
+    which = lat_state.which()
+    self._lat_state_is_torque = which == 'torqueState'
+    if self._lat_state_is_torque:
+      self._lat_torque_i = float(lat_state.torqueState.i)
+    return super().apply(c, now_nanos, model_v2, radar_state)
 
   @staticmethod
   def _get_params(ret: structs.CarParams, candidate, fingerprint, car_fw, alpha_long, is_release, docs) -> structs.CarParams:
@@ -21,7 +66,14 @@ class CarInterface(CarInterfaceBase):
       ret.steerControlType = structs.CarParams.SteerControlType.torque
       # vendor live carParams (route 00000037): steerActuatorDelay=0.3
       ret.steerActuatorDelay = 0.3
-      CarInterfaceBase.configure_torque_tune(candidate, ret.lateralTuning)
+      # A档 (vendor configure_torque_tune, interface.py.disasm L1953 + L2347):
+      # - 0.1 deg steering-angle deadzone (Song Plus group default; latcontrol_torque converts
+      #   it to a lateral-accel deadzone via the vehicle model every frame)
+      # - ki=0: the vendor lateral PID has NO integrator (kp=kf=1 are already the base defaults).
+      #   Their steady-state trimming is done by the model shaping (B档) and, on top of that,
+      #   the C档 error-enhancer subsystem - not by the loop integrator.
+      CarInterfaceBase.configure_torque_tune(candidate, ret.lateralTuning, steering_angle_deadzone_deg=0.1)
+      ret.lateralTuning.torque.ki = 0.0
     ret.steerLimitTimer = 0.5
 
     ret.radarUnavailable = True
@@ -85,3 +137,61 @@ class CarInterface(CarInterfaceBase):
     # vendor ACCEL_MIN/MAX (base class returns -3.5/2.0; BYD commands down to
     # -4.0 m/s2, see route 37 TX)
     return CarControllerParams.ACCEL_MIN, CarControllerParams.ACCEL_MAX
+
+  # --- B档: vendor siglin lateral model (interface.py.disasm L1556/L1848, see
+  # docs/byd-lateral-vendor-model.md). latcontrol_torque binds CI.torque_from_lateral_accel()
+  # once at startup, so the selector below is the only hook needed. ---
+
+  def torque_from_lateral_accel(self):
+    if self.CP.carFingerprint in CarControllerParams.NON_LINEAR_TORQUE_PARAMS:
+      return self.torque_from_lateral_accel_siglin
+    return super().torque_from_lateral_accel()
+
+  def get_adjusted_lateral_accel(self, lateral_accel_value: float,
+                                 torque_params: structs.CarParams.LateralTorqueTuning,
+                                 steer_mode: bool, roll_compensation: float,
+                                 gravity_adjusted: bool) -> float:
+    # vendor L1218. Two shapers on the commanded lateral accel, applied to every callback
+    # input (setpoint, measurement, and feedforward):
+    # 1) a gain around the latAccelFactor nominal (Song Plus: 2.5 -> exactly 1.0) plus
+    #    +0.3 while the EPS is NOT in an active steering session (their STEER_MODE in (1,2);
+    #    we approximate with the 0x318 CruiseActivated bit - see docs);
+    # 2) a curve taper keyed on the PID integrator log (torqueState.i). With the vendor's
+    #    ki=0 it is always 0 there; keeping it wired means it engages if the user raises ki
+    #    or turns on the NNFF integrator on carrot.
+    adjusted = lateral_accel_value
+    if gravity_adjusted:
+      adjusted += roll_compensation
+    curve_offset = 0.0
+    if self._lat_state_is_torque:
+      curve_offset = float(np.interp(abs(adjusted), [0.0, 0.2], [0.2, 1.0])) * self._lat_torque_i
+    lat_conv_factor = 1.0 - (torque_params.latAccelFactor - 2.5)
+    if not steer_mode:
+      lat_conv_factor += 0.3
+    lat_conv_factor *= (1.0 - curve_offset) if adjusted > 0 else (1.0 + curve_offset)
+    return adjusted * lat_conv_factor
+
+  def torque_from_lateral_accel_siglin(self, latcontrol_inputs, torque_params: structs.CarParams.LateralTorqueTuning,
+                                       lateral_accel_error: float, lateral_accel_deadzone: float,
+                                       friction_compensation: bool, gravity_adjusted: bool) -> float:
+    lateral_accel_value = latcontrol_inputs.lateral_acceleration
+    roll_compensation = latcontrol_inputs.roll_compensation
+    # vendor floors the model speed at 8 m/s (the siglin entry, disasm L110 region): below
+    # ~29 km/h the nonlinear terms stop changing with speed
+    v_ego = max(8.0, latcontrol_inputs.vego)
+    params = CarControllerParams.NON_LINEAR_TORQUE_PARAMS.get(self.CP.carFingerprint)
+    assert params is not None, 'The params are not defined'
+    f1, f2, f3, f4, f5, f6, f7 = params
+    # steer_mode: vendor's STEER_MODE msg (1 Hz) is absent from our dbc - CruiseActivated is
+    # the closest live bit (True == EPS steering == their in(1,2)); default True so a missing
+    # carstate attribute falls back to NO +0.3 boost, matching their in-session behavior
+    steer_mode = bool(getattr(self.CS, "cruise_activated", True))
+    adjusted = self.get_adjusted_lateral_accel(lateral_accel_value, torque_params,
+                                               steer_mode, roll_compensation, gravity_adjusted)
+    steer_torque = non_linear_torque(adjusted, v_ego, f1, f2, f3, f4, f5, f6, f7)
+    # C档 (get_friction_enhanced, L655: BSUC live param, gf slew limiter, error-enhancer PID)
+    # is NOT ported yet - both gravity branches fall back to the vanilla friction curve, which
+    # is exactly what the vendor's get_friction does on non-gravity calls
+    friction = get_friction(lateral_accel_error, lateral_accel_deadzone, FRICTION_THRESHOLD,
+                            torque_params, friction_compensation)
+    return float(steer_torque) + friction
