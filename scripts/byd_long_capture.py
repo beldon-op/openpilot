@@ -28,8 +28,12 @@ from datetime import datetime
 
 from openpilot.cereal import messaging
 
-# BYD CAN ids we care about (bus0 = chassis/control, bus2 = ACC domain)
-CAN_WANT = {0x316, 0x318, 0x32D, 0x32E, 0x32F, 0x3B0, 0x1F0, 0x11F, 0x242, 0x133}
+# BYD CAN ids we care about (bus0 = chassis/control, bus2 = ACC domain).
+# 0x351/2/3 + 0x374 are the vendor radar-track frames (Tang: 849-851 on bus1,
+# Han: 884 on bus2) - recording them settles whether the Song Plus even has a
+# usable lead-track message for a future radar interface.
+CAN_WANT = {0x316, 0x318, 0x32D, 0x32E, 0x32F, 0x3B0, 0x1F0, 0x11F, 0x242, 0x133,
+            0x351, 0x352, 0x353, 0x374}
 SAMPLE_EVERY = 5   # 100 Hz topics -> 20 Hz
 
 def carstate_row(cs):
@@ -43,7 +47,8 @@ def carstate_row(cs):
 def carcontrol_row(cc):
   a = cc.actuators
   return {"en": cc.enabled, "lat": cc.latActive, "lon": cc.longActive,
-          "accel": round(a.accel, 4),
+          "accel": round(a.accel, 4), "jk": round(a.jerk, 4),
+          "atgt": round(a.aTarget, 4), "vtgt": round(a.vTarget, 4) if hasattr(a, "vTarget") else None,
           "lcs": str(a.longControlState),
           "resume": cc.cruiseControl.resume, "cancel": cc.cruiseControl.cancel}
 

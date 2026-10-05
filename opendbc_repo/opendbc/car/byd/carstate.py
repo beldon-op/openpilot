@@ -206,7 +206,14 @@ class CarState(CarStateBase):
     self.counter_pcm_buttons = cp.vl["PCM_BUTTONS"]["Counter"]
 
     stock_acc_on = acc_control_active or acc_state in (2, 3, 5)
-    self.ever_engaged = self.ever_engaged or stock_acc_on
+    # vendor parity (op_byd decompile 2026-10-05): the arm is re-judged EVERY
+    # main-on cycle - main off clears ever_engaged, so an ACC off/on round
+    # trip must show a fresh genuine session before OP arms again. Our old
+    # process-monotonic flag let a stale session arm a later pure-set cycle.
+    if acc_main:
+      self.ever_engaged = self.ever_engaged or stock_acc_on
+    else:
+      self.ever_engaged = False
 
     # cruiseState.enabled = the arm latch: main-on (debounced) + ever engaged.
     # Brake and session drops deliberately do NOT clear it - that is the whole

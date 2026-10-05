@@ -6,8 +6,6 @@ _ACCEL_MIN = CarControllerParams.ACCEL_MIN
 _ACCEL_MAX = CarControllerParams.ACCEL_MAX
 _COMFORT_BAND_UPPER = CarControllerParams.COMFORT_BAND_UPPER
 _COMFORT_BAND_LOWER = CarControllerParams.COMFORT_BAND_LOWER
-_JERK_UPPER = CarControllerParams.JERK_UPPER_LIMIT
-_JERK_LOWER = CarControllerParams.JERK_LOWER_LIMIT
 _MIN_START_ACCEL = CarControllerParams.MIN_START_ACCEL
 
 
@@ -181,24 +179,37 @@ def create_can_steer_command(packer, steer_angle, steer_req, is_standstill, raw_
   return packer.make_can_msg("STEERING_MODULE_ADAS", 0, values)
 
 
-def create_accel_command(packer, accel, enabled, active, resume, radar_acc_msg, raw_cnt):
+def create_accel_command(packer, accel, enabled, active, resume, radar_acc_msg, raw_cnt,
+                         cruise_standstill=False, stopping=False, starting=False,
+                         minimal_brake=False, a_ego=0.0, jerk=0.0):
   """50 Hz, transparent ACC_CMD (814) replacement for OP longitudinal control.
 
-  The stock radar keeps owning the ACC session (its frames on bus 2 stay
-  alive and feed cruiseState), OP re-broadcasts its frame onto bus 0 with the
-  acceleration fields overridden while engaged. Byte template from the vendor
-  build's real TX (route 00000037):
+  Rebuilt to match the vendor op_byd decompile (bydcan.create_accel_command,
+  see docs notes 2026-10-05): the frame is always echoed from the radar's own
+  bus-2 ACC_CMD, and while OP is engaged the acceleration envelope fields are
+  re-derived from the plan every command frame instead of sending fixed jerk
+  constants - that jerk envelope is the vendor's longitudinal smoothness
+  mechanism (the VCU executes our accel *at* the commanded jerk rate).
 
-  - inactive echo: AccelCmd=0.0, ComfortBand=0/0, JerkUpper=0, JerkLower=0,
-    AccControlActive=0, AccReqNotStandstill=1, EspBehaviour=1 (radar standby)
-  - active: AccelCmd=OP accel ([-4, 2] m/s2), ComfortBand 0.1/0.05 only while
-    accel >= 0, JerkUpper 1.0 / JerkLower -0.8 (fixed; vendor derives them
-    from the plan jerk which we do not have), AccControlActive=1
-  - ResumeFromStandstill pulses while long control is starting (never seen in
-    the vendor log - no standstill in route 37 - so it follows the vendor
-    decompile's starting-state handling)
-  - counter free-runs at 50 Hz independent of the radar (verified: the vendor
-    counter walks 0-f continuously across echo/active transitions)
+  Vendor formulae reproduced (radar signal names -> our dbc names):
+    ACCEL_CMD        -> AccelCmd      (0.05,-5 quantization, raw 20..140)
+    ACC_CONTROLLABLE_AND_ON -> AccControlActive
+    ACC_REQ_NOT_STANDSTILL  -> AccReqNotStandstill
+    STANDSTILL_RESUME -> ResumeFromStandstill, STANDSTILL_STATE -> StandstillState,
+    BRAKE_BEHAVIOR -> BrakeBehaviour (0 free / 1 minimal-brake / 2 stopping),
+    ESP_BEHAVIOR -> EspBehaviour, ACC_OVERRIDE_OR_STANDSTILL -> AccOverrideOrStandstill
+
+  - should_send_resume (AND chain, vendor): a resume request only while the
+    car holds a standstill that the radar no longer claims - it bumps the
+    command to max(0.2, accel) to roll from stop.
+  - should_send_standstill: hold-stop bits set only when not resuming and
+    (long controller is stopping or the car reports cruise standstill).
+  - catch-up: deep plan jerk (<=-0.25) while the car decelerates LESS than
+    commanded -> accel = min(accel, 0.2*jerk), a bounded pre-brake.
+  - jerk budget: jerk = min(min(0.3*can_accel, (accel-a_ego)/0.1), plan jerk);
+    envelope upper np.clip(jerk, 1, 12), lower np.clip(jerk, -4, -0.8);
+    stopping overrides to 2 / -4.
+  - minimal_brake (over target speed): accel <= 0 and BrakeBehaviour=1.
   """
   if radar_acc_msg:
     # echo the radar's frame as the base (StandstillState / BrakeBehaviour /
@@ -213,29 +224,55 @@ def create_accel_command(packer, accel, enabled, active, resume, radar_acc_msg, 
     # all-zero control-bits shape from route 37's byte5=0x00 population
     values = {
       "AccelCmd": 0.0, "ComfortBandUpper": 0.0, "ComfortBandLower": 0.0,
-      "JerkUpperLimit": 0.0, "JerkLowerLimit": 0.0, "SETME1_0x1": 1,
-      "ResumeFromStandstill": 0, "StandstillState": 0, "BrakeBehaviour": 0,
+      "SETME1_0x1": 1, "JerkUpperLimit": 0.0, "ResumeFromStandstill": 0,
+      "JerkLowerLimit": 0.0, "StandstillState": 0, "BrakeBehaviour": 0,
       "AccReqNotStandstill": 0, "AccControlActive": 0,
       "AccOverrideOrStandstill": 0, "EspBehaviour": 0,
     }
 
   if enabled and active:
-    standstill = bool(radar_acc_msg.get("StandstillState", 0)) if radar_acc_msg else False
-    accel = float(np.clip(accel, _ACCEL_MIN, _ACCEL_MAX))
-    if resume and standstill:
-      accel = max(accel, _MIN_START_ACCEL)
+    can_accel = float(np.clip(accel, _ACCEL_MIN, _ACCEL_MAX))
+    radar_accel = radar_acc_msg.get("AccelCmd", 0.0) if radar_acc_msg else 0.0
+    radar_standstill_state = bool(radar_acc_msg.get("StandstillState", 0)) if radar_acc_msg else False
+
+    # vendor: jerk-deep + car under-decelerating -> bounded pre-brake
+    if not stopping and not starting and jerk <= -0.25 and (a_ego - can_accel) > 0.2:
+      can_accel = min(can_accel, jerk * 0.2)
+
+    should_send_resume = resume and cruise_standstill and radar_accel > 0 and not radar_standstill_state
+    should_send_standstill = (not should_send_resume) and (stopping or cruise_standstill)
+
+    # vendor jerk budget: never demand a jerk the executed accel can't carry
+    min_jerk = min(can_accel * 0.3, (can_accel - a_ego) / 0.1)
+    jerk = min(min_jerk, jerk)
+    jerk_upper = float(np.clip(jerk, 1, 12))
+    jerk_lower = float(np.clip(jerk, -4, -0.8))
+    if stopping and not should_send_resume:
+      jerk_upper, jerk_lower = 2.0, -4.0
+
+    brake_behavior = 0
+    if not cruise_standstill:
+      if minimal_brake:
+        can_accel = min(can_accel, 0.0)
+        brake_behavior = 1
+      if stopping:
+        brake_behavior = 2
+    if should_send_resume:
+      can_accel = max(_MIN_START_ACCEL, can_accel)
+
     values.update({
-      "AccelCmd": accel,
-      "ComfortBandUpper": _COMFORT_BAND_UPPER if accel >= 0 else 0.0,
-      "ComfortBandLower": _COMFORT_BAND_LOWER if accel >= 0 else 0.0,
-      "JerkUpperLimit": _JERK_UPPER,
-      "JerkLowerLimit": _JERK_LOWER,
+      "AccelCmd": can_accel,
+      "ComfortBandUpper": _COMFORT_BAND_UPPER if can_accel >= 0 else 0.0,
+      "ComfortBandLower": _COMFORT_BAND_LOWER if can_accel >= 0 else 0.0,
+      "JerkUpperLimit": jerk_upper,
+      "JerkLowerLimit": jerk_lower,
       "AccControlActive": 1,
-      "AccReqNotStandstill": 0 if standstill else 1,
-      "AccOverrideOrStandstill": 1 if standstill else 0,
-      "StandstillState": 1 if standstill else 0,
+      "AccReqNotStandstill": 0 if should_send_standstill else 1,
+      "AccOverrideOrStandstill": 1 if should_send_standstill else 0,
+      "StandstillState": 1 if should_send_standstill else 0,
       "EspBehaviour": 1,
-      "ResumeFromStandstill": 1 if resume else 0,
+      "BrakeBehaviour": brake_behavior,
+      "ResumeFromStandstill": 1 if should_send_resume else 0,
     })
 
   values["Counter"] = raw_cnt

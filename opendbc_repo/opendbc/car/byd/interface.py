@@ -63,13 +63,17 @@ class CarInterface(CarInterfaceBase):
     if alpha_long:
       ret.openpilotLongitudinalControl = True
       ret.safetyConfigs[0].safetyParam |= int(BydSafetyFlags.LONGITUDINAL)
-      # vendor interface params (decrypted op_byd interface.py); delay to be
-      # verified on the real car (alignment doc risk note)
-      ret.longitudinalActuatorDelay = 0.5
-      ret.vEgoStarting = 0.3
-      ret.vEgoStopping = 0.2
-      ret.startAccel = 0.4
-      ret.stoppingDecelRate = 0.03
+      # vendor interface params (decrypted op_byd interface.py, 2026-10-05
+      # full-pipeline decompile): the vendor sets these once for ALL BYD with
+      # op-long. longitudinalTuning kp=ki=0 there is a placeholder - carrot's
+      # longcontrol overrides single-BP tuning with params LongTuningKpV/KiV/
+      # Kf, and the vendor manager's defaults (100/0/100 -> kp=1.0, ki=0,
+      # kf=1.0) match carrot's defaults, so effective gains already agree.
+      ret.longitudinalActuatorDelay = 0.4
+      ret.vEgoStarting = 0.2
+      ret.vEgoStopping = 0.03
+      ret.startAccel = 0.5
+      ret.stoppingDecelRate = 0.25
       # the standstill -> go transition must go through LongCtrlState.starting
       # so the controller can pulse ACC_CMD ResumeFromStandstill
       ret.startingState = True

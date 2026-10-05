@@ -307,34 +307,39 @@ class CarController(CarControllerBase):
     Session gate: with the main-on arm latch (carstate) and the panda's
     matching acc_main_on widening, controls_allowed stays up through brake
     cancels and CANCEL standby - permission alone no longer implies a live
-    session. AccControlActive on the radar's own bus-2 frame is the session
-    truth: while it is down (brake cancel / CANCEL / bounce) or the driver is
-    braking, OP re-broadcasts the radar frame verbatim instead of commanding.
-    OP recovers the frame the session comes back (stock auto-resume on brake
-    release, RES after CANCEL) - no state churn, no holes.
+    session. The gate follows the vendor op_byd decompile: the radar's own
+    bus-2 frame must show BOTH AccControlActive AND AccReqNotStandstill -
+    the vendor arms exactly on AccReqNotStandstill ("ACC requesting control,
+    not a standstill hold"), which additionally blocks the standstill-hold
+    frames that the old AccControlActive-only gate let through. While the
+    gate is down (standby / CANCEL / standstill / driver braking) OP
+    re-broadcasts the radar frame verbatim instead of commanding.
 
     The SNG spoofed-RES auto-resume that used to sit next to this method is
     GONE (user decision 2026-10-05: "纵向要激活 ACC 才能控制，设置不应该
-    控制"). It pulsed BTN_AccUpDown=3 ~3.1 s after any OP-engaged standstill
-    (and its lead check was a forced-true placeholder, not a real lead) -
-    with the main-on latch keeping OP engaged through CANCEL, that meant OP
-    ACTIVATED the stock session by itself whenever the driver merely had ACC
-    set (设置): the car took over longitudinal without the driver engaging.
-    Auto-resume after a standstill is now purely the driver's action (stalk
-    RES); within a live session the ACC_CMD ResumeFromStandstill pulse and
-    LongCtrlState.starting remain, because the session there is the driver's.
+    控制"); the vendor gates its own resume injection behind the BYDSnG
+    param, which we deliberately left unimplemented - resuming is the
+    driver's stalk action.
 
-    Continuity: the frame we transmit (our ramped accel, or the echoed radar
-    AccelCmd while yielding) is tracked in accel_cmd_sent and every commanded
-    value is slew-limited from it, so session blips hand OP->radar->OP without
-    an accel step - the previous hard switch was one source of the
-    "一直在加油刹车" feel."""
+    Vendor command pipeline (see bydcan.create_accel_command): the plan jerk
+    (CC.actuators.jerk, carrot publishes it from long_plan.jTargetNow) drives
+    the JerkUpper/Lower envelope, the pre-brake catch-up, the minimal-brake
+    behavior bit and the standstill/resume bits. Continuity across the
+    gate's yields is kept by accel_cmd_sent: the slew limit ramps from the
+    value actually decoded back off our own wire."""
     if self.frame % 2 == 0:
       raw_cnt = (self.frame // 2) % 16
-      # resume pulse while long control is starting (standstill -> go)
-      resume = CC.actuators.longControlState == LongCtrlState.starting
-      session_active = bool(CS.radar_acc_msg.get("AccControlActive", 0))
+      lcs = CC.actuators.longControlState
+      stopping = lcs == LongCtrlState.stopping
+      starting = lcs == LongCtrlState.starting
+      resume = CC.cruiseControl.resume or starting
+      radar = CS.radar_acc_msg
+      session_active = bool(radar.get("AccControlActive", 0)) and \
+        bool(radar.get("AccReqNotStandstill", 0))
       long_active = CC.longActive and not CS.out.brakePressed and session_active
+      # vendor: over the set speed (cluster scale) -> ask the VCU for at most
+      # a coast/brake and raise the minimal-brake behavior bit
+      minimal_brake = bool(CS.out.vEgoCluster >= CS.out.cruiseState.speed and CS.out.vEgoCluster > 2.5)
 
       if long_active:
         demand = CC.actuators.accel
@@ -351,21 +356,19 @@ class CarController(CarControllerBase):
         lo = self.accel_cmd_sent - ACCEL_SLEW_DOWN * 0.02
         hi = self.accel_cmd_sent + ACCEL_SLEW_UP * 0.02
         accel = max(lo, min(hi, demand))
-        # mirror the two overrides create_accel_command will apply, so the
-        # tracking stays honest (the standstill-start bump is deliberately
-        # NOT slewed: it must step to clear the hold)
-        accel = min(max(accel, CarControllerParams.ACCEL_MIN), CarControllerParams.ACCEL_MAX)
-        if resume and bool(CS.radar_acc_msg.get("StandstillState", 0)):
-          accel = max(accel, CarControllerParams.MIN_START_ACCEL)
-        self.accel_cmd_sent = accel
       else:
         # echo path: transmit the radar's own frame unchanged
-        accel = CS.radar_acc_msg.get("AccelCmd", 0.0) if CS.radar_acc_msg else 0.0
-        self.accel_cmd_sent = float(accel)
+        accel = radar.get("AccelCmd", 0.0) if radar else 0.0
 
-      can_sends.append(bydcan.create_accel_command(
-        self.packer, accel, CC.enabled, long_active, resume,
-        CS.radar_acc_msg, raw_cnt))
+      sent = bydcan.create_accel_command(
+        self.packer, accel, CC.enabled, long_active, resume, radar, raw_cnt,
+        cruise_standstill=bool(CS.out.cruiseState.standstill), stopping=stopping,
+        starting=starting, minimal_brake=minimal_brake, a_ego=CS.out.aEgo,
+        jerk=CC.actuators.jerk)
+      can_sends.append(sent)
+      # the exact value the VCU will act on (post shaping + 0.05/-5
+      # quantization, read back from our own frame) is the ramp reference
+      self.accel_cmd_sent = float(sent[1][0]) * 0.05 - 5.0
       if CS.adas_msg:
         can_sends.append(bydcan.create_acc_hud_command(self.packer, CS.adas_msg, raw_cnt))
       if CS.aeb_msg:
