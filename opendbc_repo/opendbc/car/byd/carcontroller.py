@@ -42,6 +42,9 @@ class CarController(CarControllerBase):
     # 0x32E (m/s^2, OP units) - the reference the slew limiter ramps from so
     # OP<->radar handovers are continuous, not stepped
     self.accel_cmd_sent = 0.0
+    # minimal-brake (over set speed) latch, hysteresis state - see
+    # _update_longitudinal (the bare threshold chatters on cluster noise)
+    self.min_brake_latched = False
 
   def _update_torque_lateral(self, CC, CS):
     """Default torque path: steer via the LKAS_Output request in ACC_MPC_STATE (790).
@@ -338,8 +341,19 @@ class CarController(CarControllerBase):
         bool(radar.get("AccReqNotStandstill", 0))
       long_active = CC.longActive and not CS.out.brakePressed and session_active
       # vendor: over the set speed (cluster scale) -> ask the VCU for at most
-      # a coast/brake and raise the minimal-brake behavior bit
-      minimal_brake = bool(CS.out.vEgoCluster >= CS.out.cruiseState.speed and CS.out.vEgoCluster > 2.5)
+      # a coast/brake and raise the minimal-brake behavior bit. Latched with
+      # hysteresis: the 2026-10-05 second drive (1154-1187 s) showed the bare
+      # threshold chattering on 0.1-0.2 m/s cluster noise right at the cruise
+      # target, and the old post-slew clamp snapped the wire between the
+      # demand and 0.00 at ~2 Hz - the sustained 忽加忽刹 sawtooth. ±0.15
+      # deadband spreads the cycle out; the clamp below is ramped by the slew.
+      MB_ON, MB_OFF = 0.15, 0.15
+      if self.min_brake_latched:
+        if CS.out.vEgoCluster <= CS.out.cruiseState.speed - MB_OFF or CS.out.vEgoCluster <= 2.5:
+          self.min_brake_latched = False
+      elif CS.out.vEgoCluster >= CS.out.cruiseState.speed + MB_ON and CS.out.vEgoCluster > 2.5:
+        self.min_brake_latched = True
+      minimal_brake = self.min_brake_latched
 
       if long_active:
         demand = CC.actuators.accel
@@ -350,6 +364,12 @@ class CarController(CarControllerBase):
         # 往上加". Until SetSpeed lands (1-2 s later in every trace) command
         # hold-or-brake only; the positive half of our accel is clamped.
         if int(CS.adas_msg.get("SetSpeed", 0) if CS.adas_msg else 0) == 0:
+          demand = min(demand, 0.0)
+        # minimal-brake accel clamp lives HERE (ahead of the slew), not in
+        # create_accel_command: crossing the set speed must ramp the demand
+        # to coast/brake, not snap it there - bydcan still raises the
+        # BrakeBehaviour=1 behavior bit from the same latched flag.
+        if minimal_brake:
           demand = min(demand, 0.0)
         # vendor pre-brake catch-up, applied to the DEMAND so the slew limit
         # below ramps it instead of stepping it (bydcan once did this after

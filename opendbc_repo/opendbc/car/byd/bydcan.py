@@ -210,7 +210,8 @@ def create_accel_command(packer, accel, enabled, active, resume, radar_acc_msg, 
   - jerk budget: jerk = min(min(0.3*can_accel, (accel-a_ego)/0.1), plan jerk);
     envelope upper np.clip(jerk, 1, 12), lower np.clip(jerk, -4, -0.8);
     stopping overrides to 2 / -4.
-  - minimal_brake (over target speed): accel <= 0 and BrakeBehaviour=1.
+  - minimal_brake (over target speed): BrakeBehaviour=1 (the accel
+    floor clamp is applied by the caller ahead of the slew limiter).
   """
   if radar_acc_msg:
     # echo the radar's frame as the base (StandstillState / BrakeBehaviour /
@@ -256,7 +257,8 @@ def create_accel_command(packer, accel, enabled, active, resume, radar_acc_msg, 
     brake_behavior = 0
     if not cruise_standstill:
       if minimal_brake:
-        can_accel = min(can_accel, 0.0)
+        # accel floor clamp (demand -> <=0) moved to carcontroller, ahead of
+        # the slew limiter - here we only raise the vendor behavior bit
         brake_behavior = 1
       if stopping:
         brake_behavior = 2

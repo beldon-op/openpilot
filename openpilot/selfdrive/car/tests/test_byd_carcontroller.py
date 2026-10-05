@@ -199,6 +199,23 @@ class TestBydLongitudinalVendorPipeline:
     assert f["accel"] <= 0.0 + 1e-9
     assert f["brake_behavior"] == 1
 
+  def test_minimal_brake_threshold_chatter_does_not_sawtooth(self):
+    # 2026-10-05 second drive 1154-1187 s: cluster speed chattering across the
+    # bare set-speed threshold made the (post-slew) min(accel, 0) clamp snap
+    # the wire between the demand and 0.00 at ~2 Hz for 30 s straight - the
+    # sustained 忽加忽刹. Now latched with a ±0.15 deadband and the clamp is
+    # ahead of the slew, so the wire can only breathe at the slew rate.
+    c = make_controller()
+    cs = make_cs(active=True, accel=0.0)
+    cs.out.cruiseState.speed = 8.3
+    prev = None
+    for i in range(60):
+      cs.out.vEgoCluster = 8.5 if i % 4 < 2 else 8.1   # chatter over the deadband
+      f = step(make_cc(accel=0.25), cs, c)
+      if prev is not None:
+        assert abs(f["accel"] - prev) <= 0.055, f"minimal-brake stepped {prev} -> {f['accel']} @i={i}"
+      prev = f["accel"]
+
   def test_jerk_sign_noise_does_not_step_the_wire(self):
     # 2026-10-05 roadtest root cause of the 顿挫: plan jerk dipped to -0.5
     # while accel sat positive and DM-i aEgo overshot the command - the
