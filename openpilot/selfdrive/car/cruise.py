@@ -384,7 +384,27 @@ class VCruiseCarrot:
         self.v_cruise_kph = np.clip(v_cruise_kph, self._cruise_speed_min, self._cruise_speed_max)
         self.v_cruise_cluster_kph = self.v_cruise_kph
       else:
-        if self.speed_from_pcm == 1:
+        if self.CP.brand == "byd":
+          # BYD stalk-owned target (Song Plus DM-i, real-car bug 2026-10-05:
+          # Experimental + AlphaLong never accelerated, speed pinned at ~35).
+          # BYD is pcmCruise=True (byd/interface.py:38) and the SpeedFromPCM
+          # default is 2 (params_keys.h:378), which drops into the clip(...,30)
+          # virtual branch below - but BYD CarState emits no buttonEvents
+          # (byd/carstate.py only caches PCM_BUTTONS for the RES spoof), so
+          # nothing can ever raise that virtual number and the long plan never
+          # commands positive accel. The number the driver CAN change is the
+          # stalk's radar SetSpeed, which the port already mirrors into
+          # cruiseState.speed/speedCluster (byd/carstate.py:188-198, "no
+          # artificial 30 floor"), so sync it directly (speed_from_pcm==1
+          # semantics) gated by brand instead of asking users to know the
+          # hidden param. Zero-hold: main-on frames can carry SetSpeed==0 for
+          # the first 1-2 s of a session (byd/carcontroller.py:339-346, routes
+          # 31/2d) - keep the last real target through the blip instead of
+          # commanding a deceleration to zero.
+          if CS.cruiseState.speed > 0:
+            self.v_cruise_kph = CS.cruiseState.speed * CV.MS_TO_KPH
+            self.v_cruise_cluster_kph = CS.cruiseState.speedCluster * CV.MS_TO_KPH
+        elif self.speed_from_pcm == 1:
           self.v_cruise_kph = CS.cruiseState.speed * CV.MS_TO_KPH
           self.v_cruise_cluster_kph = CS.cruiseState.speedCluster * CV.MS_TO_KPH
         else:
