@@ -205,7 +205,8 @@ def create_accel_command(packer, accel, enabled, active, resume, radar_acc_msg, 
   - should_send_standstill: hold-stop bits set only when not resuming and
     (long controller is stopping or the car reports cruise standstill).
   - catch-up: deep plan jerk (<=-0.25) while the car decelerates LESS than
-    commanded -> accel = min(accel, 0.2*jerk), a bounded pre-brake.
+    commanded -> accel = min(accel, 0.2*jerk), a bounded pre-brake - applied
+    by the caller BEFORE the slew limiter (carcontroller), not here.
   - jerk budget: jerk = min(min(0.3*can_accel, (accel-a_ego)/0.1), plan jerk);
     envelope upper np.clip(jerk, 1, 12), lower np.clip(jerk, -4, -0.8);
     stopping overrides to 2 / -4.
@@ -235,9 +236,11 @@ def create_accel_command(packer, accel, enabled, active, resume, radar_acc_msg, 
     radar_accel = radar_acc_msg.get("AccelCmd", 0.0) if radar_acc_msg else 0.0
     radar_standstill_state = bool(radar_acc_msg.get("StandstillState", 0)) if radar_acc_msg else False
 
-    # vendor: jerk-deep + car under-decelerating -> bounded pre-brake
-    if not stopping and not starting and jerk <= -0.25 and (a_ego - can_accel) > 0.2:
-      can_accel = min(can_accel, jerk * 0.2)
+    # vendor pre-brake catch-up (jerk-deep + car under-decelerating ->
+    # accel = min(accel, 0.2*jerk)) MOVED to carcontroller._update_longitudinal,
+    # ahead of the slew limiter, guarded by demand <= 0. The 2026-10-05
+    # roadtest proved why: applied here it ran AFTER the slew and could step
+    # the wire ±1 m/s^2 in one frame on carrot jerk sign noise.
 
     should_send_resume = resume and cruise_standstill and radar_accel > 0 and not radar_standstill_state
     should_send_standstill = (not should_send_resume) and (stopping or cruise_standstill)

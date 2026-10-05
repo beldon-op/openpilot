@@ -78,6 +78,7 @@ def main():
   t0 = time.monotonic()
 
   def build_rows():
+    nonlocal prev_enabled, prev_events
     rows = []
     if sm.updated["can"]:
       for ce in sm["can"]:

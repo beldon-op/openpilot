@@ -351,6 +351,20 @@ class CarController(CarControllerBase):
         # hold-or-brake only; the positive half of our accel is clamped.
         if int(CS.adas_msg.get("SetSpeed", 0) if CS.adas_msg else 0) == 0:
           demand = min(demand, 0.0)
+        # vendor pre-brake catch-up, applied to the DEMAND so the slew limit
+        # below ramps it instead of stepping it (bydcan once did this after
+        # shaping - the 2026-10-05 roadtest showed why: carrot's plan jerk
+        # (jTargetNow) dips below -0.25 on ordinary sign noise, and a moment
+        # of powertrain aEgo overshoot then slammed the wire from +0.95 to
+        # -0.10 in one frame, ~22 times per 90 s of following - the 顿挫
+        # complaint). The guard demand <= 0.0 keeps the vendor's own shape:
+        # its planner only ever emits deep negative jerk while already
+        # commanding deceleration; a positive accel + negative jerk pair is
+        # carrot model jitter, not an under-deceleration to punish.
+        jerk_cmd = CC.actuators.jerk
+        if (not stopping and not starting and jerk_cmd <= -0.25 and demand <= 0.0 and
+                CS.out.aEgo - demand > 0.2):
+          demand = min(demand, 0.2 * jerk_cmd)
         # slew limit against what is actually on the wire (which, through a
         # yield, was the radar's own command) - see ACCEL_SLEW_* above
         lo = self.accel_cmd_sent - ACCEL_SLEW_DOWN * 0.02

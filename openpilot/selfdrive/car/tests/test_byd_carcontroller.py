@@ -199,6 +199,43 @@ class TestBydLongitudinalVendorPipeline:
     assert f["accel"] <= 0.0 + 1e-9
     assert f["brake_behavior"] == 1
 
+  def test_jerk_sign_noise_does_not_step_the_wire(self):
+    # 2026-10-05 roadtest root cause of the 顿挫: plan jerk dipped to -0.5
+    # while accel sat positive and DM-i aEgo overshot the command - the
+    # catch-up (then living in bydcan, AFTER the slew limiter) slammed the
+    # wire from +0.95 to -0.10 in ONE frame, ~22 times in 90 s of following.
+    # Moved ahead of the slew and gated on demand <= 0, a positive demand
+    # must never be jerked negative in one step.
+    c = make_controller()
+    cs = make_cs(active=True, accel=0.0)
+    cs.out.aEgo = 0.0
+    for _ in range(40):                      # steady positive cruise
+      step(make_cc(accel=0.95, jerk=0.5), cs, c)
+    prev = c.accel_cmd_sent
+    assert prev == pytest.approx(0.95, abs=0.06)
+    cs.out.aEgo = 1.3                        # powertrain overshoot +0.35
+    for _ in range(5):
+      f = step(make_cc(accel=0.95, jerk=-0.5), cs, c)
+      assert f["accel"] > 0.7, f"catch-up stepped the wire: {f['accel']}"
+
+  def test_true_undershoot_pre_brake_now_ramps(self):
+    # the vendor's intent survives: a genuinely decelerating plan (demand
+    # <= 0, jerk <= -0.25) under-executed by the car still tightens toward
+    # 0.2*jerk - but through the slew, not as a step
+    c = make_controller()
+    cs = make_cs(active=True, accel=0.0)
+    cs.out.aEgo = 0.0
+    for _ in range(30):
+      step(make_cc(accel=-0.1, jerk=-0.1), cs, c)
+    prev = c.accel_cmd_sent
+    cs.out.aEgo = 0.15                       # aEgo - demand = 0.25 > 0.2
+    max_step = max(ACCEL_SLEW_UP * DT_CMD, 0.05) + 1e-9
+    for _ in range(30):                      # floor 0.2*jerk = -0.2
+      f = step(make_cc(accel=-0.1, jerk=-1.0), cs, c)
+      assert abs(f["accel"] - prev) <= max_step, f"pre-brake stepped: {prev} -> {f['accel']}"
+      prev = f["accel"]
+    assert c.accel_cmd_sent == pytest.approx(-0.2, abs=0.06)
+
   def test_resume_bump_needs_the_vendor_and_chain(self):
     c = make_controller()
     # resume only pulses when the car holds a standstill the radar has
