@@ -91,9 +91,30 @@ class DeviceLayout(Widget):
                                                      option_font_weight=FontWeight.UNIFONT, callback=handle_language_selection)
     gui_app.push_widget(self._select_language_dialog)
 
+  def _is_byd_selected(self) -> bool:
+    # text-level brand check, same sources the UI shows the car from
+    # (CarSelected3 label / CarName). Server-side twin: current_vehicle_brand()
+    # in carrot/server/services/settings.py decodes CarParamsPersistent.brand.
+    car_sel = (self._params.get("CarSelected3") or b"").decode(errors="ignore").lower()
+    car_name = (self._params.get("CarName") or b"").decode(errors="ignore").lower()
+    return "byd" in car_sel or car_name.startswith("byd")
+
   def _reset_calibration_prompt(self):
     if ui_state.engaged:
       gui_app.push_widget(alert_dialog(tr("Disengage to Reset Calibration")))
+      return
+
+    # BYD: openpilot owns the EPS's only 0x316 LKAS stream (the camera's own
+    # frame is blocked bus2->bus0 by the panda fwd hook). OnroadCycleRequested
+    # below stops card for seconds (hardwared started=False cycle), which
+    # starves the EPS while the car is powered and latches 0x318 TorqueFailed -
+    # 'LKAS Fault: Restart the car to engage' until an ignition power cycle
+    # (byd/carcontroller.py update() comment, byd/carstate.py:264). Offroad the
+    # only_onroad daemons (calibrationd/torqued/card) are already stopped, so
+    # a plain param removal is enough and takes effect at the next ignition.
+    byd = self._is_byd_selected()
+    if byd and ui_state.started:
+      gui_app.push_widget(alert_dialog(tr("Turn off the car to reset calibration.\nBYD's EPS latches an LKAS fault if openpilot restarts while powered.")))
       return
 
     def reset_calibration(result: DialogResult):
@@ -106,7 +127,8 @@ class DeviceLayout(Widget):
       self._params.remove("LiveParameters")
       self._params.remove("LiveParametersV2")
       self._params.remove("LiveDelay")
-      self._params.put_bool("OnroadCycleRequested", True)
+      if not byd:
+        self._params.put_bool("OnroadCycleRequested", True)
       self._update_calib_description()
 
     dialog = ConfirmDialog(tr("Are you sure you want to reset calibration?"), tr("Reset"), callback=reset_calibration)

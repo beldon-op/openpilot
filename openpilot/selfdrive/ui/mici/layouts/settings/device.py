@@ -304,7 +304,14 @@ class DeviceLayoutMici(NavScroller):
       params.remove("LiveParameters")
       params.remove("LiveParametersV2")
       params.remove("LiveDelay")
-      params.put_bool("OnroadCycleRequested", True)
+      # BYD: cycling the onroad daemons stops card, and with it the 0x316 LKAS
+      # stream the EPS depends on as its only source - the gap latches
+      # 0x318 TorqueFailed ('LKAS Fault: Restart the car to engage'). Skip the
+      # cycle for BYD (see tici twin in ui/layouts/settings/device.py).
+      car_sel = (params.get("CarSelected3") or b"").decode(errors="ignore").lower()
+      car_name = (params.get("CarName") or b"").decode(errors="ignore").lower()
+      if not ("byd" in car_sel or car_name.startswith("byd")):
+        params.put_bool("OnroadCycleRequested", True)
 
     def uninstall_openpilot_callback():
       ui_state.params.put_bool("DoUninstall", True)

@@ -16,7 +16,7 @@ from ..services.device_info import (
   refresh_device_network,
 )
 from ..services.params import HAS_PARAMS, Params, restore_param_values_validated
-from ..services.settings import get_settings_cached
+from ..services.settings import current_vehicle_brand, get_settings_cached
 from ..services.time_sync import TIME_SYNC_DEBUG_DEFAULT, sync_system_time_from_browser
 
 
@@ -291,6 +291,31 @@ async def api_recalibrate(request: web.Request) -> web.Response:
     return web.json_response({"ok": False, "error": "params unavailable"}, status=500)
   try:
     params = Params()
+    # BYD (Song Plus DM-i): openpilot is the EPS's only 0x316 LKAS stream - the
+    # stock camera's frame is blocked bus2->bus0 by the panda fwd hook
+    # (safety_byd.h byd_fwd_hook). DoReboot below is a ~40-90 s device outage
+    # with ignition still on (manager.py:251,285) and OnroadCycleRequested still
+    # drops card for seconds (hardwared forces started=False, manager stops the
+    # only_onroad set incl. card, process_config.py:164-169). Either gap starves
+    # the EPS LKAS subsystem and it latches 0x318 TorqueFailed - which reaches
+    # the driver as 'LKAS Fault: Restart the car to engage'
+    # (steerUnavailable/permanent, events.py:1046 via car_specific.py:281,
+    # byd/carstate.py:264) and only an ignition power cycle clears it. Observed
+    # on the 2026-10-05 Song drive: the first web recalibrate latched exactly
+    # that alert. So for BYD: refuse while the car is powered, and offroad just
+    # remove the params - calibrationd/torqued/card are only_onroad and reload
+    # them fresh at the next ignition anyway, so no cycle and no reboot are
+    # needed (and they would be the hazard). Other brands: behavior unchanged.
+    if current_vehicle_brand(params) == "byd":
+      if params.get_bool("IsOnroad"):
+        return web.json_response({"ok": False, "error": "BYD: reset calibration with car off - restarting openpilot latches an EPS LKAS fault."}, status=409)
+      for key in ("CalibrationParams", "LiveTorqueParameters",
+                  "LiveParameters", "LiveParametersV2", "LiveDelay"):
+        try:
+          params.remove(key)
+        except Exception:
+          pass
+      return web.json_response({"ok": True, "notice": "BYD: calibration reset - recalibration restarts at the next ignition."})
     for key in ("CalibrationParams", "LiveTorqueParameters",
                 "LiveParameters", "LiveParametersV2", "LiveDelay"):
       try:
