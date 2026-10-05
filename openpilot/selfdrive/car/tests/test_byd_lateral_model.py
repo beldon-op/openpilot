@@ -162,3 +162,29 @@ class TestBydSiglinEndToEnd:
     # same arity the latcontrol calls it with
     out = cb(LatControlInputs(1.0, 0.0, 20.0, 0.0), torque_params(), 0.0, 0.0, True, False)
     assert isinstance(out, float)
+
+
+class TestBydApplyNeverRaises:
+  """Regression: the first ship of the siglin port read c.actuators.lateralControlState,
+  which does not exist in the carrot CarControl schema. apply() raised every frame, card
+  died, the 0x316 gap latched EPS LKAS Fault. BYD hard rule: apply() is crash-free on any
+  CC (bare or fully populated), and the curve path degrades to inert instead."""
+
+  @pytest.fixture
+  def real_ci(self):
+    ret = structs.CarParams.new_message()
+    ret.carFingerprint = str(CAR.BYD_SONG_PLUS_DMI_22)
+    CarInterface._get_params(ret, CAR.BYD_SONG_PLUS_DMI_22, {}, [], False, True, False)
+    return CarInterface(ret)
+
+  def test_apply_bare_cc_does_not_raise(self, real_ci):
+    # the production CC reaches apply() as a reader (carcontroller line 426 requires it)
+    cc = structs.CarControl.new_message().as_reader()
+    real_ci.apply(cc)  # must not throw
+    assert real_ci._lat_state_is_torque is False  # no msgq under test shim -> inert
+
+  def test_siglin_survives_inert_cache(self, real_ci):
+    cb = real_ci.torque_from_lateral_accel()
+    tune = real_ci.CP.lateralTuning.torque
+    out = cb(LatControlInputs(0.5, 0.0, 15.0, 0.0), tune, 0.0, 0.0, True, True)
+    assert out == pytest.approx(0.5, rel=0.0, abs=1.0)  # sane finite torque, no crash

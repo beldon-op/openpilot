@@ -34,24 +34,55 @@ def non_linear_torque(lateral_accel_value: float, v_ego: float,
   return sigmoid_term + linear_term
 
 
+_lats_sm = None
+
+
+def _read_lat_state() -> tuple[bool, float]:
+  # vendor equivalent: module-level sm = SubMaster(...) on 'controlsState', read via
+  # sm['controlsState'].lateralControlState (disasm L1287+). Returns (is_torqueState, i).
+  # Any failure mode (no msgq, first frame, schema drift) must degrade to (False, 0.0) -
+  # the curve term goes inert, the model keeps steering.
+  global _lats_sm
+  if _lats_sm is None:
+    try:
+      from cereal.messaging import SubMaster
+      _lats_sm = SubMaster(['controlsState'])
+    except Exception:
+      _lats_sm = False
+  if not _lats_sm:
+    return False, 0.0
+  try:
+    _lats_sm.update(0)
+    lat_state = _lats_sm['controlsState'].lateralControlState
+    if lat_state.which() == 'torqueState':
+      return True, float(lat_state.torqueState.i)
+  except Exception:
+    pass
+  return False, 0.0
+
+
 class CarInterface(CarInterfaceBase):
   CarState = CarState
   CarController = CarController
 
   def __init__(self, CP: structs.CarParams):
     super().__init__(CP)
-    # last lateralControlState seen in apply() - vendor reads it through a module-level
-    # SubMaster on controlsState (interface.py.disasm L1287+); apply() runs every control
-    # loop, so caching here reaches the same value one frame late, without the extra pipe.
+    # curve term inputs, refreshed once per loop in apply() (see _read_lat_state):
+    # the carrot CarControl schema has NO actuators.lateralControlState - the vendor
+    # reaches the lateral torque state through a SubMaster on controlsState (disasm
+    # L1287+), we do the same. Cached here so the siglin callback stays allocation-free
+    # (it runs several times per frame) and so tests can drive it directly.
     self._lat_state_is_torque = False
     self._lat_torque_i = 0.0
 
   def apply(self, c: structs.CarControl, now_nanos: int | None = None, model_v2=None, radar_state=None) -> tuple[structs.CarControl.Actuators, list]:
-    lat_state = c.actuators.lateralControlState
-    which = lat_state.which()
-    self._lat_state_is_torque = which == 'torqueState'
-    if self._lat_state_is_torque:
-      self._lat_torque_i = float(lat_state.torqueState.i)
+    # ABSOLUTE rule on BYD: apply()/card must never raise - a gap in the 0x316 stream
+    # latches EPS TorqueFailed until the next ignition cycle. Everything below is soft.
+    try:
+      self._lat_state_is_torque, self._lat_torque_i = _read_lat_state()
+    except Exception:
+      self._lat_state_is_torque = False
+      self._lat_torque_i = 0.0
     return super().apply(c, now_nanos, model_v2, radar_state)
 
   @staticmethod

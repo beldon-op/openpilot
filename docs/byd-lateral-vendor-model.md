@@ -110,8 +110,17 @@ angle 控制路（Atto3 系 13 车型组）、`BYD_TORQUE_WITH_FACTOR`（Song Pl
 4. `cruise_activated` 翻转瞬间（EPS 接受会话）：期望值 ×1.3→×1.0 是否有可感台阶——若有，考虑 steer_mode 映射换成带滞回的版本；
 5. 对照采集：`byd_long_capture.py` 已在录 CS/CC——加测 lateral 字段（torqueState desired/actual 已有）。
 
+## 事故记录（2026-10-05 首发即锁 EPS）
+
+初版把 vendor 的 `sm['controlsState'].lateralControlState` 翻译成了 `c.actuators.lateralControlState`
+缓存——**carrot 的 CarControl schema 没有这个字段**（capnp 报 no such member，只有 longControlState），
+`apply()` 每帧 AttributeError → card 断流 → 0x316 缺口 → EPS 锁 LKAS Fault（正是 BYD 已知的"断流即锁"红线）。
+修复：`_read_lat_state()` 用惰性 SubMaster(['controlsState']) 读上一帧（vendor 同源做法），
+且 apply 里整段 try/except——**BYD 上 apply/card 路径永不抛异常是硬规则**，曲线项最坏退化为恒定 0。
+回归测试：`TestBydApplyNeverRaises`。
+
 ## 本仓库改动索引
 
-- `opendbc/car/byd/interface.py`：A 档两参 + B 档全栈（sig/non_linear_torque/siglin/get_adjusted_lateral_accel/apply 缓存）
+- `opendbc/car/byd/interface.py`：A 档两参 + B 档全栈（sig/non_linear_torque/siglin/get_adjusted_lateral_accel/_read_lat_state）
 - `opendbc/car/byd/values.py`：`NON_LINEAR_TORQUE_PARAMS` 注释更正
 - 测试：`test_byd_carcontroller.py` 或新增 lateral 模型用例（见测试文件）
