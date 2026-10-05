@@ -10,7 +10,8 @@ from openpilot.selfdrive.ui.dm_preview import face_crop, preview_rect, preview_s
 
 def state(**changes):
   values = {'monitoring_fresh': True, 'camera_unavailable': False, 'driver_fresh': True,
-                'frame_fresh': True, 'face_detected': True, 'distracted': False, 'lockout': False}
+                'frame_fresh': True, 'face_detected': True, 'distracted': False, 'lockout': False,
+                'dm_disabled': False}
   return preview_state(**(values | changes))
 
 
@@ -20,6 +21,7 @@ def state(**changes):
   ({'frame_fresh': False}, 'waiting'), ({'driver_fresh': False}, 'waiting'),
   ({'face_detected': False}, 'searching'), ({'distracted': True}, 'warning'),
   ({'lockout': True, 'camera_unavailable': True}, 'warning'), ({'wheel_policy': True}, 'wheel'),
+  ({'dm_disabled': True, 'driver_fresh': False}, 'off'),
 ])
 def test_status_does_not_claim_valid_camera_or_attention(changes, kind):
   assert state(**changes).kind == kind
@@ -99,7 +101,7 @@ def preview(monkeypatch):
     _render_egl = _render_textures
 
   dm = NS(cameraUnavailable=False, isRHD=False, lockout=False, alwaysOnLockout=False, activePolicy='vision',
-          visionPolicyState=NS(faceDetected=True, isDistracted=False))
+          dm2Disabled=False, visionPolicyState=NS(faceDetected=True, isDistracted=False))
   driver = NS(leftDriverData=NS(facePosition=[-0.35, 0]), rightDriverData=NS(facePosition=[0.35, 0]))
 
   class SM(dict):
@@ -198,6 +200,18 @@ def test_alert_offroad_and_disengagement_hide_and_drop_frame(preview):
   p = preview
   p.inset.draw_onroad(p.rect, False)
   assert not p.inset.draw_onroad(p.rect, True)
+
+
+def test_disabled_monitoring_shows_off_not_check(preview):
+  # DriverMonitoringEnabled off: dm2d publishes with dm2Disabled=True and a
+  # driver camera-less device has no driverStateV2, so the old chain ended in
+  # 'DM CHECK' forever (BYD c3l clone, 2026-10-05). It must read as off.
+  p = preview
+  p.dm.dm2Disabled = True
+  p.inset.draw_onroad(p.rect, False)
+  assert not p.polls and p.labels[-1] == 'DM OFF'
+  p.inset.draw_onroad(p.rect, False)
+  assert p.labels[-1] == 'DM OFF'
   assert p.inset.frame is None
   p.sm['selfdriveState'].enabled = False
   assert not p.inset.draw_onroad(p.rect, False)

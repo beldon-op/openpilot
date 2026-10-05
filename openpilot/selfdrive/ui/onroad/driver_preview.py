@@ -62,7 +62,7 @@ class DriverPreview(CameraView):
     dm = sm['driverMonitoringState']
     monitoring_fresh = self._fresh('driverMonitoringState', now)
     driver_fresh = self._fresh('driverStateV2', now)
-    camera_allowed = monitoring_fresh and not dm.cameraUnavailable and driver_fresh
+    camera_allowed = monitoring_fresh and not dm.cameraUnavailable and driver_fresh and not dm.dm2Disabled
 
     # Consume only the existing camera stream, at most 10 Hz, without waiting.
     if camera_allowed and now >= self._next_poll:
@@ -81,9 +81,9 @@ class DriverPreview(CameraView):
     state = preview_state(monitoring_fresh=monitoring_fresh, camera_unavailable=dm.cameraUnavailable,
                           driver_fresh=driver_fresh, frame_fresh=frame_fresh, face_detected=vision.faceDetected,
                           distracted=vision.isDistracted, lockout=dm.lockout or dm.alwaysOnLockout,
-                          wheel_policy=str(dm.activePolicy) == 'wheeltouch')
+                          wheel_policy=str(dm.activePolicy) == 'wheeltouch', dm_disabled=dm.dm2Disabled)
     color = {'tracking': rl.Color(70, 220, 140, 255), 'wheel': rl.Color(110, 190, 255, 255),
-             'warning': rl.Color(255, 90, 60, 255)}.get(state.kind, rl.Color(255, 195, 70, 255))
+             'warning': rl.Color(255, 90, 60, 255), 'off': rl.Color(150, 155, 165, 255)}.get(state.kind, rl.Color(255, 195, 70, 255))
     rl.draw_rectangle_rec(rect, rl.Color(12, 18, 24, 245))
     label_h = 14 if self.compact else 32
     viewport = rl.Rectangle(rect.x + 2, rect.y + 2, rect.width - 4, rect.height - label_h - 4)

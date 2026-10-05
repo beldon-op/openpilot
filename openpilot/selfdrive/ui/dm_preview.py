@@ -17,9 +17,17 @@ def sample_fresh(now: float, timestamp: float) -> bool:
 
 
 def preview_state(*, monitoring_fresh: bool, camera_unavailable: bool, driver_fresh: bool,
-                  frame_fresh: bool, face_detected: bool, distracted: bool, lockout: bool, wheel_policy: bool = False) -> PreviewState:
+                  frame_fresh: bool, face_detected: bool, distracted: bool, lockout: bool, wheel_policy: bool = False,
+                  dm_disabled: bool = False) -> PreviewState:
   if not monitoring_fresh:
     return PreviewState('waiting', 'DM CHECK')
+  # DriverMonitoringEnabled off: dm2d still publishes at 20 Hz with dm2Disabled
+  # set and cameraUnavailable False (disabled_state_packet), so the fall-through
+  # below would read "driver model missing" and show 'DM CHECK' forever on cars
+  # without a driver camera (BYD c3l clone, 2026-10-05). The monitor is off by
+  # request, not waiting on anything - say so.
+  if dm_disabled:
+    return PreviewState('off', 'DM OFF')
   if lockout:
     return PreviewState('warning', 'DM LIMIT')
   if camera_unavailable:
