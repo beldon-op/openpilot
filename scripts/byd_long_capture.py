@@ -23,6 +23,7 @@ import json
 import os
 import sys
 import time
+import traceback
 from datetime import datetime
 
 from openpilot.cereal import messaging
@@ -47,11 +48,12 @@ def carcontrol_row(cc):
           "resume": cc.cruiseControl.resume, "cancel": cc.cruiseControl.cancel}
 
 def caroutput_row(co):
+  # carrot's CarOutput carries ONLY actuatorsOutput (no up/ui/ufAccelCmd)
   a = co.actuatorsOutput
   return {"accel": round(a.accel, 4),
           "torque": round(a.torque, 4), "torqueCan": round(a.torqueOutputCan, 1),
-          "lcs": str(a.longControlState), "up": round(co.upAccelCmd, 3),
-          "ui": round(co.uiAccelCmd, 3), "uf": round(co.ufAccelCmd, 3)}
+          "lcs": str(a.longControlState), "jerk": round(a.jerk, 4),
+          "aTarget": round(a.aTarget, 4)}
 
 def main():
   ap = argparse.ArgumentParser()
@@ -64,9 +66,50 @@ def main():
   print(f"BYD long capture -> {path}", flush=True)
 
   sm = messaging.SubMaster(["can", "carState", "carControl", "carOutput",
-                            "selfdriveState", "longitudinalPlan"])
+                            "selfdriveState", "longitudinalPlan", "onroadEvents"])
   prev_enabled = None
+  prev_events = ()
+  seen_errs = set()  # one logged traceback per failing accessor, then silence
   t0 = time.monotonic()
+
+  def build_rows():
+    rows = []
+    if sm.updated["can"]:
+      for ce in sm["can"]:
+        if ce.address in CAN_WANT:
+          rows.append({"t": t, "k": "can", "a": hex(ce.address), "b": ce.src,
+                       "d": bytes(ce.dat).hex()})
+    if sm.updated["carState"]:
+      rows.append({"t": t, "k": "cs", "r": carstate_row(sm["carState"])})
+    if sm.updated["carControl"] and sm.frame % SAMPLE_EVERY == 0:
+      rows.append({"t": t, "k": "cc", "r": carcontrol_row(sm["carControl"])})
+    if sm.updated["carOutput"] and sm.frame % SAMPLE_EVERY == 0:
+      rows.append({"t": t, "k": "co", "r": caroutput_row(sm["carOutput"])})
+    if sm.updated["selfdriveState"]:
+      sd = sm["selfdriveState"]
+      if sd.enabled != prev_enabled:
+        prev_enabled = sd.enabled
+        rows.append({"t": t, "k": "sd_edge", "en": sd.enabled, "st": str(sd.state)})
+      if sm.frame % SAMPLE_EVERY == 0:
+        rows.append({"t": t, "k": "sd", "en": sd.enabled, "st": str(sd.state)})
+    if sm.updated["longitudinalPlan"]:
+      # carrot schema: no vCruiseCluster/events-OnroadEvent-as-text - use the
+      # fork's own fields (cruiseTarget/aTarget/shouldStop/xState/trafficState)
+      lp = sm["longitudinalPlan"]
+      rows.append({"t": t, "k": "lp", "vc": round(lp.cruiseTarget, 3),
+                   "at": round(lp.aTarget, 4), "stop": lp.shouldStop,
+                   "th": lp.allowThrottle, "br": lp.allowBrake,
+                   "x": lp.xState, "tr": lp.trafficState, "lead": lp.hasLead})
+    if sm.updated["onroadEvents"]:
+      # 100 Hz publisher - log edges only (this is what answers "why did OP
+      # softDisable at the 13:45 CANCEL fragment")
+      names = tuple(sorted(str(e.name) for e in sm["onroadEvents"]))
+      nonlocal prev_events
+      if names != prev_events:
+        prev_events = names
+        rows.append({"t": t, "k": "ev", "l": list(names)})
+    return rows
+
   with open(path, "a") as f:
     f.write(json.dumps({"t": 0.0, "k": "start", "wall": datetime.now().isoformat(),
                         "topics": sm.services}) + "\n")
@@ -74,29 +117,17 @@ def main():
     while True:
       sm.update(100)
       t = round(time.monotonic() - t0, 3)
-      rows = []
-      if sm.updated["can"]:
-        for ce in sm["can"]:
-          if ce.address in CAN_WANT:
-            rows.append({"t": t, "k": "can", "a": hex(ce.address), "b": ce.src,
-                         "d": bytes(ce.dat).hex()})
-      if sm.updated["carState"]:
-        rows.append({"t": t, "k": "cs", "r": carstate_row(sm["carState"])})
-      if sm.updated["carControl"] and sm.frame % SAMPLE_EVERY == 0:
-        rows.append({"t": t, "k": "cc", "r": carcontrol_row(sm["carControl"])})
-      if sm.updated["carOutput"] and sm.frame % SAMPLE_EVERY == 0:
-        rows.append({"t": t, "k": "co", "r": caroutput_row(sm["carOutput"])})
-      if sm.updated["selfdriveState"]:
-        sd = sm["selfdriveState"]
-        if sd.enabled != prev_enabled:
-          prev_enabled = sd.enabled
-          rows.append({"t": t, "k": "sd_edge", "en": sd.enabled, "st": str(sd.state)})
-        if sm.frame % SAMPLE_EVERY == 0:
-          rows.append({"t": t, "k": "sd", "en": sd.enabled, "st": str(sd.state)})
-      if sm.updated["longitudinalPlan"]:
-        lp = sm["longitudinalPlan"]
-        rows.append({"t": t, "k": "lp", "vc": round(lp.vCruiseCluster.vCruise, 3),
-                     "at": round(lp.aTarget, 4), "ev": [str(e) for e in lp.events]})
+      try:
+        rows = build_rows()
+      except Exception:
+        # one accessor blowing up must never end the capture: log the shape
+        # once, keep going (the 2026-10-05 vCruiseCluster crash-loop incident)
+        key = traceback.format_exc(limit=1).strip().splitlines()[-1]
+        if key not in seen_errs:
+          seen_errs.add(key)
+          rows = [{"t": t, "k": "err", "m": key}]
+        else:
+          rows = []
       for r in rows:
         f.write(json.dumps(r, separators=(",", ":")) + "\n")
       if rows:
