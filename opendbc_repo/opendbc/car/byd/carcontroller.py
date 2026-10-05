@@ -7,9 +7,17 @@ from opendbc.car.byd.values import USE_ANGLE_STEERING, CarControllerParams
 
 LongCtrlState = structs.CarControl.Actuators.LongControlState
 
-RES_INTERVAL = 125   # frames between resume presses (100 Hz loop)
-SNG_WAIT = 310       # frames to wait before first resume press
-RES_LEN = 3          # number of resume presses
+# Accel command slew limit (m/s^3), applied at the 50 Hz ACC_CMD rate. The
+# vendor's own plan derives JerkUpper/Lower from its jerk and never steps the
+# accel; we previously plugged the 100 Hz controller output straight into
+# 0x32E, so every plan discontinuity (model lead jitter, session hand-back,
+# the SetSpeed zero-blip clamp) landed on the powertrain as a full step - the
+# 2026-10-05 driver complaint "一直在加油刹车" (never smooth, alternating
+# gas/brake). Asymmetric like the transmitted envelope: rising 1.5, falling
+# -1.5 keeps emergency braking reachable (0 -> -4 in ~2.7 s) while cutting
+# the command's high-frequency energy.
+ACCEL_SLEW_UP = 1.5
+ACCEL_SLEW_DOWN = 1.5
 
 class CarController(CarControllerBase):
   def __init__(self, dbc_names, CP):
@@ -30,11 +38,10 @@ class CarController(CarControllerBase):
     self.echo_frames = 0      # C: request-vs-Echo divergence streak (root cause 18)
     self.echo_hold_frames = 0  # C: re-arm hold after an echo stand-down
 
-    # SNG auto-resume state
-    self.is_sng_check = False
-    self.sng_next_press_frame = 0
-    self.resume_counter = 0
-    self.lead_valid = False
+    # longitudinal output state: the accel value actually last broadcast on
+    # 0x32E (m/s^2, OP units) - the reference the slew limiter ramps from so
+    # OP<->radar handovers are continuous, not stepped
+    self.accel_cmd_sent = 0.0
 
   def _update_torque_lateral(self, CC, CS):
     """Default torque path: steer via the LKAS_Output request in ACC_MPC_STATE (790).
@@ -287,31 +294,6 @@ class CarController(CarControllerBase):
         self.packer, apply_angle, lat_active, CS.out.standstill, (self.frame // 2) % 16)
     return None
 
-  def _update_sng_auto_resume(self, CC, CS, can_sends):
-    """Spoof the ACC resume button while stationary and a lead is detected."""
-    # brake guard: CC.enabled now survives a brake press (main-on latch), so
-    # the standstill gate alone would keep pulsing RES under the driver's foot
-    auto_resume_allowed = CC.enabled and CS.out.cruiseState.standstill and not CS.out.brakePressed
-
-    if not auto_resume_allowed:
-      self.is_sng_check = False
-    else:
-      self.lead_valid = CC.hudControl.leadVisible and self.lead_valid
-
-      if not self.is_sng_check:
-        self.is_sng_check = True
-        self.lead_valid = True
-        self.sng_next_press_frame = self.frame + SNG_WAIT
-        self.resume_counter = 0
-
-      elif self.resume_counter >= RES_LEN or CS.out.gasPressed or CS.res_btn_pressed:
-        self.sng_next_press_frame = max(self.sng_next_press_frame, self.frame + RES_INTERVAL)
-        self.resume_counter = 0
-
-      elif self.lead_valid and self.frame > self.sng_next_press_frame:
-        can_sends.append(bydcan.send_buttons(self.packer, (CS.counter_pcm_buttons + 1) % 16))
-        self.resume_counter += 1
-
   def _update_longitudinal(self, CC, CS, can_sends):
     """OP longitudinal: transparent replacement of the radar's ACC frames on bus 0.
 
@@ -329,23 +311,58 @@ class CarController(CarControllerBase):
     truth: while it is down (brake cancel / CANCEL / bounce) or the driver is
     braking, OP re-broadcasts the radar frame verbatim instead of commanding.
     OP recovers the frame the session comes back (stock auto-resume on brake
-    release, RES after CANCEL) - no state churn, no holes."""
+    release, RES after CANCEL) - no state churn, no holes.
+
+    The SNG spoofed-RES auto-resume that used to sit next to this method is
+    GONE (user decision 2026-10-05: "纵向要激活 ACC 才能控制，设置不应该
+    控制"). It pulsed BTN_AccUpDown=3 ~3.1 s after any OP-engaged standstill
+    (and its lead check was a forced-true placeholder, not a real lead) -
+    with the main-on latch keeping OP engaged through CANCEL, that meant OP
+    ACTIVATED the stock session by itself whenever the driver merely had ACC
+    set (设置): the car took over longitudinal without the driver engaging.
+    Auto-resume after a standstill is now purely the driver's action (stalk
+    RES); within a live session the ACC_CMD ResumeFromStandstill pulse and
+    LongCtrlState.starting remain, because the session there is the driver's.
+
+    Continuity: the frame we transmit (our ramped accel, or the echoed radar
+    AccelCmd while yielding) is tracked in accel_cmd_sent and every commanded
+    value is slew-limited from it, so session blips hand OP->radar->OP without
+    an accel step - the previous hard switch was one source of the
+    "一直在加油刹车" feel."""
     if self.frame % 2 == 0:
       raw_cnt = (self.frame // 2) % 16
       # resume pulse while long control is starting (standstill -> go)
       resume = CC.actuators.longControlState == LongCtrlState.starting
       session_active = bool(CS.radar_acc_msg.get("AccControlActive", 0))
       long_active = CC.longActive and not CS.out.brakePressed and session_active
-      # no set speed -> never accelerate. Routes 31/2d show the engage frame
-      # is (AccControlActive=1, SetSpeed=0) - the radar ramps to its own
-      # stored target while OP's plan has no initialized cruise speed, and
-      # echoing its AccelCmd is what the driver reads as "速度没设置就一直
-      # 往上加". Until SetSpeed lands (1-2 s later in every trace) command
-      # hold-or-brake only; the positive half of our accel is clamped.
-      if long_active and int(CS.adas_msg.get("SetSpeed", 0) if CS.adas_msg else 0) == 0:
-        accel = min(CC.actuators.accel, 0.0)
+
+      if long_active:
+        demand = CC.actuators.accel
+        # no set speed -> never accelerate. Routes 31/2d show the engage frame
+        # is (AccControlActive=1, SetSpeed=0) - the radar ramps to its own
+        # stored target while OP's plan has no initialized cruise speed, and
+        # echoing its AccelCmd is what the driver reads as "速度没设置就一直
+        # 往上加". Until SetSpeed lands (1-2 s later in every trace) command
+        # hold-or-brake only; the positive half of our accel is clamped.
+        if int(CS.adas_msg.get("SetSpeed", 0) if CS.adas_msg else 0) == 0:
+          demand = min(demand, 0.0)
+        # slew limit against what is actually on the wire (which, through a
+        # yield, was the radar's own command) - see ACCEL_SLEW_* above
+        lo = self.accel_cmd_sent - ACCEL_SLEW_DOWN * 0.02
+        hi = self.accel_cmd_sent + ACCEL_SLEW_UP * 0.02
+        accel = max(lo, min(hi, demand))
+        # mirror the two overrides create_accel_command will apply, so the
+        # tracking stays honest (the standstill-start bump is deliberately
+        # NOT slewed: it must step to clear the hold)
+        accel = min(max(accel, CarControllerParams.ACCEL_MIN), CarControllerParams.ACCEL_MAX)
+        if resume and bool(CS.radar_acc_msg.get("StandstillState", 0)):
+          accel = max(accel, CarControllerParams.MIN_START_ACCEL)
+        self.accel_cmd_sent = accel
       else:
-        accel = CC.actuators.accel
+        # echo path: transmit the radar's own frame unchanged
+        accel = CS.radar_acc_msg.get("AccelCmd", 0.0) if CS.radar_acc_msg else 0.0
+        self.accel_cmd_sent = float(accel)
+
       can_sends.append(bydcan.create_accel_command(
         self.packer, accel, CC.enabled, long_active, resume,
         CS.radar_acc_msg, raw_cnt))
@@ -385,8 +402,6 @@ class CarController(CarControllerBase):
 
     if self.CP.openpilotLongitudinalControl:
       self._update_longitudinal(CC, CS, can_sends)
-
-    self._update_sng_auto_resume(CC, CS, can_sends)
 
     self.frame += 1
     return new_actuators, can_sends

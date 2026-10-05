@@ -26,8 +26,11 @@ class CarInterface(CarInterfaceBase):
 
     ret.radarUnavailable = True
 
-    # longitudinal control is done by the stock ACC; openpilot only does
-    # lateral control plus spoofed resume button for auto-resume from standstill.
+    # longitudinal control is done by the stock ACC; openpilot does lateral
+    # control only (unless AlphaLongitudinalEnabled). The spoofed RES-button
+    # auto-resume was REMOVED 2026-10-05 (user rule: 纵向要激活 ACC 才能控制,
+    # 设置不应该控制) - OP must never activate the stock session by itself,
+    # resuming from a standstill is the driver's action on the stalk.
     # pcmCruise ties openpilot's engagement to the ACC main posture (like the
     # Geely port): cruiseState.enabled is the arm latch (debounced main-on +
     # one genuine session this drive, see carstate) - OP enables on its rising
@@ -36,6 +39,8 @@ class CarInterface(CarInterfaceBase):
     # on the live radar session in the controller instead.
     ret.openpilotLongitudinalControl = False
     ret.pcmCruise = True
+    # true: a standstill must not fire STOP_REQUIRED-style disengagements
+    # (the main-on latch keeps OP alive through the stop; the driver resumes)
     ret.autoResumeSng = True
 
     ret.wheelSpeedFactor = HUD_MULTIPLIER

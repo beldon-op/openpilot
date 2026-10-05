@@ -109,7 +109,12 @@ def create_lkas_request(packer, cam_msg, apply_torque, lkas_active, lkas_req_pre
 
 
 def send_buttons(packer, count):
-  """Spoof ACC UP_RESETSPEED button press (BTN_AccUpDown_Cmd=3) for auto-resume from standstill."""
+  """Spoof ACC UP_RESETSPEED button press (BTN_AccUpDown_Cmd=3).
+
+  UNUSED since 2026-10-05: the SNG auto-resume that called this could activate
+  the stock ACC session while the driver had only set it ("设置不应该控制" -
+  longitudinal must require the driver's own ACC activation). Kept as the
+  frame reference for the fw's still-permitted standstill button window."""
   values = {
     "SETME_1": 1,
     "BTN_AccUpDown_Cmd": 3,
