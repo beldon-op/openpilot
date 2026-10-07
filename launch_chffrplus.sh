@@ -297,12 +297,21 @@ function invalidate_modeld_build_if_needed {
   local old_stamp
   local old_big_stamp
 
-  MODEL_BUILD_STAMP_VALUE="$(git rev-parse HEAD:openpilot/selfdrive/modeld HEAD:tinygrad_repo HEAD:openpilot/common/file_chunker.py 2>/dev/null | tr '\n' ':')"
-  if [ -z "$MODEL_BUILD_STAMP_VALUE" ]; then
-    MODEL_BUILD_STAMP_VALUE="$(git rev-parse HEAD 2>/dev/null || true)"
-  fi
-
   old_stamp="$(cat "$stamp_path" 2>/dev/null || true)"
+  # Use the same source-only compiler fingerprint as the custom-model
+  # installer. Do not hash the whole modeld directory: generated PKLs inside
+  # it would make such a stamp self-invalidating even though the compiler
+  # itself did not change.
+  MODEL_BUILD_STAMP_VALUE="$(cd "$DIR" && python3 -c \
+    'from carrot.model_selector.config import compile_env_tag; print(compile_env_tag(), end="")' \
+    2>/dev/null || true)"
+  if [ -z "$MODEL_BUILD_STAMP_VALUE" ]; then
+    # A prebuilt release has no ONNX inputs to recover from. If Python itself
+    # is unavailable, preserve its packaged artifacts instead of deleting them
+    # because of an unrelated fallback stamp.
+    echo "Unable to calculate model compiler fingerprint; keeping packaged stamp."
+    MODEL_BUILD_STAMP_VALUE="$old_stamp"
+  fi
   if [ "$MODEL_BUILD_STAMP_VALUE" != "$old_stamp" ] || [ ! -f "$tg_devices_path" ] || { [ ! -f "$driving_pkl_path" ] && [ ! -f "$driving_pkl_path.chunkmanifest" ]; }; then
     echo "Model/tinygrad inputs changed or artifacts are missing; revalidating with SCons."
     # Keep generated artifacts. SCons tracks the compiler, tinygrad and model

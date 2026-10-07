@@ -260,6 +260,9 @@ def manager_thread(update_status: UpdateStatus) -> None:
 def main() -> None:
   try:
     update_status = manager_init()
+    # Carrot model selector: compile any pending model before processes start.
+    from openpilot.carrot.model_selector.boot_compile import run as _ms_boot_compile
+    _ms_boot_compile()
     write_supported_cars_files()
   finally:
     release_boot_lock()

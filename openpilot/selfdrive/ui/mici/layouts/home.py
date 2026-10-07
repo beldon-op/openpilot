@@ -215,8 +215,14 @@ class MiciHomeLayout(Widget):
       self._branch_label.render()
       line_y += self._branch_label.font_size + 6
 
-      # 3踰덉㎏ 以? ?좎쭨 (而ㅻ컠)
-      date_text = self._version_text[3] if release_branch else f"{self._version_text[3]} ({self._version_text[2]})"
+      # 第三行: 日期 (提交哈希, 模型名)
+      date_text = self._version_text[3]
+      if not release_branch:
+        commit_text = self._version_text[2]
+        model = ui_state.params.get("DrivingModelName") or ""
+        if model:
+          commit_text = f"{commit_text}  {model}"
+        date_text = f"{date_text} ({commit_text})"
       self._date_label.set_text(date_text)
       self._date_label.set_position(line_x, line_y)
       self._date_label.render()

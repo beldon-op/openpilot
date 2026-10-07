@@ -62,12 +62,14 @@ def get_tg_input_devices(process_name: str, usbgpu: bool):
     return _default_tg_input_devices(process_name, usbgpu)
 
 def modeld_pkl_path(usbgpu: bool, model_sha256: str | None = None):
+  # carrot model selector: load a custom-compiled model dir instead of the built-in one
+  models_dir = Path(override) if (override := os.getenv('MODELD_MODELS_DIR')) else MODELS_DIR
   if not usbgpu:
-    return MODELS_DIR / 'driving_tinygrad.pkl'
+    return models_dir / 'driving_tinygrad.pkl'
   if model_sha256 is None:
     model = active_manifest()
     model_sha256 = model.sha256 if model is not None else 'unavailable'
-  return MODELS_DIR / f'big_driving_{model_sha256[:16]}_tinygrad.pkl'
+  return models_dir / f'big_driving_{model_sha256[:16]}_tinygrad.pkl'
 
 def dump_oob(obj, f):
   with tempfile.TemporaryFile(dir=".") as tmp:
