@@ -56,6 +56,7 @@ PYTHONPATH=/data/local_pkgs:/data/openpilot/pydeps:/data/openpilot:/data/pythonp
 |---|---|---|---|---|
 | card only（CC 输入=日志原值） | 3561 帧 | 21.6 | 174 | 纯执行层映射差：carrot 回播/编码 vs sunny |
 | card+controlsd（全链） | 3561 帧 | 43.9 | 200 | 叠加控制律差（siglin/ki=0/deadzone0.1 生效） |
+| seg--2 过渡段 全链（engaged 仅 42.8s） | 3558 帧 | 7.9 | 210 | 未 engage 窗口以回播帧为主、高度一致；差异集中在 engage 弯道窗口（max 与 --3 同量级）——**新码偏差集中在真控制段，直线/停走 echo 无误** |
 
 - 指纹：日志 CAN 在设备内被 fuzzy match 到 `BYD_SONG_PLUS_DMI_22`（source=2）✓。
 - **0x32E 重生成缺失 = 设计行为**：`byd/interface.py:147` 只有 `alpha_long` 参数开启才置 `openpilotLongitudinalControl=True`，而日志里 sunny 的 CarParams oPIC=False → `carcontroller.update()` 按门跳过纵向。要 bench 纵向链：设备先 `Params().put_bool('AlphaLongitudinalEnabled', True)` 并保证 bench 重生成 CP（或改写 custom_params['CarParams'] 的 oPIC+safetyParam LONGITUDINAL 位），⏳ 该变体未实测。
@@ -82,3 +83,4 @@ c3l 克隆板只有 4 核，`config_realtime_process(5)` 绑核 5 会 EINVAL，�
 - 设备 `/usr/local` 只读：pip 装包一律 `--target /data/local_pkgs` + PYTHONPATH。
 - **UI 更新会清掉 `/data/local_pkgs/sitecustomize.py`**（2026-10-09 实测：更新后 card 子进程绑核 EINVAL 复活）。脚本 bootstrap 已加固：写入 PYTHONPATH 全部可写目录 + fork 场景进程内补丁 + 子解释器验证（不通过直接报错退出）。
 - 更新回归基线：d5fc348→d97a83a 无 BYD 控制码变更，重放结果逐位一致（`316.LKAS_Output n=3561 mean|Δ|=43.851 max|Δ|=200.000`，指纹/engaged 同）。以后若此数字变化，说明改动真的动了横向输出，可据此定位。
+- d97a83a→bf3a799d 更新复验（2026-10-09）：更新+重启后直接重跑 bench 成功（bootstrap 每次运行都会把 sitecustomize 重写进全部可写 PYTHONPATH 目录，即使文件被更新清掉也能自愈），--3 基线数字逐位不变。
