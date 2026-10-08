@@ -1,6 +1,6 @@
 # BYD 台架日志重放：不动车验证闭环
 
-日期：2026-10-07。设备：comma@192.168.3.113（c3l 克隆板，carrot-byd @ d5fc348，DongleId=UnregisteredDevice）。
+日期：2026-10-07（2026-10-08 实测回填）。设备：comma@192.168.3.124（c3l 克隆板，carrot-byd @ d5fc348，DongleId=UnregisteredDevice）。
 
 ## 结论速览
 
@@ -36,17 +36,34 @@ cd /data/openpilot
 #     /data/openpilot/third_party/wheels/comma_deps_catch2-2.13.10.post96-py3-none-any.whl
 #   （tinygrad 在 /data/openpilot/tinygrad_repo，PYTHONPATH 带上即可）
 
-PYTHONPATH=/data/local_pkgs timeout 600 /usr/local/venv/bin/python3 scripts/byd_replay_bench.py \
-  /data/media/0/realdata/0000000000000002/00000002--d3da5795a9--3/rlog.zst card
-# 第二个参数可给 'card,controlsd'（多进程 DAG 会重排 carControl 喂 card）
+# PYTHONPATH 必须对齐 manager 运行环境：pydeps 提供 pyserial 等，缺了会在
+# system.hardware 导入处 ModuleNotFoundError；/data/openpilot + /data/pythonpath 提供包路径。
+# （/tmp 副本=已含克隆板绑核补丁；本仓文件入库后两者等价）
+PYTHONPATH=/data/local_pkgs:/data/openpilot/pydeps:/data/openpilot:/data/pythonpath \
+  timeout 900 /usr/local/venv/bin/python3 /tmp/byd_replay_bench.py \
+  /data/media/0/realdata/0000000000000002/00000002--d3da5795a9--3/rlog.zst card,controlsd
+# 第二参数 'card'=CC 输入用日志原值（纯执行层 diff）；'card,controlsd'=全链 diff
 ```
 
 原理与输出：
 - `get_custom_params_from_lr(lr)` 从 rlog 提取 CarParams/liveCalibration 等做进程参数播种，`fingerprint=BYD_SONG_PLUS_DMI_22` 显式指定车型 → card 不跑 fw query。
-- 重生成消息 = `carControl`/`sendcan` 等进程输出；脚本按总线地址对齐原日志 `sendcan`，对 **0x32E `ACC_CMD.AccelCmd`、0x1E2 `STEERING_MODULE_ADAS.STEER_ANGLE/STEER_REQ`、0x1FC `STEERING_TORQUE.MAIN_TORQUE`** 输出 mean|Δ|/max|Δ|，并列出两代固件 TX 信号的有无差异。
+- 重生成消息 = `carControl`/`sendcan` 等进程输出；脚本按总线地址对齐原日志 `sendcan`，对 **0x32E `ACC_CMD.AccelCmd` 与 0x316(`BO_790 ACC_MPC_STATE.LKAS_Output`，11bit 力矩主通道)** 输出 mean|Δ|/max|Δ|，并列出两代固件 TX 信号的有无差异。
 - 横向 siglin 模型验证点：controlsd 重生成路径会调 `CI.torque_from_lateral_accel()`（新移植代码），输入是原日志 `modelV2`（真车 plan）→ **同一场景下新旧固件的力矩输出直接可比**。
 
-**状态：⏳ 实测数值待补**——脚本已在 `scripts/` 就位、日志已传设备，但 23:49 设备断网（待上电/确认 IP），跑通后把 diff 表贴回本节。
+### 实测结果（2026-10-08，seg=00000002--d3da5795a9--3，360s 全程 engaged）
+
+| 链 | 重生成 0x316 | mean|Δ| | max|Δ| | 说明 |
+|---|---|---|---|---|
+| card only（CC 输入=日志原值） | 3561 帧 | 21.6 | 174 | 纯执行层映射差：carrot 回播/编码 vs sunny |
+| card+controlsd（全链） | 3561 帧 | 43.9 | 200 | 叠加控制律差（siglin/ki=0/deadzone0.1 生效） |
+
+- 指纹：日志 CAN 在设备内被 fuzzy match 到 `BYD_SONG_PLUS_DMI_22`（source=2）✓。
+- **0x32E 重生成缺失 = 设计行为**：`byd/interface.py:147` 只有 `alpha_long` 参数开启才置 `openpilotLongitudinalControl=True`，而日志里 sunny 的 CarParams oPIC=False → `carcontroller.update()` 按门跳过纵向。要 bench 纵向链：设备先 `Params().put_bool('AlphaLongitudinalEnabled', True)` 并保证 bench 重生成 CP（或改写 custom_params['CarParams'] 的 oPIC+safetyParam LONGITUDINAL 位），⏳ 该变体未实测。
+- 注意：diff 数值是**新旧行为差异量**，不是对错——对错仍以本机单测（test_byd_lateral_model/test_byd_carcontroller 等）为准；bench 的价值在"同场景回归 + 差异幅度可见"。
+
+### 克隆板适配（已内置在脚本）
+
+c3l 克隆板只有 4 核，`config_realtime_process(5)` 绑核 5 会 EINVAL，且 multiprocessing 子进程不继承父 monkeypatch。`scripts/byd_replay_bench.py` 自动向 PYTHONPATH 第一个可写目录写 `sitecustomize.py`（绑核降级为可用核交集）——设备/真实 8 核 c3 都安全。
 
 ## 实时 replay（PC 侧）与设备侧的分工
 

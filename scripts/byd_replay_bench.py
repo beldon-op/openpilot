@@ -1,6 +1,27 @@
 #!/usr/bin/env python3
 # BYD 台架闭环回放：用 process_replay 在设备内重生成 controlsd/card 输出，并与 rlog 里实车记录的 sendcan 对比
-import sys, collections
+import os, sys, collections
+
+# c3l 克隆板只有 4 核：config_realtime_process 请求 core 5 → sched_setaffinity EINVAL。
+# 子进程不继承 monkeypatch（multiprocessing 非 fork 场景），因此写一个 sitecustomize
+# 到 PYTHONPATH 目录，让所有子解释器启动时自动降级绑核。
+if (os.cpu_count() or 8) < 6:
+  _sp = os.environ.get("PYTHONPATH", "").split(":")
+  for _d in _sp:
+    if _d and os.access(_d, os.W_OK):
+      with open(os.path.join(_d, "sitecustomize.py"), "w") as _f:
+        _f.write(
+          "import os\n"
+          "_o = os.sched_setaffinity\n"
+          "def _s(pid, mask):\n"
+          "  cores = {mask} if isinstance(mask, int) else set(mask)\n"
+          "  avail = set(range(os.cpu_count())) & cores\n"
+          "  if not avail:\n"
+          "    avail = set(os.sched_getaffinity(0))\n"
+          "  return _o(pid, avail)\n"
+          "os.sched_setaffinity = _s\n"
+        )
+      break
 
 from openpilot.tools.lib.logreader import LogReader
 from openpilot.selfdrive.test.process_replay.process_replay import replay_process_with_name, get_custom_params_from_lr
@@ -17,11 +38,11 @@ def decode_addr(msg, addr_dec):
     d = bytes(cd.dat)
     if addr_dec == 814:  # ACC_CMD: AccelCmd 0|8@1+ (0.05,-5)
       return {'AccelCmd': round(d[0] * 0.05 - 5, 3)}
-    if addr_dec == 482:  # STEERING_MODULE_ADAS: STEER_ANGLE 24|16@1- (0.1), STEER_REQ bit21
-      angle = int.from_bytes(d[3:5], 'little', signed=True) * 0.1
-      return {'STEER_ANGLE': round(angle, 2), 'STEER_REQ': int(d[2] >> 5) & 1}
-    if addr_dec == 508:  # STEERING_TORQUE: MAIN_TORQUE 0|16@1- (0.1)
-      return {'MAIN_TORQUE': round(int.from_bytes(d[0:2], 'little', signed=True) * 0.1, 2)}
+    if addr_dec == 790:  # 0x316: LKAS_Output 16|11@1- (1,0) —— 力矩指令主通道
+      raw = d[2] + ((d[3] & 0x7) << 8)
+      if raw >= 0x400:
+        raw -= 0x800
+      return {'LKAS_Output': raw}
   return None
 
 def collect(msgs, name):
