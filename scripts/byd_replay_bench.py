@@ -3,25 +3,45 @@
 import os, sys, collections
 
 # c3l 克隆板只有 4 核：config_realtime_process 请求 core 5 → sched_setaffinity EINVAL。
-# 子进程不继承 monkeypatch（multiprocessing 非 fork 场景），因此写一个 sitecustomize
-# 到 PYTHONPATH 目录，让所有子解释器启动时自动降级绑核。
+# spawn/子解释器场景不继承父进程 monkeypatch，靠 sitecustomize 兜底；fork 子进程再靠
+# 进程内补丁双保险。设备 UI 更新会清掉 sitecustomize 文件（2026-10-09 实测 bench3 因此
+# 崩），所以写入 PYTHONPATH 上所有可写目录、并验证子解释器确实打上补丁。
 if (os.cpu_count() or 8) < 6:
-  _sp = os.environ.get("PYTHONPATH", "").split(":")
-  for _d in _sp:
+  _sc_src = (
+    "import os\n"
+    "_o = os.sched_setaffinity\n"
+    "def _s(pid, mask):\n"
+    "  cores = {mask} if isinstance(mask, int) else set(mask)\n"
+    "  avail = set(range(os.cpu_count())) & cores\n"
+    "  if not avail:\n"
+    "    avail = set(os.sched_getaffinity(0))\n"
+    "  return _o(pid, avail)\n"
+    "os.sched_setaffinity = _s\n"
+  )
+  for _d in os.environ.get("PYTHONPATH", "").split(":"):
     if _d and os.access(_d, os.W_OK):
-      with open(os.path.join(_d, "sitecustomize.py"), "w") as _f:
-        _f.write(
-          "import os\n"
-          "_o = os.sched_setaffinity\n"
-          "def _s(pid, mask):\n"
-          "  cores = {mask} if isinstance(mask, int) else set(mask)\n"
-          "  avail = set(range(os.cpu_count())) & cores\n"
-          "  if not avail:\n"
-          "    avail = set(os.sched_getaffinity(0))\n"
-          "  return _o(pid, avail)\n"
-          "os.sched_setaffinity = _s\n"
-        )
-      break
+      try:
+        with open(os.path.join(_d, "sitecustomize.py"), "w") as _f:
+          _f.write(_sc_src)
+      except OSError:
+        pass
+
+  # 进程内降级（fork 出的子进程继承）
+  _orig_setaffinity = os.sched_setaffinity
+  def _safe_setaffinity(pid, mask):
+    cores = {mask} if isinstance(mask, int) else set(mask)
+    avail = set(range(os.cpu_count())) & cores
+    if not avail:
+      avail = set(os.sched_getaffinity(0))
+    return _orig_setaffinity(pid, avail)
+  os.sched_setaffinity = _safe_setaffinity
+
+  # 验证：子解释器必须能扛住绑不存在的核，否则更新后环境不对，直接报错退出
+  import subprocess as _sp
+  _chk = _sp.run([sys.executable, "-c", "import os; os.sched_setaffinity(0, [os.cpu_count() + 99])"],
+                 env=os.environ, capture_output=True, text=True)
+  if _chk.returncode != 0:
+    sys.exit("sitecustomize affinity patch not active in child interpreters:\n" + _chk.stderr)
 
 from openpilot.tools.lib.logreader import LogReader
 from openpilot.selfdrive.test.process_replay.process_replay import replay_process_with_name, get_custom_params_from_lr

@@ -80,3 +80,5 @@ c3l 克隆板只有 4 核，`config_realtime_process(5)` 绑核 5 会 EINVAL，�
 - 无视频帧的段（只有 rlog/qlog）做不了 modeld 回放（`model_replay` 需 `fcamera.hevc`），但 process_replay 不重跑 modeld、直接用日志里的 `modelV2`，无帧也能闭环 controlsd/card。
 - 台架不接车时 process_replay 完全不碰 panda/总线，无 EPS 锁风险；但任何让真实 card 在 onroad 断流的动作仍受 BYD「0x316 断流锁 EPS」红线约束（见 byd-lateral-vendor-model.md）。
 - 设备 `/usr/local` 只读：pip 装包一律 `--target /data/local_pkgs` + PYTHONPATH。
+- **UI 更新会清掉 `/data/local_pkgs/sitecustomize.py`**（2026-10-09 实测：更新后 card 子进程绑核 EINVAL 复活）。脚本 bootstrap 已加固：写入 PYTHONPATH 全部可写目录 + fork 场景进程内补丁 + 子解释器验证（不通过直接报错退出）。
+- 更新回归基线：d5fc348→d97a83a 无 BYD 控制码变更，重放结果逐位一致（`316.LKAS_Output n=3561 mean|Δ|=43.851 max|Δ|=200.000`，指纹/engaged 同）。以后若此数字变化，说明改动真的动了横向输出，可据此定位。
