@@ -205,6 +205,9 @@ procs = [
   PythonProcess("cweb_push", "openpilot.selfdrive.carrot.cweb_push", always_run, enabled=not PC),
   PythonProcess("carrot_cluster", "openpilot.selfdrive.carrot.cluster_autorun", enable_cluster_hud, restart_if_crash=True),
 
+  # LAN event push service (WebSocket/SSE :8083), see openpilot/mate/server.py
+  PythonProcess("mate", "openpilot.mate.server", always_run, restart_if_crash=True),
+
   #Xiaoge data broadcaster (conditional on ShareData param)
   PythonProcess("xiaoge_data", "openpilot.selfdrive.carrot.xiaoge_data", enable_xiaoge_data),
 
