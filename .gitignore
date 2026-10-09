@@ -50,7 +50,9 @@ compare_runtime*.html
 persist
 selfdrive/pandad/pandad
 cereal/services.h
+openpilot/cereal/services.h
 cereal/gen
+openpilot/cereal/gen
 cereal/messaging/bridge
 selfdrive/logcatd/logcatd
 selfdrive/mapd/default_speeds_by_region.json

@@ -47,9 +47,14 @@ void Replay::setupServices(const std::vector<std::string> &allow, const std::vec
     bool is_blocked = std::find(block.begin(), block.end(), name) != block.end();
     bool is_allowed = allow.empty() || std::find(allow.begin(), allow.end(), name) != allow.end();
     if (is_allowed && !is_blocked) {
-      uint16_t which = event_schema.getFieldByName(name).getProto().getDiscriminantValue();
-      sockets_[which] = name.c_str();
-      active_services.push_back(name.c_str());
+      // services.h can list names that no longer exist as Event union branches
+      // (e.g. navModel, customReservedRawData1/2). findFieldByName skips them
+      // instead of throwing like getFieldByName does.
+      KJ_IF_MAYBE(field, event_schema.findFieldByName(name)) {
+        uint16_t which = field->getProto().getDiscriminantValue();
+        sockets_[which] = name.c_str();
+        active_services.push_back(name.c_str());
+      }
     }
   }
 
