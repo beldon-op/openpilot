@@ -10,6 +10,8 @@ def make_car_state(left_blinker=False):
     canValid=True,
     leftBlinker=left_blinker,
     rightBlinker=False,
+    leftBlindspot=False,
+    rightBlindspot=False,
     vEgo=20.0,
     aEgo=0.0,
     trailerConnected=False,
@@ -74,6 +76,7 @@ class TestDesireHelperDriverIntent:
     self.update(left_blinker=True)
     assert self.helper.lane_change_state == log.LaneChangeState.preLaneChange
 
+    # stock brand (no "byd"): no BSD clear window, starts immediately as before
     self.update(left_blinker=True)
     assert self.helper.lane_change_state == log.LaneChangeState.laneChangeStarting
 

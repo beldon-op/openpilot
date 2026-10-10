@@ -14,6 +14,12 @@ from openpilot.selfdrive.controls.lib.desire_lib.maneuver_classifier import clas
 
 
 class DesireHelper:
+  """Stock desire/lane-change machine. Brand-specific behavior (BYD vendor
+  lane-change port) lives in desire_helper_byd.BydDesireHelper and is selected
+  through get_desire_helper(CP.brand) - the base class must not carry brand
+  branches. The _update_clear_window/_clear_window_ok/_mid_maneuver_abort
+  hooks below are behavior-neutral defaults the subclass overrides."""
+
   def __init__(self):
     self.params = Params()
     self.bluetooth_commands = CommandReader('lane')
@@ -25,6 +31,9 @@ class DesireHelper:
     self.lane_change_timer = 0.0
     self.lane_change_ll_prob = 1.0
     self.lane_change_delay = 0.0
+    # state slot for the _update_clear_window/_clear_window_ok brand hooks
+    # (unused by the stock no-op implementations)
+    self.lane_change_clear_time = 0.0
     self.maneuver_type = "none"  # "none" / "turn" / "lane_change"
 
     self.desire = log.Desire.none
@@ -59,6 +68,9 @@ class DesireHelper:
     self.laneChangeBsd = 0
     self.laneLineCheck = 0
     self.laneChangeDelay = 0.0
+    # lane-change minimum speed floor; stock constant, brand subclasses may
+    # replace it with a param-driven value (see desire_helper_byd)
+    self.lane_change_speed_floor_ms = LANE_CHANGE_SPEED_MIN
 
     # misc
     self.prev_desire_enabled = False
@@ -73,10 +85,26 @@ class DesireHelper:
   # ─────────────────────────────────────────────
   def _update_params_periodic(self):
     if self.frame % 100 == 0:
-      self.laneChangeNeedTorque = self.params.get_int("LaneChangeNeedTorque")
-      self.laneChangeBsd = self.params.get_int("LaneChangeBsd")
-      self.laneLineCheck = self.params.get_int("LaneLineCheck")
-      self.laneChangeDelay = self.params.get_float("LaneChangeDelay") * 0.1
+      self._read_params()
+
+  def _read_params(self):
+    self.laneChangeNeedTorque = self.params.get_int("LaneChangeNeedTorque")
+    self.laneChangeBsd = self.params.get_int("LaneChangeBsd")
+    self.laneLineCheck = self.params.get_int("LaneLineCheck")
+    self.laneChangeDelay = self.params.get_float("LaneChangeDelay") * 0.1
+
+  # ─────────────────────────────────────────────
+  # brand adaptation hooks - stock defaults are behavior-neutral no-ops;
+  # desire_helper_byd.BydDesireHelper overrides them with the vendor port
+  # ─────────────────────────────────────────────
+  def _update_clear_window(self, carstate):
+    pass
+
+  def _clear_window_ok(self) -> bool:
+    return True
+
+  def _mid_maneuver_abort(self, carstate) -> bool:
+    return False
 
   def _check_desire_state(self, modeldata, carstate, maneuver_type):
     desire_state = modeldata.meta.desireState
@@ -223,7 +251,7 @@ class DesireHelper:
     self.lane_change_delay = max(0.0, self.lane_change_delay - DT_MDL)
 
     v_ego = carstate.vEgo
-    below_lane_change_speed = v_ego < LANE_CHANGE_SPEED_MIN
+    below_lane_change_speed = v_ego < self.lane_change_speed_floor_ms
     trailer_maneuver_blocked = carstate.trailerConnected
 
     # per-side compute (좌/우 모두)
@@ -355,6 +383,7 @@ class DesireHelper:
             self.lane_change_state = LaneChangeState.preLaneChange
             self.lane_change_ll_prob = 1.0
             self.lane_change_delay = self.laneChangeDelay
+            self.lane_change_clear_time = 0.0
 
             # 맨 끝 차선이 아니면, ATC 자동 차선변경 비활성
             # (원본 유지: 차선 존재하거나 geom 가능하면 auto off, 아니면 on)
@@ -367,6 +396,10 @@ class DesireHelper:
             self.lane_change_direction = LaneChangeDirection.none
           else:
             self.lane_change_direction = LaneChangeDirection.left if blinker_state == BLINKER_LEFT else LaneChangeDirection.right
+
+            # brand clear-window hook (stock no-op; BYD accumulates same-side
+            # blindspot clearance - see desire_helper_byd)
+            self._update_clear_window(carstate)
 
             # torque direction cond
             torque_cond = (carstate.steeringTorque > 0) if blinker_state == BLINKER_LEFT else (carstate.steeringTorque < 0)
@@ -404,7 +437,9 @@ class DesireHelper:
                                     not atc_lane_change_retry_line_blocked
               start_gate = (side.lane_change_available_geom and self.lane_change_delay == 0) or \
                            side.lane_line_info_edge_detect or solid_line_blocked or block_released_auto or atc_line_release
-              if start_gate:
+              # brand clear-window gate (stock _clear_window_ok() is always True;
+              # BYD requires fresh rear-traffic clearance before any start path)
+              if start_gate and self._clear_window_ok():
                 if solid_line_blocked:
                   if atc_line_release or (torque_applied and not (bsd_active and block_lanechange_bsd)):
                     self.lane_change_state = LaneChangeState.laneChangeStarting
@@ -426,11 +461,23 @@ class DesireHelper:
                     # 여기서는 시작 직전 안전성 체크
                     if side.lane_change_available or atc_line_release:
                       self.lane_change_state = LaneChangeState.laneChangeStarting
+                # one reset covers all five entry paths above
+                if self.lane_change_state == LaneChangeState.laneChangeStarting:
+                  self.lane_change_clear_time = 0.0
 
         elif self.lane_change_state == LaneChangeState.laneChangeStarting:
-          self.lane_change_ll_prob = max(self.lane_change_ll_prob - 2 * DT_MDL, 0.0)
-          if lane_change_prob < 0.02 and self.lane_change_ll_prob < 0.01:
-            self.lane_change_state = LaneChangeState.laneChangeFinishing
+          # brand mid-maneuver abort hook (stock returns False; BYD falls back
+          # to preLaneChange KEEPING the direction on a fresh same-side BSD hit
+          # - DESIRES[dir][pre] is Desire.none so the car centers, and
+          # selfdrived's preLaneChange+blindspot predicate raises
+          # laneChangeBlocked. laneChangeFinishing is never aborted).
+          if self._mid_maneuver_abort(carstate):
+            self.lane_change_state = LaneChangeState.preLaneChange
+            self.lane_change_clear_time = 0.0
+          else:
+            self.lane_change_ll_prob = max(self.lane_change_ll_prob - 2 * DT_MDL, 0.0)
+            if lane_change_prob < 0.02 and self.lane_change_ll_prob < 0.01:
+              self.lane_change_state = LaneChangeState.laneChangeFinishing
 
         elif self.lane_change_state == LaneChangeState.laneChangeFinishing:
           self.lane_change_ll_prob = min(self.lane_change_ll_prob + DT_MDL, 1.0)
@@ -439,6 +486,7 @@ class DesireHelper:
             if desire_enabled:
               self.lane_change_state = LaneChangeState.preLaneChange
               self.next_lane_change = True
+              self.lane_change_clear_time = 0.0  # consecutive change needs a fresh window
             else:
               self.lane_change_state = LaneChangeState.off
 
@@ -482,3 +530,13 @@ class DesireHelper:
         self.desire = log.Desire.none
 
     return self.desire
+
+
+def get_desire_helper(brand: str) -> DesireHelper:
+  """Brand factory for the desire machine. Stock brands get the base class;
+  BYD gets BydDesireHelper (vendor lane-change port). Lazy import keeps the
+  stock DesireHelper module free of a top-level BYD dependency."""
+  if brand == "byd":
+    from openpilot.selfdrive.controls.lib.desire_helper_byd import BydDesireHelper
+    return BydDesireHelper()
+  return DesireHelper()
