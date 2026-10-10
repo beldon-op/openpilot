@@ -115,3 +115,5 @@ Pipfile
 
 # Local Windows native CPU test builds
 *.pyd
+.claude
+openspec
