@@ -34,6 +34,7 @@ from openpilot.selfdrive.locationd.helpers import PoseCalibrator, Pose
 
 from openpilot.selfdrive.carrot.carrot_controls import CarrotControls
 from openpilot.selfdrive.carrot.carrot_man_input import get_carrot_man
+from openpilot.selfdrive.controls.lib.assist_less_lane_change import get_assist_less_lane_change
 from openpilot.selfdrive.monitoring.dm_alerts import driver_monitoring_hud_alert
 
 State = log.SelfdriveState.OpenpilotState
@@ -99,6 +100,9 @@ class Controls:
     elif self.CP.lateralTuning.which() == 'torque':
       self.LaC = LatControlTorque(self.CP, self.CI)
     self.carrot_controls = CarrotControls(self.CP)
+    # Vendor assist-less lane change (LaneChangeAssistSpeed=0): releases latActive
+    # for a driver-steered lane change (sunnypilot 1b0713ac11 T3). Null for non-BYD.
+    self.assist_less = get_assist_less_lane_change(self.CP.brand)
 
   def update(self):
     self.sm.update(15)
@@ -151,6 +155,12 @@ class Controls:
                                            CS.steerFaultTemporary, CS.steerFaultPermanent, below_min_speed,
                                            CS.standstill, steer_at_standstill)
     CC.latActive = self.carrot_controls.lat_suspend_control(CS, CC.latActive)
+    # Vendor assist-less lane change (LaneChangeAssistSpeed=0): release lateral
+    # for a driver-steered lane change; unconditional here, matching the
+    # vendor's unconditional CC.latActive=False (sunnypilot controlsd_ext order:
+    # whoever hits first wins - lat_suspend's angle sleep takes precedence).
+    if self.assist_less.update(CS):
+      CC.latActive = False
     CC.longActive = CC.enabled and not any(e.overrideLongitudinal for e in self.sm['onroadEvents']) and self.CP.openpilotLongitudinalControl
 
     # AlwaysLateral must also stop while manager drains workers for this reboot.

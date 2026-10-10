@@ -21,6 +21,7 @@ from openpilot.selfdrive.locationd.helpers import PoseCalibrator, Pose
 from openpilot.selfdrive.selfdrived.camera_config import get_camera_packets
 from openpilot.selfdrive.selfdrived.events import Events, ET, EmptyAlert
 from openpilot.selfdrive.selfdrived.helpers import ExcessiveActuationCheck
+from openpilot.selfdrive.controls.lib.assist_less_lane_change import get_assist_less_lane_change
 from openpilot.selfdrive.selfdrived.state import StateMachine
 from openpilot.selfdrive.selfdrived.impact_detector import ImpactDetector
 from openpilot.selfdrive.monitoring.dm_alerts import CameraFallbackNotice
@@ -136,6 +137,12 @@ class SelfdriveD:
     self.byd_long_fw_blocked = False
     self._byd_long_blocked_prev = None
     self._byd_long_blocked_acc = 0
+
+    # Vendor assist-less lane change (sunnypilot 1b0713ac11 T3): second instance
+    # of the same latch controlsd runs to release latActive - events must be
+    # produced here (carrot has no NO_ACTUATION->latActive propagation chain,
+    # 案A); identical carState inputs converge the two within one frame.
+    self.assist_less_lane_change = get_assist_less_lane_change(self.CP.brand)
 
     self.initialized = False
     self.enabled = False
@@ -406,6 +413,13 @@ class SelfdriveD:
           self.events.add(EventName.preLaneChangeRight)
     elif self.sm['modelV2'].meta.laneChangeState in (LaneChangeState.laneChangeStarting,
                                                     LaneChangeState.laneChangeFinishing):
+      self.events.add(EventName.laneChange)
+
+    # Vendor assist-less lane change: same "Changing Lanes" display while the
+    # driver steers the lane change manually (latActive release runs on the
+    # controlsd side with the identical latch). No-op while the assist mode is
+    # enabled (LaneChangeAssistSpeed > 0, where the desire machine owns it).
+    if self.assist_less_lane_change.update(CS):
       self.events.add(EventName.laneChange)
 
     for i, pandaState in enumerate(self.sm['pandaStates']):

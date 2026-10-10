@@ -351,6 +351,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"LaneChangeDelay", {PERSISTENT, INT, "0"}},
     {"LaneChangeBsd", {PERSISTENT, INT, "0"}},
     {"LaneLineCheck", {PERSISTENT, INT, "0"}},
+    {"LaneChangeAssistSpeed", {PERSISTENT, INT, "20"}},  // MPH; 0 = assist-less (BYD-only vendor port, sunnypilot 1b0713ac11; ignored on other brands)
     {"MaxAngleFrames", {PERSISTENT, INT, "89"}},
 
     {"LatMpcPathCost", {PERSISTENT, INT, "200"}},
