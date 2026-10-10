@@ -23,9 +23,9 @@
 |---|---|---|---|
 | `ws://<车机IP>:8083/ws` | WebSocket | ✔ | 双向：收事件，可发 subscribe / snapshot / ping |
 | `http://<车机IP>:8083/stream` | SSE | ✔ | 单向推流，`?kinds=events,sound` 过滤 |
-| `http://<车机IP>:8083/state` | HTTP GET | ✔ | 一次性全量状态快照（见 §5） |
+| `http://<车机IP>:8083/state` | HTTP GET | ✔ | 一次性全量状态快照：数据段 + 服务状态段（见 §5） |
 | `http://<车机IP>:8083/sounds/<file.wav>` | HTTP GET | ✔ | sound 事件对应音效文件 |
-| `http://<车机IP>:8083/health` | HTTP GET | ✘ | 服务健康状态 |
+| `http://<车机IP>:8083/health` | HTTP GET | ✘ | 服务健康状态（含 poller 心跳新鲜度） |
 
 车机 IP 在车机设置 / 路由器管理页查看，客户端需与车机在同一局域网。
 
@@ -288,18 +288,57 @@ onroad 告警集合**发生变化时**推送（出现/消失去抖，不每帧�
 {
   "ts": 1791472951.467,
   "data": {
-    "car":     { "ts": 1791472951.400, "data": { "vEgoKph": 54.0, "...": "..." } },
-    "opstate": { "ts": 1791472940.123, "data": { "state": "enabled", "...": "..." } },
-    "events":  { "ts": 1791472947.925, "data": { "added": [...], "removed": [...], "active": [...] } },
-    "sound":   { "ts": 1791472948.300, "data": { "sound": "stopStop", "...": "..." } }
+    "car":      { "ts": 1791472951.400, "data": { "vEgoKph": 54.0, "...": "..." } },
+    "opstate":  { "ts": 1791472940.123, "data": { "state": "enabled", "...": "..." } },
+    "events":   { "ts": 1791472947.925, "data": { "added": [...], "removed": [...], "active": [...] } },
+    "sound":    { "ts": 1791472948.300, "data": { "sound": "stopStop", "...": "..." } },
+    "panda":    { "ts": 1791472951.380, "data": { "count": 1, "pandas": [ "..." ] } },
+    "services": { "ts": 1791472951.420, "data": { "carState": { "...": "..." }, "...": "..." } },
+    "meta":     { "ts": 1791472951.420, "data": { "frame": 41233, "onroad": false } }
   }
 }
 ```
 
 - 每段自带 `ts`（Unix 墙钟秒，车机时钟错时自行对齐），客户端据此判断新鲜度
-- **未收到过的段不出现**（offroad 刚启动时 `car`/`opstate` 可能缺失）；
+- **未收到过的数据段不出现**（offroad 刚启动时 `car`/`opstate` 可能缺失）；
   `button` 永远不在快照里（瞬时边沿）
 - `events` 段在告警清空后保留空 `active`（表示"确认无告警"，区别于未收到）
+- `meta` / `services` 每轮 poller 循环（≤100ms）刷新，`panda` 随 pandaStates（10Hz）刷新；
+  这三段是**服务状态**，只出现在 `/state` 与 WS `snapshot`，不进事件流广播
+
+### 服务状态段（meta / services / panda）
+
+`data` 为空或缺段时，按这三段自查，顺序如下：
+
+1. **meta.ts 是不是在变旧** → 变旧超过 1–2s = poller 线程已死/卡死（HTTP 服务本身
+   仍会正常应答，别信 200）。`frame` 是 SubMaster 循环计数，单调递增，可当心跳序号。
+2. **meta.onroad**（params `IsOnroad`）→ `false` 时 `card`/`selfdrived` 不运行，
+   `car`/`opstate`/`events`/`sound` 缺段属**常态**，不是故障。
+3. **services**：每个订阅 topic 一条，字段如下：
+
+| 字段 | 类型 | 含义 |
+|---|---|---|
+| `seen` | bool | 服务启动以来是否收到过该 topic（频率 0 的 on-demand topic 恒判 `alive`，要靠它区分） |
+| `alive` | bool | 最近消息是否在 10× 期望周期内（新鲜度） |
+| `valid` | bool | 最近一条消息的 `valid` 标志 |
+| `ageS` | float/null | 距最近一条消息的秒数（本进程单调钟差值，**仅同设备同次开机内可比**）；`null`=从未收到 |
+
+`panda` 段来自 pandaStates——`pandad` 常驻，**offroad 下唯一持续更新的数据段**：
+
+| 字段 | 含义 |
+|---|---|
+| `count` / `pandas[]` | panda 数量与逐只明细（`type` 型号，`uptime` 秒） |
+| `heartbeatLost` | true=主机与这只 panda 失联（USB/线路问题） |
+| `ignitionLine` | 点火线检测（台架判断 ACC 档位） |
+| `controlsAllowed` | panda 是否放行控制输出 |
+| `safetyModel` / `safetyParam` | 安全模型（如 `byd`）与其参数 |
+| `faultStatus` / `faults[]` | `none`/`faultTemp`/`faultPerm` 与逐条故障枚举 |
+| `harnessStatus` | `notConnected`/`normal`/`flipped`（comma  harness） |
+| `canStates[]` | 每路 CAN：`busOff`/`busOffCnt` 总线关闭，`canSpeed`（0=该路没流量，台架查接线/车辆上电），`totalRxCnt/totalTxCnt` 收发计数，`errorWarning/errorPassive` 错误状态 |
+
+> 典型判读：offroad 且 `panda.pandas[0].heartbeatLost=false`、`canStates[*].canSpeed>0`
+> → 车机与 panda 链路正常，只是 openpilot 没上电；`panda` 整段缺失 → pandad 没跑或
+> `services.pandaStates.seen=false`。
 
 ### `car` 段字段
 
@@ -343,10 +382,13 @@ sound 事件的配套音效。目录随语言设置切换（`sounds` / `sounds_c
 ### `GET /health`
 
 ```json
-{ "ok": true, "service": "mate", "uptime": 1234.5, "clients": 2, "token_auth": false }
+{ "ok": true, "service": "mate", "uptime": 1234.5, "clients": 2,
+  "token_auth": false, "poller_age": 0.1, "onroad": false }
 ```
 
-不鉴权，供探活脚本使用。
+不鉴权，供探活脚本使用。`poller_age`=meta 心跳距今秒数（`null`=poller 从未跑起来）；
+`ok` 现在等于「HTTP 服务在 + poller 心跳 < 2s」，光看 HTTP 200 不够，探活请断言 `ok`。
+`onroad` 透传 params `IsOnroad`，解释 `/state` 数据段为何缺失。
 
 ---
 
@@ -359,7 +401,7 @@ sound 事件的配套音效。目录随语言设置切换（`sounds` / `sounds_c
 - **对时**：用每段 `ts`（车机墙钟），不要用客户端本地收包时间推算状态时序。
 - **枚举容错**：所有枚举为字符串，未来新增值可能显示为 `"unknown"`，客户端要兜底。
 - **流量**：事件为低频边沿（全订阅约 1–3 条/秒，峰值出现在按键/告警瞬间），
-  无需 topic 级节流；`/state` 一次约 2–4 KB。
+  无需 topic 级节流；`/state` 一次约 3–6 KB（含 services/panda/meta 状态段）。
 - **不要公网暴露**：设计为局域网使用；远程访问走 VPN/内网穿透并务必设置 `MateToken`。
 
 ## 8. 部署

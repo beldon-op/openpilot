@@ -33,3 +33,24 @@ class TestHubSnapshot:
     assert len(hub.replay_snapshot()) == 1
     hub.emit("sound", {"sound": "none", "file": None, "loop": False, "alertText1": "", "alertText2": ""})
     assert hub.replay_snapshot() == []
+
+
+class TestHubServiceState:
+  def test_poller_age_and_onroad(self):
+    hub = Hub()
+    assert hub.poller_age() is None and hub.onroad() is None  # meta 未写入 = poller 没跑
+    hub.set_state("meta", {"frame": 7, "onroad": False})
+    age = hub.poller_age()
+    assert age is not None and age < 1.0
+    assert hub.onroad() is False
+    hub.set_state("meta", {"frame": 8, "onroad": True})
+    assert hub.onroad() is True
+
+  def test_status_sections_snapshot_only(self):
+    hub = Hub()
+    hub.set_state("services", {"carState": {"seen": False}})
+    hub.set_state("panda", {"count": 0, "pandas": []})
+    assert hub.replay_snapshot() == []  # 状态段只进 /state，不广播不补发
+    snap = hub.state_snapshot()
+    assert snap["data"]["services"]["data"]["carState"] == {"seen": False}
+    assert snap["data"]["panda"]["data"] == {"count": 0, "pandas": []}

@@ -8,8 +8,9 @@ WebSocket 和 SSE 推给局域网客户端。参考实现为 cp_byd local_collec
 接口：
   GET /ws                 WebSocket（heartbeat 20s）
   GET /stream             SSE（?kinds=events,sound 可过滤）
-  GET /state              一次性状态快照（car/opstate/events/sound 最新值，不周期推流）
-  GET /health             健康检查（不鉴权）
+  GET /state              一次性状态快照（car/opstate/events/sound 最新值 +
+                          services/panda/meta 服务状态段，不周期推流）
+  GET /health             健康检查（不鉴权，含 poller 心跳新鲜度与 onroad 标志）
   GET /sounds/<file.wav>  播放 sound 事件对应的音效文件（随语言目录切换）
 
 WS 客户端也可发 {"type":"snapshot"} 走同一条连接拿快照。协议文档见 mate/API.md。
@@ -47,6 +48,7 @@ REPLAY_KINDS = ("events", "sound")  # 新连接先补发这两类的当前状态
 TOKEN_PARAM = "MateToken"
 SLOW_CLIENT_QUEUE = 256
 SSE_KEEPALIVE_S = 15.0
+POLLER_STALE_S = 2.0  # poller 每轮（≤100ms）刷 meta，超这个秒数没刷即视为线程死亡
 
 ASSETS_DIR = os.path.join(BASEDIR, "openpilot", "selfdrive", "assets")
 
@@ -122,9 +124,22 @@ class Hub:
     self.clients.pop(q, None)
 
   def set_state(self, kind: str, data: dict) -> None:
-    """非边沿状态（car 快照）只进快照，不广播、不补发。每段带自己的写入时间。"""
+    """car/services/panda/meta 这类状态段只进快照，不广播、不补发。每段带自己的写入时间。"""
     with self._snapshot_lock:
       self.snapshot[kind] = {"ts": wallclock(), "data": data}
+
+  def poller_age(self) -> float | None:
+    """poller 心跳距今秒数；None=meta 从未写入（线程死在启动或根本没起）。"""
+    with self._snapshot_lock:
+      meta = self.snapshot.get("meta")
+    if meta is None:
+      return None
+    return max(0.0, round(wallclock() - meta["ts"], 1))
+
+  def onroad(self) -> bool | None:
+    with self._snapshot_lock:
+      meta = self.snapshot.get("meta")
+    return None if meta is None else bool(meta["data"].get("onroad"))
 
   def emit(self, kind: str, data: dict) -> None:
     """任意线程可调。events/sound 同时维护补发快照；STATE_KINDS 进 /state。"""
@@ -259,19 +274,24 @@ async def sounds_handler(request: web.Request):
 
 
 async def state_handler(request: web.Request):
-  """GET /state：一次性全量快照（car/opstate/events/sound 最新值 + 各自 ts）。
-  未收到过的段不出现；car 段在 offroad 后保持最后一次 onroad 状态并随 ts 变旧。"""
+  """GET /state：一次性全量快照（car/opstate/events/sound/panda 最新值 + 各自 ts，
+  外加 services/meta 两段服务状态，每轮 poller 循环刷新）。
+  未收到过的数据段不出现；data 全空时看 meta（poller 是否活着）与 services
+  （哪个 topic 见过数据）定位原因。car 段在 offroad 后保持最后一次 onroad 状态并随 ts 变旧。"""
   check_auth(request)
   return web.json_response(hub.state_snapshot())
 
 
 async def health_handler(request: web.Request):
+  age = hub.poller_age()
   return web.json_response({
-    "ok": True,
+    "ok": age is not None and age < POLLER_STALE_S,
     "service": "mate",
     "uptime": round(time.monotonic() - hub.start_time, 1),
     "clients": len(hub.clients),
     "token_auth": read_token() is not None,
+    "poller_age": age,
+    "onroad": hub.onroad(),
   })
 
 

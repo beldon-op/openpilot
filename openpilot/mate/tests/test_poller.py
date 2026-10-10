@@ -11,19 +11,27 @@ from openpilot.mate.poller import (
   enum_name,
   event_to_dict,
   opstate_payload,
+  panda_payload,
+  services_status,
   sound_payload,
 )
 from openpilot.selfdrive.ui.soundd import AudibleAlert
 
 
 class FakeSM:
-  """最小 SubMaster 替身：updated / 下标 / recv_time 三个接口。"""
+  """最小 SubMaster 替身：updated / 下标 / recv_time / 健康度属性。"""
 
   def __init__(self, **messages):
     self._messages = dict(messages)
+    self.services = list(self._messages)
     self.updated = dict.fromkeys(self._messages, True)
     now = time.monotonic()
     self.recv_time = dict.fromkeys(self._messages, now)
+    self.frame = 1
+    self.seen = dict.fromkeys(self._messages, True)
+    self.alive = dict.fromkeys(self._messages, True)
+    self.valid = dict.fromkeys(self._messages, True)
+    self.logMonoTime = dict.fromkeys(self._messages, int(now * 1e9))
 
   def __getitem__(self, key):
     return self._messages[key]
@@ -122,6 +130,50 @@ class TestCarSnapshot:
     # 从未 update 过的 CarState（offroad 首帧）也要能出快照，不能抛
     snap = car_snapshot(car.CarState.new_message())
     assert snap["standstill"] is False and snap["gearShifter"] == "unknown"
+
+
+class TestServiceStatus:
+  def test_shape_and_age(self):
+    sm = make_sm()
+    status = services_status(sm)
+    assert set(status) == set(sm.services)
+    for entry in status.values():
+      assert entry["seen"] and entry["alive"] and entry["valid"]
+      assert 0 <= entry["ageS"] < 1.0
+    json.dumps(status)  # 必须始终可序列化
+
+  def test_unseen_topic(self):
+    # offroad 场景：carState 一帧没收过；alive 对 on-demand topic 会恒真，
+    # 全靠 seen 字段区分「数据源没跑」
+    sm = make_sm()
+    sm.seen["carState"] = False
+    sm.alive["carState"] = False
+    entry = services_status(sm)["carState"]
+    assert entry["seen"] is False and entry["alive"] is False and entry["ageS"] is None
+
+
+class TestPandaPayload:
+  def test_full_payload(self):
+    ps = [log.PandaState.new_message(
+      heartbeatLost=True, controlsAllowed=False, safetyModel="byd", safetyParam=1,
+      harnessStatus="notConnected", uptime=42, faults=["relayMalfunction"],
+      canState0={"busOff": True, "busOffCnt": 3, "canSpeed": 500, "totalRxCnt": 10},
+    )]
+    p = panda_payload(ps)
+    assert p["count"] == 1
+    d = p["pandas"][0]
+    assert d["heartbeatLost"] is True and d["safetyModel"] == "byd" and d["safetyParam"] == 1
+    assert d["faultStatus"] == "none" and d["faults"] == ["relayMalfunction"]
+    assert d["harnessStatus"] == "notConnected" and d["uptime"] == 42
+    assert len(d["canStates"]) == 3
+    bus0 = d["canStates"][0]
+    assert bus0["bus"] == 0 and bus0["busOff"] is True and bus0["canSpeed"] == 500
+    json.dumps(p)  # 必须始终可序列化
+
+  def test_defaults_readable(self):
+    # 全默认字段（未 set）的 PandaState 也不能抛
+    p = panda_payload([log.PandaState.new_message()])
+    assert p["pandas"][0]["heartbeatLost"] is False and p["pandas"][0]["faults"] == []
 
 
 class TestSoundTracker:
