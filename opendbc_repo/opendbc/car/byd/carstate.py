@@ -45,9 +45,11 @@ class CarState(CarStateBase):
     self.steer_error = 0
     self.res_btn_pressed = False
     self.counter_pcm_buttons = 0
-    # Stalk-blinker side mapping override for the Song (see update). Raw
-    # /data/params file, readable before the prebuilt params_pyx.so knows the
-    # key. 1 = swap L/R. Read once at init - restart to pick up changes.
+    # Stalk-blinker side mapping override (see update): 1 = exchange the
+    # (2,3) left / (4,5) right detent sets - only for a stalk that reads the
+    # opposite way; the 宋 was confirmed correct with the default
+    # (2026-10-05..07 road test, sunnypilot). Read once at init - restart to
+    # pick up changes.
     self.blinker_stalk_swap = False
     try:
       with open('/data/params/BydBlinkerStalkSwap') as f:
@@ -247,15 +249,21 @@ class CarState(CarStateBase):
     # Song Plus: the Han-layout LeftIndicator/RightIndicator bits (STALKS
     # byte0) NEVER move on this car - drive route 4 (2026-10-04): byte0
     # constant 0x01 through two 5-7 s stalk holds. The stalk position lives in
-    # TURN_SIGNAL_SWITCH (byte4, 36|3@1+): 1 = neutral, 4/5 = the two held
-    # detents (the actual lamps blink on 0x322 at 1.35 Hz during a hold).
-    # The vendor agrees: BYD_SONG_PLUS is in its ALT_BLINKER_CARS list
-    # (stalk-based blinkers, not lamp bits) - cp_byd carstate values dump.
-    # Default 5=left is a guess until a real flick confirms the side; write
-    # BydBlinkerStalkSwap=1 (raw file + restart) if the UI shows the opposite.
+    # TURN_SIGNAL_SWITCH (byte4, 36|3@1+) and the vendor decodes it as two
+    # SETS, not two singles - carstate.py.disasm 10706/10756:
+    #   leftBlinker = switch in (2, 3), rightBlinker = switch in (4, 5)
+    # (BYD_SONG_PLUS is in its ALT_BLINKER_CARS list: stalk-based blinkers).
+    # Confirmed on the car (sunnypilot road test, 415-segment raw sweep):
+    # a flick reads 1 -> transient -> held detent, right = 4 then 5,
+    # left = 2 then 3. The earlier single-value guess (5 = left) inverted both
+    # sides and is what the road test hit: every "right lane change" fired off
+    # the 0.2-0.3 s transient 4 (60 starting-right events, all on blips; zero
+    # long right holds in 415 segments), while a real left hold (3) decoded as
+    # no blinker at all - "right works, left does nothing".
     switch = int(cp.vl["STALKS"]["TURN_SIGNAL_SWITCH"])
-    ret.leftBlinker = switch == (4 if self.blinker_stalk_swap else 5)
-    ret.rightBlinker = switch == (5 if self.blinker_stalk_swap else 4)
+    left_vals, right_vals = ((4, 5), (2, 3)) if self.blinker_stalk_swap else ((2, 3), (4, 5))
+    ret.leftBlinker = switch in left_vals
+    ret.rightBlinker = switch in right_vals
     ret.espDisabled = False
     ret.stockAeb = bool(cp_adas.vl["ACC_HUD_ADAS"]["AEB"])
     ret.stockFcw = bool(cp_adas.vl["ACC_HUD_ADAS"]["FCW"])

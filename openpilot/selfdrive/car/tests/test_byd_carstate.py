@@ -1,5 +1,7 @@
 from collections import defaultdict
 
+import pytest
+
 from opendbc.car import Bus, structs
 from opendbc.car.byd.carstate import AVAIL_FALL_DEBOUNCE_TIME, BOOT_LATCH_HOLD_TIME, CarState
 from opendbc.car.byd.values import CAR
@@ -138,3 +140,43 @@ class TestBydMainLatch:
       ret = run_update(cs, main=False, session=False)
     assert not ret.cruiseState.available
     assert not ret.cruiseState.enabled
+
+
+class TestBydStalkBlinkers:
+  """TURN_SIGNAL_SWITCH side mapping - the vendor decodes it as two SETS
+  (carstate.py.disasm 10706/10756): (2, 3) = left, (4, 5) = right, 1 = neutral.
+
+  Road test 2026-10-05..07 (sunnypilot, 415-segment raw sweep) on the 宋: a
+  flick reads transient-then-detent - right = 4 then 5, left = 2 then 3 - so
+  BOTH members of a side must light that side. The earlier single-value guess
+  (5 = left, 4 = right) inverted the sides: lane changes fired only off the
+  0.2-0.3 s right transient and a real left hold (3) decoded as no blinker at
+  all ("right works, left does nothing"). Ported from sunnypilot 839d871ae8.
+  """
+
+  @pytest.mark.parametrize("switch, expected", [
+    (1, (False, False)),   # neutral
+    (2, (True, False)),    # left transient (stalk moving)
+    (3, (True, False)),    # left held detent
+    (4, (False, True)),    # right transient
+    (5, (False, True)),    # right held detent
+    (0, (False, False)),   # unused positions read as "no blinker"
+    (6, (False, False)),
+    (7, (False, False)),
+  ])
+  def test_side_sets(self, switch, expected):
+    cs = make_carstate()
+    pt, adas = FakeParser(), FakeParser()
+    pt.vl['STALKS']['TURN_SIGNAL_SWITCH'] = switch
+    ret = cs.update({Bus.pt: pt, Bus.adas: adas})
+    assert (bool(ret.leftBlinker), bool(ret.rightBlinker)) == expected
+
+  def test_swap_override(self):
+    # BydBlinkerStalkSwap=1 exchanges the two sets (other BYD stalk layouts)
+    cs = make_carstate()
+    cs.blinker_stalk_swap = True
+    for switch, expected in [(2, (False, True)), (5, (True, False))]:
+      pt, adas = FakeParser(), FakeParser()
+      pt.vl['STALKS']['TURN_SIGNAL_SWITCH'] = switch
+      ret = cs.update({Bus.pt: pt, Bus.adas: adas})
+      assert (bool(ret.leftBlinker), bool(ret.rightBlinker)) == expected
