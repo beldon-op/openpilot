@@ -6,6 +6,7 @@ from opendbc.car import get_safety_config, get_friction, structs
 from opendbc.car.interfaces import FRICTION_THRESHOLD, CarInterfaceBase
 from opendbc.car.byd.carcontroller import CarController
 from opendbc.car.byd.carstate import CarState
+from opendbc.car.byd.radar_interface import RadarInterface
 from opendbc.car.byd.values import HUD_MULTIPLIER, USE_ANGLE_STEERING, BydSafetyFlags, CarControllerParams
 
 
@@ -64,6 +65,7 @@ def _read_lat_state() -> tuple[bool, float]:
 class CarInterface(CarInterfaceBase):
   CarState = CarState
   CarController = CarController
+  RadarInterface = RadarInterface
 
   def __init__(self, CP: structs.CarParams):
     super().__init__(CP)
@@ -107,6 +109,14 @@ class CarInterface(CarInterfaceBase):
       ret.lateralTuning.torque.ki = 0.0
     ret.steerLimitTimer = 0.5
 
+    # No valid MRR target exists on any recorded bus (docs/byd-lane-change.md
+    # §8.5): 0x374 absent, 0x380-0x38f is a status table, and the 0x351-354
+    # track slots on bus 1 are present but logged IsValid=0 only. RadarInterface
+    # parses those slots (community tangdm layout) and falls back to the 0x32D
+    # HUD bar synthesis; the slot path auto-lights if a real target stream ever
+    # appears (private-CAN tap / AEB duty). It stays inert until
+    # RADAR_HUD_BARS_TO_M is calibrated on-road; flipping this flag is then the
+    # only change needed. Behavior today is unchanged.
     ret.radarUnavailable = True
 
     # longitudinal control is done by the stock ACC; openpilot does lateral

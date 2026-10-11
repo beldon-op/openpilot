@@ -229,3 +229,35 @@ VAL_ 813 Notify 36 "ACC_ERROR" 22 "OVERRIDE" 12 "ENGAGE" 8 "DISENGAGE" 20 "ACC_O
 VAL_ 834 DriveMode 2 "SPORT" 1 "ECO" 0 "SNOW" ;
 VAL_ 834 PowerMode 3 "HEV" 2 "FORCE_EV" 1 "EV" ;
 VAL_ 944 BTN_AccUpDown_Cmd 0 "NOTPRESSED" 1 "DOWN_SETSPEED" 3 "UP_RESETSPEED" ;
+
+; MRR track slots on bus 1 (Song Plus DM-i: frames present @~25Hz but 415 logged
+; segments show IsValid=0 only - placeholder slots; layout from the mypilot
+; community byd_tangdm_radar.dbc, verbatim including the 850 LatDist sign quirk,
+; see docs/byd-lane-change.md §8.5.6). b0/b1 are rolling freshness/CRC bytes.
+BO_ 849 RADAR_TRACK_351: 8 XXX
+ SG_ LongDist_tang : 16|12@1- (0.06,-4) [-61.44|61.41] "m" XXX
+ SG_ LatDist_tang : 28|10@1+ (0.05,-25.6) [-15.36|15.33] "m" XXX
+ SG_ TrackID_tang : 38|6@1+ (1,0) [0|63] "" XXX
+ SG_ RelSpeed_tang : 44|10@1+ (1,-512) [-512|511] "km/h" XXX
+ SG_ IsValid_tang : 56|1@0+ (1,0) [0|1] "" XXX
+
+BO_ 850 RADAR_TRACK_352: 8 XXX
+ SG_ LongDist_tang : 16|12@1- (0.06,-4) [-61.44|61.41] "m" XXX
+ SG_ LatDist_tang : 28|10@1+ (-0.05,-25.6) [-15.36|15.33] "m" XXX
+ SG_ TrackID_tang : 38|6@1+ (1,0) [0|63] "" XXX
+ SG_ RelSpeed_tang : 44|10@1+ (1,-512) [-512|511] "km/h" XXX
+ SG_ IsValid_tang : 56|1@0+ (1,0) [0|1] "" XXX
+
+BO_ 851 RADAR_TRACK_353: 8 XXX
+ SG_ LongDist_tang : 16|12@1- (0.06,-4) [-61.44|61.41] "m" XXX
+ SG_ LatDist_tang : 28|10@1+ (0.05,-25.6) [-15.36|15.33] "m" XXX
+ SG_ TrackID_tang : 38|6@1+ (1,0) [0|63] "" XXX
+ SG_ RelSpeed_tang : 44|10@1+ (1,-512) [-512|511] "km/h" XXX
+ SG_ IsValid_tang : 56|1@0+ (1,0) [0|1] "" XXX
+
+BO_ 852 RADAR_TRACK_354: 8 XXX
+ SG_ LongDist_tang : 16|12@1- (0.06,-4) [-61.44|61.41] "m" XXX
+ SG_ LatDist_tang : 28|10@1+ (0.05,-25.6) [-15.36|15.33] "m" XXX
+ SG_ TrackID_tang : 38|6@1+ (1,0) [0|63] "" XXX
+ SG_ RelSpeed_tang : 44|10@1+ (1,-512) [-512|511] "km/h" XXX
+ SG_ IsValid_tang : 56|1@0+ (1,0) [0|1] "" XXX
