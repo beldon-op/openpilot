@@ -42,14 +42,15 @@ def recording():
     _should_render=True, _render_texture=None, _record_enabled=False, _scale=1., _nav_stack_ticks=[], _nav_stack=[],
     _nav_stack_widgets_to_render=1, _show_fps=False, _show_touches=False, _grid_size=0, _record_frame_idx=2,
     _record_every_n=3, _ffmpeg_queue=queue.Queue(maxsize=1), _record_t0=0, _record_max_sec=60, _frame=0,
-    _scaled_width=100, _scaled_height=50, _monitor_fps=lambda: None)
+    width=100, height=50, _scaled_width=100, _scaled_height=50, _monitor_fps=lambda: None,
+    _read_framebuffer=lambda: 73)
   return app, calls, scope
 
 
 @pytest.mark.parametrize('keep', ['record', 'cli_record', 'scale', 'burn_in', 'none'])
 def test_recording_target_released_only_when_unused(recording, keep):
   app, calls, scope = recording
-  app._render_texture = target = SimpleNamespace(texture=9)
+  app._render_texture = target = SimpleNamespace(id=7, texture=9)
   app._record_enabled = keep == 'record'
   app._scale = .75 if keep == 'scale' else 1.
   scope['RECORD'] = keep == 'cli_record'
@@ -67,24 +68,68 @@ def test_start_recording_midframe_does_not_end_or_capture_an_unbegun_target(reco
   app, calls, _ = recording
   frames = app.render()
   assert next(frames)
+  assert app.render_framebuffer == 73
   app._record_enabled = True
-  app._render_texture = SimpleNamespace(texture=9)
+  app._render_texture = SimpleNamespace(id=7, texture=9)
   app._window_close_requested = True
   assert list(frames) == []
+  assert app.render_framebuffer == 73
   names = [c[0] for c in calls]
   assert 'begin_drawing' in names and 'end_drawing' in names
   assert 'end_texture_mode' not in names
   assert 'load_image_from_texture' not in names
 
 
+@pytest.mark.parametrize('window_target', (0, 31, 92))
+def test_window_target_is_captured_after_begin_before_widgets(recording, window_target):
+  app, _, scope = recording
+  active = [-1]
+  scope['rl'].begin_drawing = lambda: active.__setitem__(0, window_target)
+  app._read_framebuffer = lambda: active[0]
+  rendered_targets = []
+  app._nav_stack = [SimpleNamespace(render=lambda _: rendered_targets.append(app.render_framebuffer))]
+  frames = app.render()
+  assert next(frames)
+  assert rendered_targets == [window_target]
+  app._window_close_requested = True
+  assert list(frames) == []
+
+
+def test_es2_framebuffer_reader_does_not_use_zero_returning_raylib_stub():
+  tree = ast.parse((LIB / 'application.py').read_text(encoding='utf8'))
+  node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == '_make_framebuffer_reader')
+  allocations, queries = [], []
+  def allocate(kind):
+    result = [0]
+    allocations.append(result)
+    return result
+  def query(pname, pointer):
+    assert pname == 0x8CA6
+    queries.append(pointer)
+    pointer[0] = 73
+  ffi = SimpleNamespace(cdef=lambda _: None, new=allocate,
+                        dlopen=lambda _: SimpleNamespace(glGetIntegerv=query))
+  scope = {'PC': False, 'cffi': SimpleNamespace(FFI=lambda: ffi),
+           'rl': SimpleNamespace(rl_get_active_framebuffer=lambda: 0)}
+  exec(compile(ast.Module(body=[node], type_ignores=[]), 'application.py', 'exec'), scope)
+  reader = scope['_make_framebuffer_reader']()
+  assert [reader() for _ in range(10)] == [73] * 10
+  assert len(allocations) == 1
+  assert all(pointer is allocations[0] for pointer in queries)
+  scope['PC'] = True
+  assert scope['_make_framebuffer_reader']() is scope['rl'].rl_get_active_framebuffer
+
+
 def test_stop_recording_midframe_releases_after_matching_end(recording):
   app, calls, _ = recording
   app._record_enabled = True
-  app._render_texture = SimpleNamespace(texture=9)
+  app._render_texture = SimpleNamespace(id=7, texture=9)
   frames = app.render()
   assert next(frames)
+  assert app.render_framebuffer == 7
   app._record_enabled = False
   assert next(frames)
+  assert app.render_framebuffer == 73
   names = [c[0] for c in calls]
   assert names.index('end_texture_mode') < names.index('unload_render_texture')
   assert app._render_texture is None
@@ -97,7 +142,7 @@ def test_stop_recording_midframe_releases_after_matching_end(recording):
 def test_encoder_backpressure_skips_gpu_readback(recording, full):
   app, calls, _ = recording
   app._record_enabled = True
-  app._render_texture = SimpleNamespace(texture=9)
+  app._render_texture = SimpleNamespace(id=7, texture=9)
   if full:
     app._ffmpeg_queue.put_nowait(b'previous')
   frames = app.render()
@@ -115,7 +160,7 @@ def test_text_measurement_cache_bounds_and_freshness(monkeypatch):
     return SimpleNamespace(x=len(text)*size, y=size)
   fake_rl = SimpleNamespace(Font=object, Vector2=object, measure_text_ex=measure)
   monkeypatch.setitem(sys.modules, 'pyray', fake_rl)
-  monkeypatch.setitem(sys.modules, 'openpilot.system.ui.lib.application', SimpleNamespace(FONT_SCALE=1.16, font_fallback=lambda f: f))
+  monkeypatch.setitem(sys.modules, 'openpilot.system.ui.lib.application', SimpleNamespace(FONT_SCALE=1.16, font_fallback=lambda f, text=None: f))
   monkeypatch.setitem(sys.modules, 'openpilot.system.ui.lib.emoji', SimpleNamespace(find_emoji=lambda _: []))
   spec = importlib.util.spec_from_file_location('_measure_test', LIB/'text_measure.py')
   module = importlib.util.module_from_spec(spec)
@@ -137,7 +182,8 @@ def test_text_measurement_cache_bounds_and_freshness(monkeypatch):
 
 
 @pytest.mark.parametrize('native', [False, True])
-def test_plain_text_hook_keeps_font_fallback_scale_and_spacing(monkeypatch, native):
+@pytest.mark.parametrize('text', ['한글', '한글'.encode(), '35° / €'])
+def test_plain_text_hook_keeps_font_fallback_scale_and_spacing(monkeypatch, native, text):
   from openpilot.system.ui.lib import native_text
   original_calls, native_calls = [], []
   def original(*args):
@@ -147,13 +193,18 @@ def test_plain_text_hook_keeps_font_fallback_scale_and_spacing(monkeypatch, nati
     return native
   monkeypatch.setattr(native_text, 'try_plain_text', optimized)
   rl = SimpleNamespace(draw_text_ex=original)
-  scope = {'rl': rl, 'FONT_SCALE': 1.16, 'font_fallback': lambda _: 'fallback'}
+  fallback_calls = []
+  def fallback(font, value):
+    fallback_calls.append((font, value))
+    return 'fallback'
+  scope = {'rl': rl, 'FONT_SCALE': 1.16, 'font_fallback': fallback}
   cls = methods('application.py', 'GuiApplication', ['_patch_text_functions'], scope)
   app = cls()
   app._patch_text_functions()
   app._patch_text_functions()  # Reinitialization must not multiply the scale twice.
-  rl.draw_text_ex('input_font', '한글', (10, 20), 40, 1.7, 'white')
-  expected = ('fallback', '한글', (10, 20), 40*1.16, 1.7, 'white')
+  rl.draw_text_ex('input_font', text, (10, 20), 40, 1.7, 'white')
+  expected = ('fallback', text, (10, 20), 40*1.16, 1.7, 'white')
+  assert fallback_calls == [('input_font', text)]
   assert native_calls == [(rl, *expected)]
   assert original_calls == ([] if native else [expected])
 

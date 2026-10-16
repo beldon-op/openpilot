@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import json
 import os
 import time
 import threading
@@ -25,14 +26,17 @@ from openpilot.selfdrive.car.card_diagnostics import should_log_card_diagnostics
 from openpilot.selfdrive.car.cruise import VCruiseCarrot
 from openpilot.selfdrive.car.car_specific import MockCarState
 from openpilot.selfdrive.car.openpilot_toggle import CruiseMainOpenpilotToggle
+from openpilot.selfdrive.controls.lib.lateral_readiness import LateralStartupGate
 from openpilot.selfdrive.carrot.xiaoge.xiaoge_vision import (
   XiaogeVisionResult,
   apply_xiaoge_vision_result,
   parse_xiaoge_vision_payload,
+  xiaoge_blindspot_vision,
 )
 
 REPLAY = "REPLAY" in os.environ
 XIAOGE_LANE_ERROR_LOG_INTERVAL_NS = 5_000_000_000
+XIAOGE_SOURCE_HEARTBEAT_NS = 1_000_000_000
 
 # BYD Song Plus DM-i: the DiPilot camera (MPC) faults with 'check multifunction
 # video controller' when it sees the UDS/isotp firmware-query frames that card
@@ -87,14 +91,16 @@ class Car:
   def __init__(self, CI=None) -> None:
     self.can_sock = messaging.sub_sock('can', timeout=20)
     self.sm = messaging.SubMaster(['pandaStates', 'carControl', 'onroadEvents', 'carrotMan', 'longitudinalPlan',
-                                   'radarState', 'modelV2', 'drivingModelData', 'customReservedRawData0'])
-    self.pm = messaging.PubMaster(['sendcan', 'carState', 'carParams', 'carOutput'])
+                                   'radarState', 'modelV2', 'drivingModelData', 'customReservedRawData0',
+                                   'liveParameters', 'livePose', 'selfdriveState', 'lateralPlan'])
+    self.pm = messaging.PubMaster(['sendcan', 'carState', 'carParams', 'carOutput', 'customReservedRawData1'])
 
     self.can_rcv_cum_timeout_counter = 0
 
     self.CC_prev = car.CarControl.new_message()
     self.CS_prev = car.CarState.new_message()
     self.initialized_prev = False
+    self.lateral_startup = LateralStartupGate()
     self.cruise_main_toggle = CruiseMainOpenpilotToggle(ButtonType.mainCruise)
 
     self.last_actuators_output = structs.CarControl.Actuators()
@@ -191,6 +197,9 @@ class Car:
     self.card_diag_slow_process = 0
     self.card_diag_can_timeouts = 0
     self.xiaoge_vision_result: XiaogeVisionResult | None = None
+    self.xiaoge_blindspot_sources = (False, False, False, False)
+    self.xiaoge_blindspot_sources_published = None
+    self.xiaoge_blindspot_sources_published_ns = 0
     self.xiaoge_vision_error_log_at_ns = 0
     self.card_diag_stage_names = ('decode', 'ci_update', 'sm_update', 'vision', 'state_tail',
                                   'state_total', 'publish', 'apply', 'sendcan', 'total')
@@ -214,6 +223,10 @@ class Car:
     decode_done_ns = time.monotonic_ns()
 
     # Update carState from CAN
+    # joongyu01/speedcam: camera skips and section unlock (+ / gas tap) apply only while engaged,
+    # and a section unlocks only when the set speed is above its cap.
+    self.CI.CS.speedcam_engaged = self.sm['carControl'].enabled
+    self.CI.CS.speedcam_v_cruise = self.v_cruise_helper.v_cruise_kph
     CS = self.CI.update(can_list)
     if self.CP.brand == 'mock':
       CS = self.mock_carstate.update(CS)
@@ -229,6 +242,14 @@ class Car:
         if sm_done_ns - self.xiaoge_vision_error_log_at_ns >= XIAOGE_LANE_ERROR_LOG_INTERVAL_NS:
           cloudlog.warning(f"invalid Xiaoge vision payload: {error}")
           self.xiaoge_vision_error_log_at_ns = sm_done_ns
+    left_oem, right_oem = bool(CS.leftBlindspot), bool(CS.rightBlindspot)
+    left_vision, right_vision = xiaoge_blindspot_vision(self.xiaoge_vision_result, sm_done_ns)
+    self.xiaoge_blindspot_sources = (left_oem, right_oem, left_vision, right_vision)
+    CS.leftBlindspotOem = left_oem
+    CS.rightBlindspotOem = right_oem
+    CS.leftBlindspotOnnx = left_vision
+    CS.rightBlindspotOnnx = right_vision
+    CS.blindspotSplitSourcesValid = True
     apply_xiaoge_vision_result(CS, self.xiaoge_vision_result, sm_done_ns)
     #self.t1 = time.monotonic()
 
@@ -252,6 +273,8 @@ class Car:
     #self.t2 = time.monotonic()
 
     #self.v_cruise_helper.update_v_cruise(CS, self.sm['carControl'].enabled, self.is_metric)
+    # A gas tap spent on a camera skip must not also raise the set speed by +10.
+    self.v_cruise_helper.speedcam_gas_tok_consumed = getattr(self.CI.CS, "speedcam_gas_tok_consumed", False)
     self.v_cruise_helper.update_v_cruise(CS, self.sm, self.is_metric)
     #self.t3 = time.monotonic()
     if self.sm['carControl'].enabled and not self.CC_prev.enabled:
@@ -306,7 +329,24 @@ class Car:
     co_send.carOutput.actuatorsOutput = self.last_actuators_output
     self.pm.send('carOutput', co_send)
 
-    # kick off controlsd step while we actuate the latest carControl packet
+    now_ns = time.monotonic_ns()
+    sources = self.xiaoge_blindspot_sources
+    if sources != self.xiaoge_blindspot_sources_published or \
+       now_ns - self.xiaoge_blindspot_sources_published_ns >= XIAOGE_SOURCE_HEARTBEAT_NS:
+      payload = json.dumps({
+        "type": "xiaogeBlindspotSources",
+        "version": 1,
+        "receivedMonoTimeNanos": now_ns,
+        "left": {"oem": sources[0], "vision": sources[2]},
+        "right": {"oem": sources[1], "vision": sources[3]},
+      }, separators=(",", ":")).encode()
+      source_msg = messaging.new_message("customReservedRawData1", size=len(payload), valid=True)
+      source_msg.customReservedRawData1 = payload
+      self.pm.send("customReservedRawData1", source_msg)
+      self.xiaoge_blindspot_sources_published = sources
+      self.xiaoge_blindspot_sources_published_ns = now_ns
+
+    # Publish source metadata before the merged carState so UI never sees a new warning with old source colors.
     cs_send = messaging.new_message('carState')
     cs_send.valid = CS.canValid
     cs_send.carState = CS
@@ -332,6 +372,17 @@ class Car:
         CC.actuators = car.CarControl.Actuators.new_message()
         CC.cruiseControl.resume = CC.cruiseControl.override = False
         CC.cruiseControl.cancel = CS.cruiseState.enabled
+        CC = CC.as_reader()
+      # Independently confirm startup once at the final application boundary.
+      # Later input failures do not rearm this process-lifetime latch.
+      lateral_ready = self.lateral_startup.update(self.sm, CS, 'carControl')
+      if CC.latActive and not lateral_ready:
+        CC = CC.as_builder()
+        CC.latActive = False
+        CC.actuators.torque = 0.0
+        CC.actuators.steeringAngleDeg = CS.steeringAngleDeg
+        CC.actuators.curvature = 0.0
+        CC = CC.as_reader()
       # send car controls over can
       apply_start_ns = time.monotonic_ns()
       now_nanos = self.can_log_mono_time if REPLAY else int(time.monotonic() * 1e9)

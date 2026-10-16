@@ -24,7 +24,8 @@ from openpilot.selfdrive.selfdrived.helpers import ExcessiveActuationCheck
 from openpilot.selfdrive.controls.lib.assist_less_lane_change import get_assist_less_lane_change
 from openpilot.selfdrive.selfdrived.state import StateMachine
 from openpilot.selfdrive.selfdrived.impact_detector import ImpactDetector
-from openpilot.selfdrive.monitoring.dm_alerts import CameraFallbackNotice
+from openpilot.selfdrive.controls.lib.radar_only_warning import RadarOnlyWarning
+from openpilot.selfdrive.carrot.radar_motion.timing import front_radar_distance_delay_s
 from openpilot.selfdrive.selfdrived.alertmanager import AlertManager, set_offroad_alert
 from openpilot.selfdrive.controls.lib.cutin_alert import (
   CutinAlertCandidate,
@@ -97,7 +98,8 @@ class SelfdriveD:
     # TODO: de-couple selfdrived with card/conflate on carState without introducing controls mismatches
     self.car_state_sock = messaging.sub_sock('carState', timeout=20)
 
-    ignore = self.sensor_packets + self.gps_packets + ['alertDebug']
+    # Optional advisory input must not become a controls-readiness dependency.
+    ignore = self.sensor_packets + self.gps_packets + ['alertDebug', 'liveTracks']
     if SIMULATION:
       ignore += ['driverCameraState', 'managerState']
     if self.CP.notCar or SIMULATION:
@@ -110,7 +112,7 @@ class SelfdriveD:
         ignore += ['wideRoadCameraState']
     self.sm = messaging.SubMaster(['deviceState', 'pandaStates', 'peripheralState', 'modelV2', 'liveCalibration',
                                    'carOutput', 'driverMonitoringState', 'longitudinalPlan', 'livePose', # 'liveDelay',
-                                   'managerState', 'liveParameters', 'radarState', 'liveTorqueParameters',
+                                   'managerState', 'liveParameters', 'radarState', 'liveTracks', 'liveTorqueParameters',
                                    'carrotMan',
                                    'controlsState', 'carControl', 'driverAssistance', 'alertDebug', 'userBookmark', 'audioFeedback'] + \
                                    self.camera_packets + self.sensor_packets + self.gps_packets,
@@ -155,17 +157,21 @@ class SelfdriveD:
     self.events_prev = []
     self.logged_comm_issue = None
     self.not_running_prev = None
+    self._manager_frame = -1
+    self._not_running = set()
     self.experimental_mode = False
     self.personality = self.read_personality_param()
     self.recalibrating_seen = False
     self.dm_lockout_set = self.params.get_bool("DriverTooDistracted")
     self.cutin_audio_tracker = CutinAlertTracker()
+    self.radar_only_warning = RadarOnlyWarning(front_radar_distance_delay_s(self.CP))
+    self.car_state_time_s = 0.0
     self.dm_uncertain_alerted = False
     self.dm_disabled_prev = False
-    self.dm_camera_notice = CameraFallbackNotice()
     self.update_reboot_alerted = False
     self.system_ready_alerted = False
     self.system_ready_since = None
+    self.nnff_alerted = False
     self.big_model_loading = False
     self.big_model_active = False
     self.big_model_ready_t = 0.0
@@ -272,6 +278,12 @@ class SelfdriveD:
     if cutin_alert:
       self.events.add(EventName.radarCutin)
 
+    if self.radar_only_warning.update_live(
+      self.car_state_time_s if REPLAY else time.monotonic(), CS, self.sm,
+      self.enabled and self.CP.openpilotLongitudinalControl,
+    ):
+      self.events.add(EventName.radarStationaryLead)
+
     # Block resume if cruise never previously enabled
     resume_pressed = any(be.type in (ButtonType.accelCruise, ButtonType.resumeCruise) for be in CS.buttonEvents)
     if not self.CP.pcmCruise and CS.vCruise > 250 and resume_pressed:
@@ -284,9 +296,8 @@ class SelfdriveD:
       self.dm_uncertain_alerted = False
     self.dm_disabled_prev = dm_disabled
     if not self.CP.notCar and not dm_disabled:
-      if self.dm_camera_notice.update(self.sm.frame * DT_CTRL, self.sm.all_checks(['driverMonitoringState']),
-                                      self.sm['driverMonitoringState'].cameraUnavailable, dm_disabled):
-        self.events.add(EventName.driverMonitorFallback)
+      # Camera availability silently selects vision or interaction monitoring.
+      # Actual attention warnings, lockout and service-health checks still apply.
       self.update_dm_lockout()
       # No entry conditions
       if self.sm['driverMonitoringState'].lockout or self.sm['driverMonitoringState'].alwaysOnLockout:
@@ -463,7 +474,10 @@ class SelfdriveD:
     # All events here should at least have NO_ENTRY and SOFT_DISABLE.
     num_events = len(self.events)
 
-    not_running = {p.name for p in self.sm['managerState'].processes if not p.running and p.shouldBeRunning}
+    if self.sm.recv_frame['managerState'] != self._manager_frame:
+      self._manager_frame = self.sm.recv_frame['managerState']
+      self._not_running = {p.name for p in self.sm['managerState'].processes if not p.running and p.shouldBeRunning}
+    not_running = self._not_running
     if self.sm.recv_frame['managerState'] and len(not_running):
       if not_running != self.not_running_prev:
         cloudlog.event("process_not_running", not_running=not_running, error=True)
@@ -603,8 +617,6 @@ class SelfdriveD:
 
       if self.sm['modelV2'].frameDropPerc > 20:
         self.events.add(EventName.modeldLagging)
-    if self.sm.frame == 550 and Params().get("NNFFModelName") is not None:
-      self.events.add(EventName.torqueNNLoad)
     # decrement personality on distance button press
     #if self.CP.openpilotLongitudinalControl:
     #  if any(not be.pressed and be.type == ButtonType.gapAdjustCruise for be in CS.buttonEvents):
@@ -637,12 +649,15 @@ class SelfdriveD:
   def data_sample(self):
     car_state = messaging.recv_one(self.car_state_sock)
     CS = car_state.carState if car_state else self.CS_prev
+    if car_state is not None:
+      self.car_state_time_s = car_state.logMonoTime * 1e-9
 
     self.sm.update(0)
 
     if not self.initialized:
       all_valid = CS.canValid and self.sm.all_checks()
-      timed_out = self.sm.frame * DT_CTRL > 6.
+      # Leave room for model startup; healthy services can finish sooner.
+      timed_out = self.sm.frame * DT_CTRL > 10.
       if all_valid or timed_out or (SIMULATION and not REPLAY):
         available_streams = VisionIpcClient.available_streams("camerad", block=False)
         if VisionStreamType.VISION_STREAM_ROAD not in available_streams:
@@ -713,6 +728,23 @@ class SelfdriveD:
     self.update_alerts(CS)
     self.system_ready_alerted = True
 
+  def update_nnff_alert(self, CS):
+    # Retry after startup instead of losing the notice when initialization takes
+    # longer than 5.5 seconds. Poll at 2 Hz, including a late model-name write.
+    if self.nnff_alerted or self.sm.frame < 550 or self.sm.frame % 50:
+      return
+    if (not self.initialized or self.CP.passive or not self.sm['deviceState'].started
+        or not CS.canValid or CS.canTimeout or not self.sm.all_checks()
+        or self.events.contains(ET.NO_ENTRY) or self.AM.current_alert is not EmptyAlert):
+      return
+    if self.params.get("NNFFModelName") is None:
+      return
+    # Called after this frame's alert selection and readiness chime, so neither
+    # an existing warning nor a new warning can consume the one-shot notice.
+    self.events.add(EventName.torqueNNLoad)
+    self.update_alerts(CS)
+    self.nnff_alerted = True
+
   def update_impact_dashcam(self, CS):
     if REPLAY or SIMULATION or self.CP.notCar:
       return
@@ -761,6 +793,11 @@ class SelfdriveD:
     pers = LONGITUDINAL_PERSONALITY_MAP[self.personality]
     alerts = self.events.create_alerts(self.state_machine.current_alert_types, [self.CP, CS, self.sm, self.is_metric,
                                                                                 self.state_machine.soft_disable_timer, pers])
+    if not self.enabled and EventName.selfdriveInitializing in self.events.names:
+      # Retain wrongGear in the state machine/logs, but explain the current
+      # startup block when an early enable request also finds Park/Neutral.
+      alerts = [a for a in alerts if a.alert_type != 'wrongGear/noEntry']
+      self.AM.alerts.pop('wrongGear/noEntry', None)
     self.AM.add_many(self.sm.frame, alerts)
     self.AM.process_alerts(self.sm.frame, clear_event_types)
 
@@ -809,6 +846,7 @@ class SelfdriveD:
     self.update_alerts(CS)
 
     self.update_system_ready_alert(CS)
+    self.update_nnff_alert(CS)
 
     self.publish_selfdriveState(CS)
 

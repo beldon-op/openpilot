@@ -7,29 +7,52 @@ import selectors
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 
 import numpy as np
 
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.modeld.parse_model_outputs import Parser
+from openpilot.selfdrive.modeld.egpu_worker_progress import worker_snapshot
+
+INFERENCE_TIMEOUT = .15  # three 20 Hz periods; first-use initialization has its own budget
+
+_retiring_workers = []
+_retiring_lock = threading.Lock()
+
+
+def _reap_worker(process):
+  # An uninterruptible kernel USB operation can delay even SIGKILL. Keep its
+  # ownership visible, but never wait for it on modeld's publication thread.
+  process.wait()
+  with _retiring_lock:
+    _retiring_workers.remove(process)
 
 
 class PrecompiledModelState:
-  def __init__(self, cam_w: int, cam_h: int, pkl_path: Path):
+  def __init__(self, cam_w: int, cam_h: int, pkl_path: Path, *, recovery_cancel=None):
     self.pkl_path = pkl_path
     self.process = None
+    with _retiring_lock:
+      if any(process.poll() is None for process in _retiring_workers):
+        raise RuntimeError('previous eGPU worker is still exiting')
     self.shared = None
     self.views = {}
     self.output = None
     self.usbgpu = True
     self.first_run = True
+    self.recovery_cancel = recovery_cancel
     self.parser = Parser()
     self.prev_desire = np.zeros(ModelConstants.DESIRE_LEN, dtype=np.float32)
     # A named temporary file permits independently opened mmap in the worker.
     self.file = tempfile.NamedTemporaryFile(prefix='carrot-model-', delete=False)
     try:
       worker = Path(__file__).with_name('precompiled_worker.py')
-      self.process = subprocess.Popen([sys.executable, str(worker), str(pkl_path), self.file.name, str(cam_w), str(cam_h)],
+      arguments = [sys.executable, str(worker), str(pkl_path), self.file.name, str(cam_w), str(cam_h)]
+      if recovery_cancel is not None:
+        arguments.append('--recovery')
+      self.process = subprocess.Popen(arguments,
                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0)
       info = json.loads(self._receive(110))
       self.shared = mmap.mmap(self.file.fileno(), info['size'])
@@ -42,8 +65,9 @@ class PrecompiledModelState:
       self.frame_size = info['frame_size']
       self.checkpoint = info['checkpoint']
     except BaseException as exc:
+      self.failed = True
       self.close()
-      if isinstance(exc, Exception):
+      if isinstance(exc, Exception) and not (self.recovery_cancel is not None and self.recovery_cancel.is_set()):
         from openpilot.selfdrive.modeld.precompiled_model import record_failure
         record_failure(self.pkl_path, exc, 'load')
       raise
@@ -51,14 +75,33 @@ class PrecompiledModelState:
   def _receive(self, timeout: float) -> bytes:
     with selectors.DefaultSelector() as selector:
       selector.register(self.process.stdout, selectors.EVENT_READ)
-      if not selector.select(timeout):
-        raise TimeoutError('precompiled eGPU worker timed out')
-    value = self.process.stdout.readline()
+      deadline, ready, value = time.monotonic() + timeout, False, b''
+      while not ready and time.monotonic() < deadline:
+        if self.recovery_cancel is not None and self.recovery_cancel.is_set():
+          raise InterruptedError('eGPU recovery cancelled')
+        if selector.select(min(.05, max(0, deadline - time.monotonic()))):
+          chunk = os.read(self.process.stdout.fileno(), 65536)
+          if not chunk:
+            raise RuntimeError(f'precompiled eGPU worker exited ({self.process.poll()})')
+          value += chunk
+          if len(value) > 128 * 1024:
+            raise RuntimeError('oversized eGPU worker response')
+          ready = value.endswith(b'\n')
+      if not ready:
+        error = TimeoutError('precompiled eGPU worker timed out')
+        error.worker_diagnostics = worker_snapshot(Path(self.file.name + '.progress'), self.process.pid)
+        raise error
     if not value:
       raise RuntimeError(f'precompiled eGPU worker exited ({self.process.poll()})')
     if value.startswith(b'ERROR '):
       raise RuntimeError(json.loads(value[6:]))
     return value
+
+  def reset_after_probe(self):
+    self.process.stdin.write(b'z')
+    if self._receive(1) != b'Z\n':
+      raise RuntimeError('invalid eGPU recovery reset response')
+    self.prev_desire[:] = 0
 
   def run(self, bufs, transforms, inputs, prepare_only):
     for name in ('img', 'big_img'):
@@ -73,17 +116,19 @@ class PrecompiledModelState:
     self.views['big_tfm'][:] = transforms['big_img']
     try:
       self.process.stdin.write(b'r')
-      if self._receive(20 if self.first_run else 1) != b'1\n':
+      if self._receive(20 if self.first_run else INFERENCE_TIMEOUT) != b'1\n':
         raise RuntimeError('invalid model worker response')
       self.first_run = False
       result = self.output.copy()
       if not np.isfinite(result).all():
         raise ValueError('non-finite model output')
     except BaseException as exc:
+      self.failed = True
       self.close()
       # The manager sends SIGINT when ignition turns off. KeyboardInterrupt and
       # SystemExit release the worker but must not blacklist a healthy artifact.
-      if isinstance(exc, Exception):
+      cancel = getattr(self, 'recovery_cancel', None)
+      if isinstance(exc, Exception) and not (cancel is not None and cancel.is_set()):
         from openpilot.selfdrive.modeld.precompiled_model import record_failure
         record_failure(self.pkl_path, exc, 'inference')
       raise
@@ -102,12 +147,21 @@ class PrecompiledModelState:
   def close(self):
     if self.process is not None:
       if self.process.poll() is None:
-        self.process.terminate()
-        try:
-          self.process.wait(timeout=2)
-        except subprocess.TimeoutExpired:
+        # A failed worker has no recoverable GPU state. Do not spend two more
+        # seconds in driver/atexit cleanup before the internal model can run.
+        failed = getattr(self, 'failed', False)
+        if failed:
           self.process.kill()
-          self.process.wait()
+        else:
+          self.process.terminate()
+        try:
+          self.process.wait(timeout=.1 if failed else 2)
+        except subprocess.TimeoutExpired:
+          if not failed:
+            self.process.kill()
+          with _retiring_lock:
+            _retiring_workers.append(self.process)
+          threading.Thread(target=_reap_worker, args=(self.process,), name='egpu-reap', daemon=True).start()
       self.process.stdin.close()
       self.process.stdout.close()
       self.process = None
@@ -118,6 +172,7 @@ class PrecompiledModelState:
       self.shared = None
     self.file.close()
     Path(self.file.name).unlink(missing_ok=True)
+    Path(self.file.name + '.progress').unlink(missing_ok=True)
 
   def __del__(self):
     if getattr(self, 'process', None) is not None:

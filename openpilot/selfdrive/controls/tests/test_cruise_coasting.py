@@ -133,7 +133,7 @@ def control(monkeypatch):
 @pytest.mark.parametrize('brand', ['hyundai', 'gm', 'toyota'])
 def test_zero_percent_matches_unmodified_pid_over_time(control, brand):
   c = control(brand)
-  kp, ki = (1., 0.) if brand == 'hyundai' else (1., .2)
+  kp, ki = {'hyundai': (1., 0.), 'toyota': (0., 0.), 'gm': (1., .2)}[brand]
   legacy = PIDController(kp, ki, k_f=1., neg_limit=-3.5, pos_limit=2., rate=100)
   cs, plan, radar = inputs()
   plan.cruiseCoastingPercent = 0
@@ -297,6 +297,42 @@ def test_planner_permission_vetoes_even_if_source_was_cruise(planner_gate, veto)
   elif veto == 'reset':
     args['reset_state'] = True
   assert step() == 0
+
+
+@pytest.mark.parametrize('veto', ['disabled', 'reset', 'source', 'gas', 'lead', 'turn'])
+def test_early_veto_skips_subscriber_scan_and_navigation(planner_gate, veto):
+  step, state, sm, carrot, args = planner_gate
+  for _ in range(21):
+    step()
+  if veto == 'disabled':
+    state.coasting_percent = 0
+  elif veto == 'reset':
+    args['reset_state'] = True
+  elif veto == 'source':
+    state.mpc.source = 'lead1'
+  elif veto == 'gas':
+    sm['carState'].gasPressed = True
+  elif veto == 'lead':
+    sm['radarState'].leadTwo.status = True
+  elif veto == 'turn':
+    args['coasting_turn_blocked'] = True
+  def unnecessary_scan(**kwargs):
+    raise AssertionError('ineligible coasting must exit before subscriber scan')
+  sm.all_checks = unnecessary_scan
+  assert step() == 0
+  assert state.coasting.stable_time == 0 and state.coasting.target == 0
+
+
+@pytest.mark.parametrize('field', ['planner', 'carrot'])
+def test_nonfinite_target_difference_still_vetoes(planner_gate, field):
+  step, state, _, carrot, _ = planner_gate
+  for _ in range(21):
+    step()
+  if field == 'planner':
+    state.v_cruise_kph = float('nan')
+  else:
+    carrot.v_cruise = float('nan')
+  assert step() == 0 and state.coasting.stable_time == 0
 
 
 def test_planner_and_controller_coast_with_a_changing_live_ratio(planner_gate, control):

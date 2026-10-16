@@ -63,6 +63,21 @@ def corner_radar_enabled(CP: car.CarParams, enable_corner_radar: int) -> bool:
   )
 
 
+def bosch_radar_tracks_active(CP: car.CarParams, enable_radar_tracks: int) -> bool:
+  """Cars whose liveTracks cadence comes from RadarInterface's frame counter.
+
+  This is the same condition that builds the Hyundai Bosch provider in
+  opendbc hyundai/radar_interface.py, so it selects exactly the configurations
+  whose liveTracks publication is gated on `self.frame % 5 == 0` inside
+  radarcan's exact 100 Hz card-batch stream instead of a radar CAN trigger.
+  """
+  return (
+    CP.brand == "hyundai"
+    and bool(int(CP.extFlags) & int(HyundaiExtFlags.BOSCH_RADAR))
+    and enable_radar_tracks > 0
+  )
+
+
 def _yaw_rate(live_pose: Any) -> float:
   angular_velocity = getattr(live_pose, "angularVelocityDevice", None)
   if (
@@ -108,8 +123,10 @@ class DPathRadarD:
 
   def update(self, sm: messaging.SubMaster, rr: car.RadarData) -> None:
     self.radar_state_valid = sm.all_checks()
-    # Reuse the builder like conventional radard. Reallocating every 20 Hz
-    # frame is measurable on device and does not change any published field.
+    # Cap'n Proto arenas cannot reclaim replaced lists/structs. Keeping this
+    # builder across frames retains old allocations for the whole drive, even
+    # though publish() copies only the currently reachable data.
+    self.radar_state = log.RadarState.new_message()
     self.radar_state.mdMonoTime = sm.logMonoTime["modelV2"]
     self.radar_state.carStateMonoTime = sm.logMonoTime["carState"]
     self.radar_state.radarErrors = rr.errors
@@ -158,9 +175,21 @@ def main() -> None:
   )
   cloudlog.info("dPath radard got CarParams")
 
+  # Hyundai Bosch publishes liveTracks on RadarInterface's 20 Hz frame counter,
+  # driven by card's exact batches and independent of modelV2. A conflated read
+  # once per modelV2 wake therefore aliases 2:1 whenever the two 20 Hz clocks
+  # drift onto the same boundary, and the conflated queue discards the second
+  # record. Waking on liveTracks as well keeps the observed cadence equal to the
+  # publication cadence.
+  # Its 11.2 Hz lower bound is unchanged, and every other car keeps the single poll.
+  poll: str | list[str] = "modelV2"
+  if bosch_radar_tracks_active(CP, effective_radar_track_mode(
+      CP.brand, CP.radarUnavailable, Params().get_int("EnableRadarTracks"))):
+    poll = ["modelV2", "liveTracks"]
+
   sm = messaging.SubMaster(
     ["modelV2", "carState", "liveTracks", "livePose"],
-    poll="modelV2",
+    poll=poll,
     ignore_alive=["livePose"],
     ignore_valid=["livePose"],
   )

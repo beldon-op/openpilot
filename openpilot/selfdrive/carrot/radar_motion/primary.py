@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import math
+from collections import deque
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any
@@ -98,6 +99,8 @@ STATIONARY_FRONT_RANGE_MAX_FRACTION = 0.25
 STATIONARY_FRONT_RANGE_MAX_YREL_ERROR_M = 2.0
 STATIONARY_FRONT_RANGE_MAX_DPATH_M = 1.5
 STATIONARY_MOVING_CORNER_CONFIRMATION_S = 0.15
+STATIONARY_MOVING_CORNER_HISTORY_S = 1.0
+STATIONARY_MOVING_CORNER_MIN_HISTORY_S = 0.50
 # A separate measured moving target can disprove the velocity-error hypothesis.
 # Its range, lateral position, and speed must all agree with the current vision.
 STATIONARY_MOVING_VISION_MIN_SPEED_DELTA_MPS = 6.0
@@ -138,6 +141,11 @@ STATIONARY_VISION_CROSS_SOURCE_MAX_DREL_M = 5.0
 STATIONARY_VISION_CROSS_SOURCE_MAX_YREL_M = 0.75
 STATIONARY_VISION_CROSS_SOURCE_MAX_VLEAD_MPS = 2.5
 STATIONARY_VISION_CROSS_SOURCE_CORNER_MAX_ABS_VLEAD_MPS = 6.0
+# Only mutually agreeing front/corner measurements may tolerate this larger
+# model error. Radar-to-radar range, lateral and velocity gates stay unchanged.
+STATIONARY_PAIRED_VISION_DISTANCE_SCALE = 2.0
+STATIONARY_PAIRED_VISION_MAX_SPEED_DELTA_MPS = 30.0
+STATIONARY_PAIRED_VISION_MAX_YREL_ERROR_M = 1.25
 STATIONARY_VISION_PATH_OUTLIER_MAX_DPATH_M = 8.0
 STATIONARY_VISION_PATH_OUTLIER_MIN_PROB = 0.85
 STATIONARY_VISION_PATH_OUTLIER_HOLD_S = 0.20
@@ -815,6 +823,8 @@ class VisionRadarMatcher:
   """Match vision/radar leads and confirm no-vision moving radar leads."""
 
   def __init__(self) -> None:
+    self._closing_range_history: dict[tuple[str, int], tuple[float, float, RadarPointSnapshot]] = {}
+    self.closing_range_match: VisionRadarMatch | None = None
     self.last_identity: tuple[str, int] | None = None
     self.low_probability_hold_frames = 0
     self.stationary_identity: tuple[str, int] | None = None
@@ -832,6 +842,10 @@ class VisionRadarMatcher:
     self._observed_last_s: dict[tuple[str, int], float] = {}
     self._stationary_front_evidence: dict[tuple[str, int], _RadarPositionEvidence] = {}
     self._moving_vision_evidence: dict[tuple[str, int], _RadarPositionEvidence] = {}
+    self._corner_motion_history: dict[
+      tuple[str, int], deque[tuple[float, RadarPointSnapshot]]
+    ] = {}
+    self._corner_motion_unreliable_until: dict[tuple[str, int], float] = {}
     self._stationary_corner_supported = False
     self._stationary_weak_pair_identity: (
       tuple[int, str, int] | None
@@ -876,6 +890,8 @@ class VisionRadarMatcher:
     self._rejected_radar_only_moving_last_time_s: float | None = None
 
   def reset(self) -> None:
+    self._closing_range_history.clear()
+    self.closing_range_match = None
     self._reset_moving()
     self._reset_stationary()
     self._reset_radar_only_moving()
@@ -885,6 +901,8 @@ class VisionRadarMatcher:
     self._vision_fallback_hold_frames = 0
     self._stationary_front_evidence.clear()
     self._moving_vision_evidence.clear()
+    self._corner_motion_history.clear()
+    self._corner_motion_unreliable_until.clear()
 
   def _reset_moving(self) -> None:
     self.last_identity = None
@@ -1246,6 +1264,8 @@ class VisionRadarMatcher:
   def _stationary_vision_cross_source_position_cost(
     vision: VisionLead | None,
     front: RadarPointSnapshot,
+    *,
+    distance_scale: float = 1.0,
   ) -> float | None:
     if (
       vision is None
@@ -1263,6 +1283,7 @@ class VisionRadarMatcher:
         ),
       ),
     )
+    distance_gate *= distance_scale
     lateral_gate = max(2.0, min(4.0, abs(vision.y_std) * 3.0))
     distance_error = abs(front.d_rel - vision.d_rel)
     lateral_error = abs(front.y_rel - vision.y_rel)
@@ -1281,6 +1302,9 @@ class VisionRadarMatcher:
         float,
       ]
     ],
+    *,
+    yaw_rate_rad_s: float = 0.0,
+    preferred_identity: tuple[str, int] | None = None,
   ) -> tuple[
     tuple[RadarPointSnapshot, float, float, RadarPointSnapshot], ...
   ]:
@@ -1304,7 +1328,26 @@ class VisionRadarMatcher:
         or abs(front.v_lead - vision.velocity)
         > STATIONARY_MAX_VISION_SPEED_DELTA_MPS
       ):
-        continue
+        # Preserve the ordinary pair path for sources without native quality.
+        # Expanding longitudinal uncertainty needs tight visual lateral support.
+        # On a bend even two radars can agree on the same adjacent vehicle;
+        # preserve the ordinary gates once the existing turn guard is active.
+        if (
+          front.radar_track_state < STATIONARY_RADAR_ONLY_FRONT_MIN_TRACK_STATE
+          or abs(yaw_rate_rad_s) >= STATIONARY_TURN_FRONT_MIN_ABS_YAW_RATE_RAD_S
+          or (preferred_identity is not None and preferred_identity != (front.source, front.track_id))
+          or abs(front.y_rel - vision.y_rel) > STATIONARY_PAIRED_VISION_MAX_YREL_ERROR_M
+          or abs(front.v_lead - vision.velocity)
+          > STATIONARY_PAIRED_VISION_MAX_SPEED_DELTA_MPS
+        ):
+          continue
+        position_cost = (
+          VisionRadarMatcher._stationary_vision_cross_source_position_cost(
+            vision, front, distance_scale=STATIONARY_PAIRED_VISION_DISTANCE_SCALE,
+          )
+        )
+        if position_cost is None:
+          continue
       cost = (
         position_cost
         + abs(front.d_rel - corner.d_rel)
@@ -1739,6 +1782,67 @@ class VisionRadarMatcher:
       / STATIONARY_FRONT_POSITION_LOCK_MAX_DPATH_M
     )
 
+  def _update_corner_motion_history(
+    self,
+    points: Sequence[RadarPointSnapshot],
+    time_s: float | None,
+  ) -> None:
+    """Keep measured range/velocity evidence independent of visual association."""
+    if time_s is None or not math.isfinite(time_s):
+      self._corner_motion_history.clear()
+      self._corner_motion_unreliable_until.clear()
+      return
+    self._corner_motion_unreliable_until = {
+      identity: until for identity, until in self._corner_motion_unreliable_until.items()
+      if time_s < until <= time_s + STATIONARY_MOVING_CORNER_HISTORY_S
+    }
+    for identity, history in tuple(self._corner_motion_history.items()):
+      if not 0.0 <= time_s - history[-1][0] <= VISION_CORROBORATED_MAX_OBSERVATION_GAP_S:
+        del self._corner_motion_history[identity]
+    for point in points:
+      if (
+        not point.source.startswith("corner") or not point.measured
+        or not 0.5 < point.d_rel < 180.0 or not math.isfinite(point.v_rel)
+      ):
+        continue
+      history = self._corner_motion_history.setdefault(self._identity(point), deque())
+      if history:
+        previous_time, previous = history[-1]
+        dt = time_s - previous_time
+        if (
+          dt <= 0.0
+          or abs(point.d_rel - (previous.d_rel + previous.v_rel * dt))
+          > STATIONARY_LONGITUDINAL_CONTINUITY_M
+        ):
+          history.clear()
+          self._corner_motion_unreliable_until[self._identity(point)] = time_s + STATIONARY_MOVING_CORNER_HISTORY_S
+      history.append((time_s, point))
+      while len(history) > 2 and time_s - history[1][0] >= STATIONARY_MOVING_CORNER_HISTORY_S:
+        history.popleft()
+
+  def _corner_motion_consistent(self, point: RadarPointSnapshot, time_s: float) -> bool:
+    history = self._corner_motion_history.get(self._identity(point))
+    if not history or history[-1][0] != time_s:
+      return False
+    duration_s = time_s - history[0][0]
+    if duration_s < STATIONARY_MOVING_CORNER_MIN_HISTORY_S:
+      return False
+    integrated_v_rel_m = 0.0
+    previous_time, previous = history[0]
+    for sample_time, sample in history:
+      integrated_v_rel_m += 0.5 * (previous.v_rel + sample.v_rel) * (sample_time - previous_time)
+      previous_time, previous = sample_time, sample
+    observed_delta_m = point.d_rel - history[0][1].d_rel
+    if (
+      abs(observed_delta_m - integrated_v_rel_m) / duration_s
+      > RADAR_ONLY_MOVING_CORNER_MAX_LONGITUDINAL_ERROR_RATE_MPS
+    ):
+      self._corner_motion_unreliable_until[self._identity(point)] = time_s + STATIONARY_MOVING_CORNER_HISTORY_S
+      return False
+    # A range jump must not erase the contradictory history and immediately
+    # rehabilitate the same corner ID with a short, quieter suffix.
+    return time_s >= self._corner_motion_unreliable_until.get(self._identity(point), -math.inf)
+
   def _stationary_front_moving_vision_conflicts(
     self,
     vision: VisionLead | None,
@@ -1803,6 +1907,9 @@ class VisionRadarMatcher:
     }
     moving_support = tuple(
       point for point in points if point.measured
+      # A noisy corner range may happen to agree with model speed for a few
+      # frames. It cannot veto a slow front without consistent measured motion.
+      and (not point.source.startswith("corner") or self._corner_motion_consistent(point, time_s))
       and 0.5 < point.d_rel < 180.0
       and (point.source in PRIMARY_RADAR_SOURCES or point.source.startswith("corner"))
       and point.v_lead > STATIONARY_MAX_ABS_VLEAD_MPS
@@ -2188,7 +2295,10 @@ class VisionRadarMatcher:
     }
     cross_source_front_support = (
       self._stationary_vision_cross_source_front_support(
-        vision, front_corner_pairs,
+        vision, front_corner_pairs, yaw_rate_rad_s=yaw_rate_rad_s,
+        # Broader model error must not interrupt another object's confirmation
+        # or replace its held identity. Ordinary association still may hand off.
+        preferred_identity=self.stationary_identity or self._stationary_pending_identity,
       )
     )
     cross_source_front_support_by_identity = {
@@ -3370,6 +3480,56 @@ class VisionRadarMatcher:
       d_path=d_path,
     )
 
+  def _match_closing_range(self, vision, points, path, time_s, yaw_rate_rad_s):
+    """Qualify a slower measured front despite uncertain visual range/speed.
+
+    Distance times speed is not an urgency metric. Compare the stopped-equivalent
+    obstacles at 2.5 m/s^2 instead, without changing either measurement. This
+    exception cannot replace a closer regular match or a braking visual lead.
+    """
+    self.closing_range_match = None
+    history = {}
+    matches = []
+    if (vision is not None and time_s is not None and math.isfinite(time_s)
+        and math.isfinite(yaw_rate_rad_s) and abs(yaw_rate_rad_s) < 0.05
+        and all(math.isfinite(value) for value in (vision.d_rel, vision.y_rel, vision.velocity,
+                                                 vision.acceleration, vision.probability, vision.x_std))
+        and vision.probability >= 0.6 and vision.acceleration >= -0.5):
+      vision_path = project_to_model_path(path, vision.d_rel, vision.y_rel).d_path
+      for point in points:
+        if not all(math.isfinite(value) for value in (point.d_rel, point.y_rel, point.v_rel, point.v_lead, point.yv_rel)):
+          continue
+        delta = point.d_rel - vision.d_rel
+        limit = min(35.0, 0.4 * vision.d_rel, max(15.0, 2.5 * abs(vision.x_std)))
+        d_path = project_to_model_path(path, point.d_rel, point.y_rel).d_path
+        if (point.source != "frontRadar" or not point.measured or point.radar_track_state < 2
+            or not 40.0 <= point.d_rel <= 150.0 or point.v_rel >= -1.0
+            or not 4.0 < point.v_lead < vision.velocity - 2.0
+            or vision.velocity - point.v_lead > 20.0 or not 0.0 <= delta <= limit
+            or abs(d_path) > 1.5 or abs(vision_path) > 1.0
+            or abs(point.y_rel - vision.y_rel) > 1.25
+            or point.d_rel + point.v_lead ** 2 / 5.0 + 5.0
+            > vision.d_rel + vision.velocity ** 2 / 5.0):
+          continue
+        key = self._identity(point)
+        previous = self._closing_range_history.get(key)
+        since = time_s
+        if previous is not None:
+          start, last, old = previous
+          dt = time_s - last
+          if (0.0 < dt <= 0.15
+              and abs(point.d_rel - old.d_rel - old.v_rel * dt) <= 1.0
+              and abs(point.y_rel - old.y_rel - old.yv_rel * dt) <= 0.5
+              and abs(point.v_lead - old.v_lead) <= 2.0):
+            since = start
+        history[key] = (since, time_s, point)
+        if time_s - since >= 0.25:
+          matches.append(VisionRadarMatch(point, vision.probability, 1.0 - delta / max(limit, 1.0), d_path))
+    self._closing_range_history = history
+    if matches:
+      self.closing_range_match = min(matches, key=lambda match: match.point.d_rel)
+    return self.closing_range_match
+
   def _match_moving(
     self,
     vision: VisionLead | None,
@@ -3718,6 +3878,7 @@ class VisionRadarMatcher:
       for identity in stale_identities:
         self._observed_since_s.pop(identity, None)
         self._observed_last_s.pop(identity, None)
+    self._update_corner_motion_history(stationary_values, time_s)
     self._update_stationary_front_evidence(vision, stationary_values, path, time_s, yaw_rate_rad_s)
     conflicting_fronts = self._stationary_front_moving_vision_conflicts(
       vision, stationary_values, path, time_s, yaw_rate_rad_s,
@@ -3762,6 +3923,7 @@ class VisionRadarMatcher:
         if point.source in allowed_output_sources
       )
     )
+    closing_range = self._match_closing_range(vision, output_values, path, time_s, yaw_rate_rad_s)
     far_corroborated = self._match_far_vision_corroborated_radar(
       vision,
       output_values,
@@ -3827,7 +3989,7 @@ class VisionRadarMatcher:
       vision, output_values, path, time_s,
     )
     if corroborated is None:
-      corroborated = far_corroborated
+      corroborated = closing_range if closing_range is not None else far_corroborated
     if (
       radar_moving is not None
       and (

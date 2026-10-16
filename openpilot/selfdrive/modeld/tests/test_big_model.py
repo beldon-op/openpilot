@@ -60,23 +60,23 @@ def test_manifest_resolves_relative_https_url():
   assert manifest.cache_filename.endswith(".onnx")
 
 
-def test_default_manifest_is_pinned_to_cinque_v3(monkeypatch):
+def test_default_manifest_is_pinned_to_md_v3(monkeypatch):
   monkeypatch.setattr(big_model, "urlopen", lambda *_args, **_kwargs: pytest.fail("default manifest must be built in"))
   manifest = big_model.fetch_manifest()
-  assert big_model.DEFAULT_MANIFEST_URL == "https://upload.shind0.synology.me/models/comma4-big-cinque-v3/manifest.json"
-  assert manifest.model_id == "comma-pr38932-cinque-v3-892fc3a1-e758b96d"
-  assert manifest.size == 776_634_338
-  assert manifest.sha256 == "e758b96df27858ea97122d18554930d04f9f8bda417417074edfb3a72b008d0b"
-  assert manifest.url == "https://upload.shind0.synology.me/models/comma4-big-cinque-v3/big_driving_tinygrad.pkl"
+  assert big_model.DEFAULT_MANIFEST_URL == "https://upload.shind0.synology.me/models/comma4-big-md-v3-1365126a/manifest.json"
+  assert manifest.model_id == "comma-pr39087-md-v3-e86b58dc-d4c7a3fc"
+  assert manifest.size == 799_941_965
+  assert manifest.sha256 == "d4c7a3fcfc95813826ca871a80bea18df833aacb2eb6f5333e25a01e65b1a422"
+  assert manifest.url == "https://upload.shind0.synology.me/models/comma4-big-md-v3-1365126a/big_driving_tinygrad.pkl"
   assert manifest.precompiled_only
-  assert manifest.cache_filename == "big_driving_tinygrad-e758b96df27858ea.pkl"
+  assert manifest.cache_filename == "big_driving_tinygrad-d4c7a3fcfc958138.pkl"
 
 
 def test_precompiled_only_model_never_uses_a_local_onnx_build(tmp_path, monkeypatch):
   from openpilot.selfdrive.modeld import helpers, precompiled_model
   manifest = big_model.fetch_manifest()
-  monkeypatch.setattr(big_model, 'active_manifest', lambda: manifest)
-  monkeypatch.setattr(helpers, 'active_manifest', lambda: manifest)
+  monkeypatch.setattr(big_model, 'selected_manifest', lambda: manifest)
+  monkeypatch.setattr(helpers, 'selected_manifest', lambda: manifest)
   monkeypatch.setattr(precompiled_model, 'installed', lambda *args: None)
   monkeypatch.setattr(helpers, 'modeld_pkl_path', lambda **kw: pytest.fail('no ONNX compiler artifact for v3'))
   assert not big_model.active_model_compiled()
@@ -233,6 +233,9 @@ def test_status_is_atomic_and_preserves_stage_start(tmp_path: Path):
 
 
 def test_status_reporter_rate_limits_download_updates(monkeypatch, tmp_path: Path):
+  # Exercise rate limiting independently of the CI runner's uptime. A newly
+  # booted runner can have monotonic() < this test's 60-second interval.
+  monkeypatch.setattr('openpilot.selfdrive.modeld.big_model_status.time.monotonic', lambda: 120.0)
   manifest = BigModelManifest.from_dict(manifest_for(b"model"), "https://example.com/models/manifest.json")
   reporter = BigModelStatusReporter(tmp_path, min_interval=60.0)
   reporter.download_progress(manifest, 1, manifest.size)

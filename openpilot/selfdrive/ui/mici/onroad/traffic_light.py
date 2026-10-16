@@ -5,6 +5,7 @@ from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.system.ui.widgets import Widget
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.selfdrive.ui.mici.onroad.confidence_ball import draw_circle_gradient
+from openpilot.selfdrive.ui.signal_status import signal_detection_paused, draw_signal_pause, signal_assist_status, draw_signal_assist, signal_display_visible
 
 
 class TrafficLight(Widget):
@@ -20,11 +21,18 @@ class TrafficLight(Widget):
   # --------------------------------------------------
 
   def is_visible(self):
-    return self._alpha_filter.x > 0.05
+    return self._alpha_filter.x > 0.05 or signal_display_visible(ui_state.sm)
 
   # --------------------------------------------------
 
   def _update_state(self):
+    if signal_detection_paused(ui_state.sm):
+      self._current_state = 3
+      self._green_start_time = None
+      self._alpha_filter.x = 1.0
+      return
+    if self._current_state == 3:
+      self._alpha_filter.x = 0.0
     state = ui_state.sm["longitudinalPlan"].trafficState
 
     visible = False
@@ -59,7 +67,7 @@ class TrafficLight(Widget):
 
   def _render(self, _):
     alpha = max(0.0, min(1.0, self._alpha_filter.x))
-    if alpha <= 0.01:
+    if alpha <= 0.01 and not signal_display_visible(ui_state.sm):
       return
 
     content_rect = rl.Rectangle(
@@ -72,6 +80,10 @@ class TrafficLight(Widget):
     center_x = content_rect.x + content_rect.width - self._radius
     center_y = self.rect.y + self._radius
 
+    if self._current_state == 3:
+      draw_signal_pause(center_x, center_y, self._radius)
+      return
+
     # 
     if self._current_state == 1:
       top = rl.Color(255, 80, 80, int(255 * alpha))
@@ -81,3 +93,4 @@ class TrafficLight(Widget):
       bottom = rl.Color(0, 255, 0, int(255 * alpha))
 
     draw_circle_gradient(center_x, center_y, self._radius, top, bottom)
+    draw_signal_assist(ui_state.sm, center_x, center_y, self._radius)

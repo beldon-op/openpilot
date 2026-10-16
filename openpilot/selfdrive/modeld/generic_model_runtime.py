@@ -8,13 +8,22 @@ import time
 
 import numpy as np
 
+from openpilot.selfdrive.modeld.precompiled_artifact import compile_warp, load_warp, prepare_jit
+
 
 def input_view(buffer, shape, dtype, offset=0):
   from tinygrad import Tensor
   from tinygrad.uop.ops import UOp
 
-  buf = buffer.view(math.prod(shape), dtype, offset).ensure_allocated()
-  return Tensor(UOp.from_buffer(buf)).reshape(shape)
+  if hasattr(buffer, 'dtype'):
+    # Cinque and the earlier MDM runtime carry the dtype on each Buffer.
+    buf = buffer.view(math.prod(shape), dtype, offset).ensure_allocated()
+    uop = UOp.from_buffer(buf)
+  else:
+    # Retrained MDM uses byte-addressed storage; interpretation belongs to UOp.
+    buf = buffer.view(math.prod(shape) * dtype.itemsize, offset).ensure_allocated()
+    uop = UOp.from_buffer(buf, dtype)
+  return Tensor(uop).reshape(shape)
 
 
 def model_metadata(jits):
@@ -44,7 +53,7 @@ class GenericModelRuntime:
   def __init__(self, jits, width, height, runtime_dir: Path, frame_info):
     # Imports must happen after the worker selects the artifact's tinygrad.
     from tinygrad import Tensor, Device
-    from examples.openpilot.compile_warp import NV12Frame, compile_warp
+    from examples.openpilot.compile_warp import NV12Frame
 
     self.checkpoint, self.output_slices, self.state_pairs, self.count = model_metadata(jits)
     self.device = jits['input_specs']['new_img'][2]
@@ -52,7 +61,7 @@ class GenericModelRuntime:
     if self.gpu_arch != 'gfx1200':
       raise ValueError('precompiled GPU architecture mismatch')
     self.specs = jits['input_specs']
-    self.run_model = jits['run']
+    self.run_model = prepare_jit(jits['run'])
     stride, y_height, uv_height = frame_info[:3]
     self.frame_size = stride * (y_height + uv_height)
     self.input_shapes = {'img': [self.frame_size], 'big_img': [self.frame_size]}
@@ -79,8 +88,7 @@ class GenericModelRuntime:
       self.outputs[next_name] = input_view(state._buffer(), state.shape, state.dtype)
     warp_path = runtime_dir / f'warp-{self.gpu_arch}-{width}x{height}.pkl'
     if warp_path.is_file():
-      with warp_path.open('rb') as f:
-        warp = pickle.load(f)
+      self.run_warp = load_warp(warp_path)
     else:
       warp = compile_warp(NV12Frame(width, height, stride, y_height, uv_height, self.frame_size),
                           (512, 256), layout='yuv420', frames=2, benchmark_runs=1)
@@ -88,7 +96,7 @@ class GenericModelRuntime:
       with temporary.open('wb') as f:
         pickle.dump(warp, f)
       os.replace(temporary, warp_path)
-    self.run_warp = warp['run']
+      self.run_warp = prepare_jit(warp['run'])
 
   def bind_shared(self, packed):
     from tinygrad import Tensor
@@ -103,14 +111,29 @@ class GenericModelRuntime:
     self.transforms = input_view(self.device_buffer, (2, 3, 3), dtypes.float32)
     self.frames = input_view(self.device_buffer, (2, self.frame_size), dtypes.uint8, self.frames_offset)
 
+  def reset_state(self):
+    from tinygrad import Device, Tensor
+    # Same initial zero state and buffer identities as construction; captured
+    # recurrent outputs must continue to alias their original inputs.
+    for name in self.state_pairs:
+      tensor = self.queues[name]
+      zeros = Tensor(np.zeros(tensor.shape, dtype=self.specs[name][1]), device='NPY')
+      tensor._buffer().copy_from(zeros._buffer())
+    Device[self.device].synchronize()
+
   def run(self):
+    progress = getattr(self, 'progress', lambda stage: None)
     started, cpu_started = time.monotonic(), time.thread_time()
+    progress('input_upload')
     self.device_buffer.copy_from(self.host)
     uploaded, cpu_uploaded = time.monotonic(), time.thread_time()
+    progress('warp')
     self.queues['new_img'] = self.run_warp(input_frame=self.frames, M_inv=self.transforms)
     warped, cpu_warped = time.monotonic(), time.thread_time()
+    progress('model_call')
     self.run_model(output_buffers=self.outputs, **self.queues)
     dispatched, cpu_dispatched = time.monotonic(), time.thread_time()
+    progress('output_read')
     result = self.outputs['outputs'].numpy().reshape(-1)
     finished, cpu_finished = time.monotonic(), time.thread_time()
     # Call boundaries only: GPU work may finish in a later call. Do not insert

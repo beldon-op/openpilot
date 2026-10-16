@@ -1,5 +1,6 @@
 import math
 import colorsys
+import time
 import numpy as np
 
 from openpilot.selfdrive.ui.onroad.path_geometry import project_path, sample_path
@@ -11,6 +12,8 @@ from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.params import Params
 from openpilot.selfdrive.locationd.calibrationd import HEIGHT_INIT
 from openpilot.selfdrive.ui.ui_state import ui_state
+from openpilot.selfdrive.ui.radar_display import select_radar_display_points
+from openpilot.selfdrive.ui.vision_status import blindspot_source_packet, blindspot_sources
 from openpilot.selfdrive.ui.road_markings import (
   LANE_DASH_LENGTH_M as LANE_DASH_LENGTH_M, LANE_DASH_GAP_M as LANE_DASH_GAP_M,
   lane_dash_segments, project_lane_segments, project_blindspot_barrier, blindspot_barrier_quads,
@@ -20,6 +23,7 @@ from openpilot.system.ui.lib.text_draw import draw_text_ui_style
 from openpilot.system.ui.lib.shader_polygon import draw_polygon, draw_polygon_solid, Gradient
 from openpilot.system.ui.lib import native_draw, native_geometry, native_text
 from openpilot.system.ui.widgets import Widget
+from openpilot.system.ui.lib.overlay_cache import OverlayLayer, DisplayClock
 
 CLIP_MARGIN = 500
 MIN_DRAW_DISTANCE = 10.0
@@ -74,6 +78,11 @@ class RadarLeadInfo:
 class ModelRenderer(Widget):
   def __init__(self):
     super().__init__()
+    self._overlay = OverlayLayer(0)
+    self._overlay_state = None
+    self._display_clock = DisplayClock()
+    self._model_frame = -1
+    self._params_frame = -1
     self._longitudinal_control = False
     self._experimental_mode = False
     self._blend_filter = FirstOrderFilter(1.0, 0.25, 1 / gui_app.target_fps)
@@ -108,12 +117,19 @@ class ModelRenderer(Widget):
 
     self._font_display: rl.Font = gui_app.font(FontWeight.DISPLAY)
     self._init_carrot()
+    self._render_diagnostics = RenderDiagnostics('uiModel')
 
   def set_transform(self, transform: np.ndarray):
     self._car_space_transform = transform.astype(np.float32)
     self._transform_dirty = True
 
   def _render(self, rect: rl.Rectangle):
+    state = self._overlay_state
+    self._overlay.draw(rect, self._paint, state.key if state else None,
+                       enabled=state is not None and state.enabled, urgent=state is not None and state.urgent)
+
+  def _paint(self, rect: rl.Rectangle):
+    self._display_clock.tick()
     sm = ui_state.sm
 
     # Check if data is up-to-date
@@ -132,11 +148,13 @@ class ModelRenderer(Widget):
     live_calib = sm['liveCalibration']
     self._path_offset_z = live_calib.height[0] if live_calib.height else HEIGHT_INIT[0]
 
-    if sm.updated['carParams']:
+    if sm.recv_frame['carParams'] != self._params_frame:
+      self._params_frame = sm.recv_frame['carParams']
       self._longitudinal_control = sm['carParams'].openpilotLongitudinalControl
 
     model = sm['modelV2']
-    if sm.updated['modelV2']:
+    if sm.recv_frame['modelV2'] != self._model_frame:
+      self._model_frame = sm.recv_frame['modelV2']
       self._update_raw_points(model)
 
     if self._path.raw_points.shape[0] == 0:
@@ -155,8 +173,6 @@ class ModelRenderer(Widget):
     self._draw_carrot_overlays(sm)
 
   def _draw_carrot_overlays(self, sm) -> None:
-    if not hasattr(self, '_render_diagnostics'):
-      self._render_diagnostics = RenderDiagnostics('uiModel')
     timing = self._render_diagnostics
     timing.start()
     timing.call('path', self._draw_path_carrot, sm)
@@ -422,6 +438,7 @@ class ModelRenderer(Widget):
     self._carrot_tire_trajectory = 0
 
     self._carrot_path_draw_seq = 0.0
+    self._carrot_path_draw_seq2 = -1
     self._carrot_pos_t = 0.0
 
     self._carrot_path_x = 0
@@ -744,15 +761,16 @@ class ModelRenderer(Widget):
       path_x = float(np.clip(path_x, 350.0, self._rect.width - 350.0))
       path_y = float(np.clip(path_y, 200.0, self._rect.height - 80.0))
 
-      self._carrot_path_fx = self._carrot_path_fx * self._carrot_path_alpha + path_x * (1.0 - self._carrot_path_alpha)
-      self._carrot_path_fy = self._carrot_path_fy * self._carrot_path_alpha + path_y * (1.0 - self._carrot_path_alpha)
+      alpha = self._display_clock.retention(self._carrot_path_alpha)
+      self._carrot_path_fx = self._carrot_path_fx * alpha + path_x * (1.0 - alpha)
+      self._carrot_path_fy = self._carrot_path_fy * alpha + path_y * (1.0 - alpha)
 
       if path_width < 120.0:
         path_width = 120.0
       elif path_width > 800.0:
         path_width = 800.0
 
-      self._carrot_path_fwidth = self._carrot_path_fwidth * self._carrot_path_alpha + path_width * (1.0 - self._carrot_path_alpha)
+      self._carrot_path_fwidth = self._carrot_path_fwidth * alpha + path_width * (1.0 - alpha)
       self._carrot_path_x = int(self._carrot_path_fx)
       self._carrot_path_y = int(self._carrot_path_fy)
       self._carrot_path_width_px = int(self._carrot_path_fwidth)
@@ -774,9 +792,10 @@ class ModelRenderer(Widget):
 
       if lead_two_left is not None and lead_two_right is not None:
         if self._carrot_lead_two_status > 0:
-          self._carrot_lead_two_xl = self._carrot_lead_two_xl * 0.8 + lead_two_left[0] * 0.2
-          self._carrot_lead_two_xr = self._carrot_lead_two_xr * 0.8 + lead_two_right[0] * 0.2
-          self._carrot_lead_two_y = self._carrot_lead_two_y * 0.8 + lead_two_left[1] * 0.2
+          retain = self._display_clock.retention(0.8)
+          self._carrot_lead_two_xl = self._carrot_lead_two_xl * retain + lead_two_left[0] * (1.0 - retain)
+          self._carrot_lead_two_xr = self._carrot_lead_two_xr * retain + lead_two_right[0] * (1.0 - retain)
+          self._carrot_lead_two_y = self._carrot_lead_two_y * retain + lead_two_left[1] * (1.0 - retain)
         else:
           self._carrot_lead_two_xl = lead_two_left[0]
           self._carrot_lead_two_xr = lead_two_right[0]
@@ -807,6 +826,8 @@ class ModelRenderer(Widget):
             draw_text_ui_style("Signal slowing", x, disp_y, 50, rl.Color(255, 255, 255, 255), align="center", y_offset=0.0)
         elif self._carrot_x_state == 4:
           draw_text_ui_style("E2E주행중", x, disp_y, 50, rl.Color(255, 255, 255, 255), align="center", y_offset=0.0)
+        elif self._carrot_x_state == 6:
+          draw_text_ui_style("신호 감속 준비", x, disp_y, 50, rl.Color(255, 190, 80, 255), align="center", y_offset=0.0)
         elif self._carrot_x_state in (0, 1, 2):
           draw_dist = True
       else:
@@ -1013,22 +1034,28 @@ class ModelRenderer(Widget):
 
 
   def _draw_blind_spot_carrot(self, sm) -> None:
-    input_services = ("modelV2", "carState", "radarState")
+    input_services = ("modelV2", "carState")
     if not all(sm.valid[service] for service in input_services):
       return
 
     car_state = sm['carState']
-    radar_state = sm['radarState']
     meta = sm['modelV2'].meta
-
-    left_blindspot, right_blindspot, left_assist, right_assist = self._blind_spot_draw_state_carrot(
-      car_state, radar_state, meta,
-    )
+    if sm.valid["radarState"]:
+      left_blindspot, right_blindspot, left_assist, right_assist = self._blind_spot_draw_state_carrot(
+        car_state, sm["radarState"], meta,
+      )
+    else:
+      left_blindspot = bool(car_state.leftBlindspot)
+      right_blindspot = bool(car_state.rightBlindspot)
+      left_assist = right_assist = False
     if not (left_blindspot or right_blindspot or left_assist or right_assist):
       return
 
-    warn_color = rl.Color(255, 215, 0, 150)
+    oem_color = rl.Color(255, 215, 0, 150)
+    vision_color = rl.Color(64, 156, 255, 165)
+    combined_color = rl.Color(255, 128, 128, 190)
     assist_color = rl.Color(0, 204, 0, 150)
+    source_packet = blindspot_source_packet(sm, time.monotonic_ns())
     self._update_blind_spot_barriers_carrot(
       sm,
       update_left=left_blindspot or left_assist,
@@ -1036,12 +1063,16 @@ class ModelRenderer(Widget):
     )
 
     if left_blindspot:
-      self._draw_blind_spot_segments_carrot(self._carrot_lane_barrier_vertices[0], warn_color)
+      left_oem, left_vision = blindspot_sources(car_state, "left", source_packet)
+      color = combined_color if left_oem and left_vision else vision_color if left_vision else oem_color
+      self._draw_blind_spot_segments_carrot(self._carrot_lane_barrier_vertices[0], color)
     elif left_assist:
       self._draw_blind_spot_segments_carrot(self._carrot_lane_barrier_vertices[0], assist_color)
 
     if right_blindspot:
-      self._draw_blind_spot_segments_carrot(self._carrot_lane_barrier_vertices[1], warn_color)
+      right_oem, right_vision = blindspot_sources(car_state, "right", source_packet)
+      color = combined_color if right_oem and right_vision else vision_color if right_vision else oem_color
+      self._draw_blind_spot_segments_carrot(self._carrot_lane_barrier_vertices[1], color)
     elif right_assist:
       self._draw_blind_spot_segments_carrot(self._carrot_lane_barrier_vertices[1], assist_color)
 
@@ -1061,7 +1092,11 @@ class ModelRenderer(Widget):
     lane_x = np.array(lane_line.x, dtype=np.float32)
     lane_z = np.array(lane_line.z, dtype=np.float32)
 
-    for lead_group in (radar_state.leadsLeft, radar_state.leadsRight, radar_state.leadsCenter):
+    display_points = select_radar_display_points(sm, self._carrot_show_radar_info, started_frame=ui_state.started_frame)
+    # 표시전용 배열은 제어 그룹을 대체한다. 오류/빈 상태에서는 예전 점을 남기지 않는다.
+    lead_groups = ((display_points,) if display_points is not None else
+                   (radar_state.leadsLeft, radar_state.leadsRight, radar_state.leadsCenter))
+    for lead_group in lead_groups:
       for lead in lead_group:
         d_rel = float(lead.dRel)
         if d_rel <= 2.5:
@@ -1145,7 +1180,7 @@ class ModelRenderer(Widget):
     elif dt < 0.2:
       dt = 0.2
 
-    self._carrot_pos_t += dt
+    self._carrot_pos_t += dt * self._display_clock.frames
     if self._carrot_pos_t > 24.0:
       self._carrot_pos_t -= 24.0
 
@@ -1400,7 +1435,7 @@ class ModelRenderer(Widget):
     accel = float(car_state.aEgo)
     v_ego_kph = float(car_state.vEgo * 3.6)
 
-    seq = max(0.3, v_ego_kph / 100.0)
+    seq = max(0.3, v_ego_kph / 100.0) * self._display_clock.frames
     forward = True
     if accel < -1.0:
       forward = False
@@ -1408,9 +1443,6 @@ class ModelRenderer(Widget):
       forward = True
 
     max_seq = min(track_vertices_len // 4 + 3, 16)
-
-    if not hasattr(self, "_carrot_path_draw_seq2"):
-      self._carrot_path_draw_seq2 = -1
 
     if forward:
       self._carrot_path_draw_seq += seq

@@ -1,4 +1,6 @@
+import asyncio
 import importlib.util
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -23,6 +25,23 @@ def feature(monkeypatch, tmp_path):
 
 def payload(feature, engaged=False):
   return feature.build_status_payload(SimpleNamespace(get_bool=lambda key: key == "UsbGpuHardwareSeen" or (key == "IsEngaged" and engaged)))
+
+
+@pytest.mark.parametrize('state,expected', [('waiting', 'recovering'), ('recovering', 'recovering'),
+                                         ('ready', 'recovery_ready'), ('stopped', 'recovery_stopped')])
+def test_live_recovery_status_overrides_old_failure_without_offering_reboot(feature, monkeypatch, state, expected):
+  monkeypatch.setattr(feature, 'read_egpu_recovery', lambda: {'state': state, 'attempts': 1})
+  params = SimpleNamespace(get_bool=lambda key: key in ('UsbGpuHardwareSeen', 'UsbGpuStartupFailed'))
+  result = feature.build_status_payload(params)
+  assert result['state'] == expected and result['error_code'] is None
+  assert not result['can_restart'] and not result['active']
+
+
+def test_active_gpu_wins_over_recovery_status(feature, monkeypatch):
+  monkeypatch.setattr(feature, 'read_egpu_recovery', lambda: {'state': 'ready'})
+  params = SimpleNamespace(get_bool=lambda key: key in ('UsbGpuHardwareSeen', 'UsbGpuActive'))
+  result = feature.build_status_payload(params)
+  assert result['active'] and result['recovery'] == {}
 
 
 @pytest.mark.parametrize("state", ["checking", "downloading", "verifying", "compiling", "error"])
@@ -132,3 +151,49 @@ def test_runtime_failure_overrides_stale_successful_installation(feature, tmp_pa
   write_big_model_status(tmp_path, 'compiled', sha256='a' * 64)
   result = feature.build_status_payload(SimpleNamespace(get_bool=lambda k: k in {'UsbGpuHardwareSeen', 'UsbGpuStartupFailed'}))
   assert result['state'] == 'error' and result['error_code'] == 'runtime'
+
+
+def test_current_failure_explained_but_never_overrides_active_gpu(feature, monkeypatch):
+  monkeypatch.setattr(feature, 'current_failure', lambda *args: {'error_code': 'timeout', 'worker': {'stage': 'output_read'}})
+  flags = {'UsbGpuHardwareSeen', 'UsbGpuStartupFailed'}
+  params = SimpleNamespace(get_bool=lambda key: key in flags)
+  result = feature.build_status_payload(params)
+  assert result['error_code'] == 'timeout' and result['detail'] == 'Last worker stage: output_read'
+  flags.add('UsbGpuActive')
+  result = feature.build_status_payload(params)
+  assert result['active'] and result['error_code'] != 'timeout'
+
+
+@pytest.mark.parametrize('marker', [False, True])
+def test_rejected_model_never_offers_ineffective_compile_restart(feature, tmp_path, marker):
+  write_big_model_status(tmp_path, 'error', sha256='a' * 64, error_code='rejected' if not marker else 'runtime')
+  if marker:
+    folder = tmp_path / 'precompiled' / ('a' * 64)
+    folder.mkdir(parents=True)
+    (folder / 'rejected').write_text('a' * 64)
+  assert not payload(feature)['can_restart']
+
+
+def test_compile_restart_rejects_blocked_model_without_reboot(feature, monkeypatch, tmp_path):
+  writes = []
+  params = SimpleNamespace(get_bool=lambda key: key == 'UsbGpuHardwareSeen', put_bool=lambda *args: writes.append(args))
+  monkeypatch.setattr(feature, 'HAS_PARAMS', True)
+  monkeypatch.setattr(feature, 'Params', lambda: params)
+  write_big_model_status(tmp_path, 'error', sha256='a' * 64, error_code='rejected')
+  assert asyncio.run(feature.api_compile_restart(None)).status == 409
+  assert not writes
+
+
+def test_diagnostic_download_preserves_original_failure_after_reboot(feature, tmp_path):
+  folder = tmp_path / 'precompiled' / ('a' * 64)
+  folder.mkdir(parents=True)
+  (folder / 'installed.json').write_text(json.dumps({'pickle': {'sha256': 'b' * 64}}))
+  failure = {'pickle_sha256': 'b' * 64, 'boot_id': 'yesterday', 'rejected': True,
+             'phase': 'inference', 'error': 'ValueError: invalid precompiled model output'}
+  (folder / 'last_failure.json').write_text(json.dumps(failure | {'unrelated_private_data': 'do not export'}))
+  response = asyncio.run(feature.api_diagnostics(None))
+  assert response.status == 200 and response.headers['Cache-Control'] == 'no-store'
+  assert 'attachment' in response.headers['Content-Disposition']
+  assert json.loads(response.text)['failure'] == failure
+  (folder / 'installed.json').write_text(json.dumps({'pickle': {'sha256': 'c' * 64}}))
+  assert asyncio.run(feature.api_diagnostics(None)).status == 404

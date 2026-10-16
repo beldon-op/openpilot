@@ -167,6 +167,12 @@ Scope and exclusions:
 > [!WARNING]
 > Values that are too large can flood button messages or make stock SCC miss inputs. Values that are too small can slow or prevent synchronization. Keep the initial Params values `8 / 30 / 1` if there is no problem.
 
+### Toyota/Lexus stock set speed
+
+With `SpeedFromPCM=3`, stock SET/RES speed becomes Carrot's base target. Mode `1` also uses stock set speed; `0` and `2` retain the existing Carrot speed selection. This setting does not switch between stock ACC and openpilot longitudinal control or enable/disable radar. With openpilot longitudinal control, lead, curve, and camera deceleration can lower the target further.
+
+Mode `0` has one exception: with PCM and openpilot direct longitudinal control on `TOYOTA_RAV4_TSS2_2022`, observed stock set-speed changes and disabled-to-enabled cruise transitions update the base target when CAN is valid. An initially enabled sample only establishes a reference; local button or Bluetooth speed changes take priority in the same cycle. Lower lead, curve, and map targets still apply, and no RES/SET CAN transmission is added.
+
 <a id="speed-presets"></a>
 ## 4. Speed presets
 

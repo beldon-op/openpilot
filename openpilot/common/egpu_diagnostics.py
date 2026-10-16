@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from collections import deque
 import os
 from pathlib import Path
 import re
@@ -46,13 +47,26 @@ def select(value: dict, keys: tuple[str, ...]) -> dict:
           for k in keys if k in value and isinstance(value[k], (str, int, float, bool, type(None)))}
 
 
-def command_tail(argv: list[str], *, cwd: Path | None = None) -> str:
+def command_tail(argv: list[str], *, cwd: Path | None = None, pattern: str | None = None) -> str:
   # File-backed output bounds RAM even when the kernel ring buffer is large.
   try:
     with tempfile.TemporaryFile() as output:
       result = subprocess.run(argv, cwd=cwd, stdout=output, stderr=subprocess.STDOUT, timeout=2, check=False)
-      output.seek(max(0, output.tell() - LIMIT))
-      return f'exit={result.returncode}\n' + output.read(LIMIT).decode('utf-8', errors='replace')
+      if pattern is None:
+        output.seek(max(0, output.tell() - LIMIT))
+        data = output.read(LIMIT).decode('utf-8', errors='replace')
+      else:
+        # Camera/other kernel traffic can bury the relevant USB events beyond
+        # the raw tail. Filter the complete file first, with bounded memory.
+        output.seek(0)
+        matched = deque(maxlen=200)
+        regex = re.compile(pattern, re.I)
+        while line := output.readline(8192):
+          text = line.decode('utf-8', errors='replace')
+          if regex.search(text):
+            matched.append(text)
+        data = ''.join(matched)[-LIMIT:]
+      return f'exit={result.returncode}\n' + data
   except (OSError, subprocess.TimeoutExpired) as exc:
     return f'[unavailable: {type(exc).__name__}]'
 
@@ -88,6 +102,11 @@ def collect_report(cache: Path, params: Path, usb_root: Path, repo: Path, update
     runtime_safe = isinstance(runtime_name, str) and re.fullmatch(r'runtime-[0-9a-f]{16}', runtime_name)
     entry = 'examples/openpilot/compile_warp.py' if installed.get('format') == 'comma-generic-onnx' else 'model_runtime.py'
     model_file = root / 'model.pkl'
+    failure = read_json(root / 'last_failure.json')
+    failure_report = select(failure, ('time', 'phase', 'rejected', 'pickle_sha256', 'error', 'boot_id', 'read_error'))
+    if isinstance(failure.get('worker'), dict):
+      failure_report['worker'] = select(failure['worker'], ('pid', 'stage', 'frame', 'stage_age_ms', 'thread_cpu_seconds',
+                                                         'thread_id', 'stat', 'schedstat', 'wchan'))
     artifacts.append({'model_sha256': root.name, 'is_active': root.name == active_sha,
                       'model_exists': model_file.is_file(), 'model_bytes': model_file.stat().st_size if model_file.is_file() else None,
                       'pickle': select(installed.get('pickle', {}) if isinstance(installed.get('pickle'), dict) else {}, ('sha256', 'size')),
@@ -95,7 +114,7 @@ def collect_report(cache: Path, params: Path, usb_root: Path, repo: Path, update
                       'runtime_entry_exists': bool(runtime_safe and (root / runtime_name / entry).is_file()),
                       'runtime_tinygrad_exists': bool(runtime_safe and (root / runtime_name / 'tinygrad/__init__.py').is_file()),
                       'rejected': (root / 'rejected').exists(), 'rejected_hash': read_text(root / 'rejected', 128).strip(),
-                      'last_failure': select(read_json(root / 'last_failure.json'), ('time', 'phase', 'rejected', 'pickle_sha256', 'error', 'read_error')),
+                      'last_failure': failure_report,
                       'boot_validation_exists': (root / 'boot_validation.json').is_file()})
   report['artifacts'] = artifacts
   report['usb_devices'] = []
@@ -105,7 +124,7 @@ def collect_report(cache: Path, params: Path, usb_root: Path, repo: Path, update
       report['usb_devices'].append({'port': device.name, 'vendor': vendor, 'product': product,
                                     **{k: read_text(device / k, 128).strip() for k in
                                        ('speed', 'authorized', 'power/runtime_status', 'power/control')}})
-  kernel = command_tail(['dmesg'])
+  kernel = command_tail(['dmesg'], pattern=r'usb|pcie|xhci|over.?current|voltage|unavailable|permitted|denied')
   report['kernel_usb_tail'] = '\n'.join(line for line in kernel.splitlines()
                                        if re.search(r'usb|pcie|xhci|over.?current|voltage|unavailable|permitted|denied|^exit=', line, re.I))[-12000:]
   report['download_error_tail'] = '\n'.join(line for line in read_text(update_log, tail=True).splitlines()
