@@ -52,6 +52,17 @@ safety_byd.h 自带 gate），逻辑等价，源码不能互换编译。
 （2026-10-17 实车复现过一次）。签名校验对此无感（新旧固件签名可相同），
 不会触发自动重刷——不要试图靠重刷解决版本不匹配。
 
+**C++ 侧 health 兼容（勿移除，2026-10-18）**：C++ `pandad` 直接 include
+`panda/board/health.h`，v17 结构体比 v16 包多 1 字节——按 v17 读 v16 包时
+`wake_on_can` 之后所有字段错位一字节：`harnessStatus` 读到固件
+`safety_mode`（冻结固件 silent=19）→ 枚举越界，hardwared 在
+STATUS_PACKET `to_dict()` 上 "Member was null" 崩溃循环 → deviceState
+断流 → 设备不进工作状态（2026-10-18 台架复现）。修复：
+`health.h` 增加 `legacy_health_t`（v16 布局），`pandad/panda.cc`
+`Panda::get_state()` 按 control_read 实际返回字节数归一化
+（58=v16 映射进 v17 结构，59=v17 直读，其它长度拒绝发布）。
+合并上游时保留该分支；改 `health_t` 结构时同步更新 `legacy_health_t`。
+
 ## 不要做的事
 
 - 不要用 sunnypilot 或本仓库 `panda/` 现编的新代固件刷这块 c3l 兼容板：
