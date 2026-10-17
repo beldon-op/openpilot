@@ -45,21 +45,21 @@ safety_byd.h 自带 gate），逻辑等价，源码不能互换编译。
   `~/Documents/op/arm-tc`），`scons -j8 board/obj/panda.bin.signed`；
   产物与入库文件逐字节一致（可复现构建已验证）。
 
-**health v17 过渡（2026-10-18）**：固件侧已在 0.9.x 基线上把 health packet
-升到 **v17**（`panda_fw_base` `9d0a0046`：加 `wake_on_can_pkt` 字节、恒 0，
-版本号 16→17），与主机侧 a3fbd86f 起的 v17 期望对齐，**上游合并不再需要
-v16 兼容分支**。此前两段历史（供追溯）：
-① python 库曾 v17-only，对 v16 固件 pandad 在 `health()` 版本不匹配崩溃
-循环 → UI「panda 否/离线」（2026-10-17 实车复现，72820133 修）；
-② C++ `pandad` 曾按 v17 结构体读 v16 包，`wake_on_can` 之后全体错位一字节，
-`harnessStatus` 读到固件 `safety_mode`(19) 枚举越界，hardwared 在
-STATUS_PACKET `to_dict()` 上 "Member was null" 崩溃循环 → deviceState
-断流 → 设备不进工作状态（2026-10-18 台架复现，641183f0 修）。
-**过渡安排**：`panda/python/__init__.py` 的 v16 双解析（LEGACY_*
-+ `test_panda_health_v16.py`）与 `pandad/panda.cc` 的按包长归一化
-（`legacy_health_t`）**先保留**——对 v17 固件走 v17 路径不生效，同时兼容
-万一刷写后仍是 v16 旧固件的板子；**设备实测确认 health v17 后，删除两处
-兼容分支**（删 `legacy_health_t` 时 `static_assert` 会一起删）。
+**health v17 定案（2026-10-18，已实车验证）**：固件侧已在 0.9.x 基线上把
+health packet 升到 **v17**（`panda_fw_base` `9d0a0046`：加 `wake_on_can_pkt`
+字节、恒 0，版本号 16→17），与主机侧 a3fbd86f 起的 v17 期望对齐。设备实测
+（`d9a1d07a` OTA 后）：pandad 签名不同自动刷写成功，health_version=17、
+原始包 59 字节原生路径，实车正常工作。上游合并不再需要任何 v16 兼容分支
+——曾有的两处过渡兼容（python `LEGACY_*` 双解析 + C++ `legacy_health_t`
+按包长归一化，修 72820133/641183f0）已在设备确认 v17 后删除。
+历史事故供追溯：① python 库 v17-only 遇 v16 固件 → `health()` 崩溃循环
+「panda 否/离线」（2026-10-17 实车）；② C++ v17 结构体读 v16 包 →
+`harnessStatus` 读到 `safety_mode`(19) 枚举越界 → hardwared "Member was
+null" 崩溃循环 → deviceState 断流（2026-10-18 台架）。
+**警告**：主机现已无 v16 兼容——若把 git 历史里的旧 v16 固件产物刷回板子，
+会立即复现事故②；只刷本目录当前产物。另：sunnypilot 树的 "v17" 是
+57B/25 字段的另一种布局（见记忆/docs），与 carrot v17 59B 同号不同协议，
+其固件产物不能配 carrot host，勿混刷。
 
 ## 不要做的事
 

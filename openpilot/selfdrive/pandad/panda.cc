@@ -99,56 +99,9 @@ void Panda::set_ir_pwr(uint16_t ir_pwr) {
 }
 
 std::optional<health_t> Panda::get_state() {
-  // Normalize by packet size: the frozen BYD c3l firmware reports health
-  // packet v16 (legacy_health_t, see panda/board/obj/FIRMWARE_NOTICE.md),
-  // which is health_t minus wake_on_can_pkt. Reading a v16 packet with the
-  // v17 layout shifts every field after ignition_can by one byte and makes
-  // consumers crash on out-of-range enums (e.g. harnessStatus = safety_mode).
-  uint8_t raw[sizeof(health_t)] = {0};
-  int err = handle->control_read(0xd2, 0, 0, (unsigned char*)raw, sizeof(raw));
-  if (err < 0) {
-    return std::nullopt;
-  }
-
-  health_t health = {0};
-  if (err == (int)sizeof(health_t)) {
-    memcpy(&health, raw, sizeof(health));
-  } else if (err == (int)sizeof(legacy_health_t)) {
-    static_assert(sizeof(legacy_health_t) == sizeof(health_t) - 1);
-    legacy_health_t legacy = {0};
-    memcpy(&legacy, raw, sizeof(legacy));
-    health.uptime_pkt = legacy.uptime_pkt;
-    health.voltage_pkt = legacy.voltage_pkt;
-    health.current_pkt = legacy.current_pkt;
-    health.safety_tx_blocked_pkt = legacy.safety_tx_blocked_pkt;
-    health.safety_rx_invalid_pkt = legacy.safety_rx_invalid_pkt;
-    health.tx_buffer_overflow_pkt = legacy.tx_buffer_overflow_pkt;
-    health.rx_buffer_overflow_pkt = legacy.rx_buffer_overflow_pkt;
-    health.faults_pkt = legacy.faults_pkt;
-    health.ignition_line_pkt = legacy.ignition_line_pkt;
-    health.ignition_can_pkt = legacy.ignition_can_pkt;
-    health.controls_allowed_pkt = legacy.controls_allowed_pkt;
-    health.car_harness_status_pkt = legacy.car_harness_status_pkt;
-    health.safety_mode_pkt = legacy.safety_mode_pkt;
-    health.safety_param_pkt = legacy.safety_param_pkt;
-    health.fault_status_pkt = legacy.fault_status_pkt;
-    health.power_save_enabled_pkt = legacy.power_save_enabled_pkt;
-    health.heartbeat_lost_pkt = legacy.heartbeat_lost_pkt;
-    health.alternative_experience_pkt = legacy.alternative_experience_pkt;
-    health.interrupt_load_pkt = legacy.interrupt_load_pkt;
-    health.fan_power = legacy.fan_power;
-    health.safety_rx_checks_invalid_pkt = legacy.safety_rx_checks_invalid_pkt;
-    health.spi_checksum_error_count_pkt = legacy.spi_checksum_error_count_pkt;
-    health.fan_stall_count = legacy.fan_stall_count;
-    health.sbu1_voltage_mV = legacy.sbu1_voltage_mV;
-    health.sbu2_voltage_mV = legacy.sbu2_voltage_mV;
-    health.som_reset_triggered = legacy.som_reset_triggered;
-    // health.wake_on_can_pkt stays 0: not present in v16
-  } else {
-    // Unknown packet size: refuse to publish misaligned data.
-    return std::nullopt;
-  }
-  return health;
+  health_t health {0};
+  int err = handle->control_read(0xd2, 0, 0, (unsigned char*)&health, sizeof(health));
+  return err >= 0 ? std::make_optional(health) : std::nullopt;
 }
 
 std::optional<can_health_t> Panda::get_can_state(uint16_t can_number) {

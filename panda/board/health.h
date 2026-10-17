@@ -31,41 +31,6 @@ struct __attribute__((packed)) health_t {
   uint8_t som_reset_triggered;
 };
 
-// Legacy health packet v16, reported by the frozen 0.9.x-baseline BYD c3l
-// firmware (see panda/board/obj/FIRMWARE_NOTICE.md): identical to health_t
-// minus the wake_on_can_pkt byte after ignition_can_pkt. Host code
-// (pandad Panda::get_state, python LEGACY_HEALTH_STRUCT) normalizes it by
-// packet size; this header is also compiled into the board, where the
-// struct is intentionally unused.
-struct __attribute__((packed)) legacy_health_t {
-  uint32_t uptime_pkt;
-  uint32_t voltage_pkt;
-  uint32_t current_pkt;
-  uint32_t safety_tx_blocked_pkt;
-  uint32_t safety_rx_invalid_pkt;
-  uint32_t tx_buffer_overflow_pkt;
-  uint32_t rx_buffer_overflow_pkt;
-  uint32_t faults_pkt;
-  uint8_t ignition_line_pkt;
-  uint8_t ignition_can_pkt;
-  uint8_t controls_allowed_pkt;
-  uint8_t car_harness_status_pkt;
-  uint8_t safety_mode_pkt;
-  uint16_t safety_param_pkt;
-  uint8_t fault_status_pkt;
-  uint8_t power_save_enabled_pkt;
-  uint8_t heartbeat_lost_pkt;
-  uint16_t alternative_experience_pkt;
-  float interrupt_load_pkt;
-  uint8_t fan_power;
-  uint8_t safety_rx_checks_invalid_pkt;
-  uint16_t spi_checksum_error_count_pkt;
-  uint8_t fan_stall_count;
-  uint16_t sbu1_voltage_mV;
-  uint16_t sbu2_voltage_mV;
-  uint8_t som_reset_triggered;
-};
-
 #define CAN_HEALTH_PACKET_VERSION 5
 typedef struct __attribute__((packed)) {
   uint8_t bus_off;
