@@ -56,3 +56,8 @@ safety_byd.h 自带 gate），逻辑等价，源码不能互换编译。
 
 - 不要用 sunnypilot 或本仓库 `panda/` 现编的新代固件刷这块 c3l 兼容板：
   0.10.x 基线 app 刷入后不枚举 USB（未深查，弃用），新代框架结构也不同。
+  **已证实例外**：sunnypilot 树构建的 `DEV-80a7a508-RELEASEd`（2026-10-14，
+  产物在 `~/Documents/work/op/carrotpilot/byd/openpilot/panda/board/obj/`）
+  实车可正常启动（2026-10-17 确认）——"不枚举 USB"结论只对当时试过的构建
+  成立，不是新代固件的通例。但它与 carrot 签名不同，carrot 的 pandad 会刷回
+  本仓库产物；本仓库入库固件仍以 0.9.x BYD 基线为准，不更换。

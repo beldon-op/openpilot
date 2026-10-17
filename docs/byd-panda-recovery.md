@@ -101,6 +101,12 @@ sudo sh -c 'echo 0 > /sys/class/gpio/gpio134/value;
 | 官方 v0.10.1 固件 | ❌ | 在此兼容板上主固件无法启动（bootstub 正常）|
 | **自建固件（含 byd）** | ✅ 必经之路 | 以 0.9.x 时代上游 panda 源码为基线
   （厂商固件同期、已验证可启动），移植 `byd.h` 交叉编译 |
+| sunnypilot 树新代构建（`DEV-80a7a508-RELEASEd`） | ✅（2026-10-17 实车确认） | 第二个已知好固件源：
+  `~/Documents/work/op/carrotpilot/byd/openpilot/panda/board/obj/`（2026-10-14 构建，
+  `panda.bin.signed` sha256 `b9f9d0ae…279332`，固件源码已从该树清掉、仅存产物）。
+  推定 health v17（配 sunnypilot v17-only 库）。注意：与 carrot 签名不同，carrot 的
+  pandad 会自动刷回本仓库 `panda.bin.signed`——长期跑 carrot 仍以本仓库入库产物为准 |
+
 
 ## 四、当前状态与下一步
 
