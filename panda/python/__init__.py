@@ -87,18 +87,21 @@ def unpack_can_buffer(dat):
   return (ret, dat)
 
 
-def ensure_version(desc, lib_field, panda_field, fn):
+def ensure_version(desc, lib_field, panda_field, fn, allowed=None):
   @wraps(fn)
   def wrapper(self, *args, **kwargs):
     lib_version = getattr(self, lib_field)
     panda_version = getattr(self, panda_field)
-    if lib_version != panda_version:
+    ok = panda_version in allowed if allowed is not None else panda_version == lib_version
+    if not ok:
       raise RuntimeError(f"{desc} packet version mismatch: panda's firmware v{panda_version}, library v{lib_version}. Reflash panda.")
     return fn(self, *args, **kwargs)
   return wrapper
 ensure_can_packet_version = partial(ensure_version, "CAN", "CAN_PACKET_VERSION", "can_version")
 ensure_can_health_packet_version = partial(ensure_version, "CAN health", "CAN_HEALTH_PACKET_VERSION", "can_health_version")
-ensure_health_packet_version = partial(ensure_version, "health", "HEALTH_PACKET_VERSION", "health_version")
+# health v16 = the frozen 0.9.x-baseline firmware on the BYD c3l board
+# (Panda.LEGACY_HEALTH_PACKET_VERSION, see panda/board/obj/FIRMWARE_NOTICE.md)
+ensure_health_packet_version = partial(ensure_version, "health", "HEALTH_PACKET_VERSION", "health_version", allowed=(16, 17))
 
 
 
@@ -132,6 +135,11 @@ class Panda:
   CAN_HEALTH_PACKET_VERSION = 5
   HEALTH_STRUCT = struct.Struct("<IIIIIIIIBBBBBBHBBBHfBBHBHHB")
   CAN_HEALTH_STRUCT = struct.Struct("<BIBBBBBBBBIIIIIIIHHBBBIIII")
+  # health v16: the BYD c3l board runs the frozen 0.9.x-baseline firmware (see
+  # panda/board/obj/FIRMWARE_NOTICE.md), whose health packet is this layout —
+  # identical to v17 minus the wake_on_can field inserted after ignition_can.
+  LEGACY_HEALTH_PACKET_VERSION = 16
+  LEGACY_HEALTH_STRUCT = struct.Struct("<IIIIIIIIBBBBBHBBBHfBBHBHHB")
 
   F4_DEVICES = [HW_TYPE_WHITE_PANDA, HW_TYPE_GREY_PANDA, HW_TYPE_BLACK_PANDA, HW_TYPE_UNO, HW_TYPE_DOS]
   H7_DEVICES = [HW_TYPE_RED_PANDA, HW_TYPE_RED_PANDA_V2, HW_TYPE_TRES, HW_TYPE_CUATRO]
@@ -548,8 +556,13 @@ class Panda:
 
   @ensure_health_packet_version
   def health(self):
-    dat = self._handle.controlRead(Panda.REQUEST_IN, 0xd2, 0, 0, self.HEALTH_STRUCT.size)
-    a = self.HEALTH_STRUCT.unpack(dat)
+    if self.health_version == self.LEGACY_HEALTH_PACKET_VERSION:
+      dat = self._handle.controlRead(Panda.REQUEST_IN, 0xd2, 0, 0, self.LEGACY_HEALTH_STRUCT.size)
+      a = list(self.LEGACY_HEALTH_STRUCT.unpack(dat))
+      a.insert(10, 0)  # wake_on_can, added in health v17
+    else:
+      dat = self._handle.controlRead(Panda.REQUEST_IN, 0xd2, 0, 0, self.HEALTH_STRUCT.size)
+      a = self.HEALTH_STRUCT.unpack(dat)
     return {
       "uptime": a[0],
       "voltage": a[1],

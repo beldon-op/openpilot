@@ -43,6 +43,15 @@ safety_byd.h 自带 gate），逻辑等价，源码不能互换编译。
   `~/Documents/op/arm-tc`），`scons -j8 board/obj/panda.bin.signed`；
   产物与入库文件逐字节一致（可复现构建已验证）。
 
+**主机侧 health 兼容（勿移除）**：本固件 health packet 为 **v16**（无
+`wake_on_can` 字段），而库在 a3fbd86f 起期望 v17。`panda/python/__init__.py`
+按固件上报版本双解析（`LEGACY_HEALTH_PACKET_VERSION`/`LEGACY_HEALTH_STRUCT`，
+`ensure_health_packet_version` 允许 16/17，v16 补 `wake_on_can=0`），单测
+`test_panda_health_v16.py` 守护。**合并上游/升级库时必须保留 v16 分支**，
+否则 pandad 在 `health()` 上版本不匹配崩溃循环 → UI「panda 否/离线」
+（2026-10-17 实车复现过一次）。签名校验对此无感（新旧固件签名可相同），
+不会触发自动重刷——不要试图靠重刷解决版本不匹配。
+
 ## 不要做的事
 
 - 不要用 sunnypilot 或本仓库 `panda/` 现编的新代固件刷这块 c3l 兼容板：
