@@ -1,19 +1,26 @@
 """
 mate — 车机事件实时推送服务（局域网）
 
-把 poller.py 推导的五类边沿事件（events / opstate / button / sound / navi）通过
-WebSocket 和 SSE 推给局域网客户端。参考实现为 cp_byd local_collector，
-其中 admin 管理 API 与 10Hz 周期帧均不移植。
+把 poller.py 推导的边沿事件（events / opstate / button / sound）与 2Hz 周期状态帧
+（frame：car/radar 段，喂驾驶屏连续值）通过 WebSocket 和 SSE 推给局域网客户端。
+
+服务定位原则：mate 只推「op 能获取、而局域网客户端无法自产」的数据；数据源在
+客户端侧的数据禁止回推——v2 的 navi kind（输入即 carrotmate 上行的导航数据）
+因此移除。参考实现为 cp_byd local_collector，其中 admin 管理 API 与 10Hz 周期帧
+均不移植（frame 为 2Hz 状态语义）。
 
 接口：
   GET /ws                 WebSocket（heartbeat 20s）
   GET /stream             SSE（?kinds=events,sound 可过滤）
-  GET /state              一次性状态快照（car/opstate/events/sound 最新值 +
+  GET /state              一次性状态快照（car/radar/opstate/events/sound +
                           services/panda/meta 服务状态段，不周期推流）
   GET /health             健康检查（不鉴权，含 poller 心跳新鲜度与 onroad 标志）
   GET /sounds/<file.wav>  播放 sound 事件对应的音效文件（随语言目录切换）
 
 WS 客户端也可发 {"type":"snapshot"} 走同一条连接拿快照。协议文档见 mate/API.md。
+
+协议 v3：hello.version=3；kind 白名单 events/opstate/button/sound/frame；
+WS 鉴权失败在升级后发 {"type":"error"} 帧再关闭（SSE 仍为 HTTP 401）。
 
 可选鉴权：params 写 MateToken 后，/ws /stream /state /sounds 必须带 ?token=xxx 或
 Authorization: Bearer xxx。白名单外的 key 走 /data/params/d 文件直读。
@@ -42,11 +49,11 @@ from openpilot.selfdrive.ui.soundd import (
 )
 
 PORT = int(os.environ.get("MATE_PORT", "8083"))
-PROTOCOL_VERSION = 2  # v2：新增 navi kind；客户端按 hello.version 探测能力
-ALL_KINDS = ("events", "opstate", "button", "sound", "navi")
+PROTOCOL_VERSION = 3  # v3：移除回声 navi kind、新增 frame 周期状态帧；客户端按 hello.version 探测能力
+ALL_KINDS = ("events", "opstate", "button", "sound", "frame")
 STATE_KINDS = ("events", "opstate", "sound")  # emit 时同步写进 /state 快照的类型；
-# navi 不在其中——其 emit 数据是「变化分组」而非全量值，快照由 poller 显式喂
-REPLAY_KINDS = ("events", "sound")  # 新连接先补发这两类的当前状态
+# frame 不在其中——其 car/radar 段由 poller 显式喂快照，kind 本身只广播不进快照
+REPLAY_KINDS = ("events", "sound")  # 新连接先补发这两类的当前状态（frame 走快照初始化）
 TOKEN_PARAM = "MateToken"
 SLOW_CLIENT_QUEUE = 256
 SSE_KEEPALIVE_S = 15.0
@@ -96,13 +103,18 @@ def resolve_wav_path(filename: str) -> str | None:
   return path if os.path.isfile(path) else None
 
 
-def check_auth(request: web.BaseRequest) -> None:
+def auth_ok(request: web.BaseRequest) -> bool:
   token = read_token()
   if not token:
-    return
+    return True
   auth = request.headers.get("Authorization", "")
   provided = request.query.get("token") or (auth[7:] if auth.startswith("Bearer ") else "")
-  if not hmac.compare_digest(provided, token):
+  return hmac.compare_digest(provided, token)
+
+
+def check_auth(request: web.BaseRequest) -> None:
+  """HTTP 语义的鉴权（SSE/state/sounds）：失败抛 401。WS 用 auth_ok 走 error 帧。"""
+  if not auth_ok(request):
     raise web.HTTPUnauthorized(text='{"error":"invalid token"}', content_type="application/json")
 
 
@@ -182,10 +194,19 @@ class Hub:
 hub = Hub()
 
 
+async def ws_reject(ws: web.WebSocketResponse) -> None:
+  """WS 鉴权失败：完成升级后发 error 帧再关闭——客户端（carrotmate 的 AuthFailed
+  分支）按消息语义处理，而非笼统的连接失败。"""
+  await ws.send_str(json.dumps({"type": "error", "data": {"msg": "invalid token"}}, ensure_ascii=False))
+  await ws.close()
+
+
 async def ws_handler(request: web.Request):
-  check_auth(request)
   ws = web.WebSocketResponse(heartbeat=20)
   await ws.prepare(request)
+  if not auth_ok(request):
+    await ws_reject(ws)
+    return ws
 
   kinds = set(ALL_KINDS)
   q = hub.add_client(kinds)

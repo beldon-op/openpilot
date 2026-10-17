@@ -1,12 +1,37 @@
 # mate 接口文档
 
 车机事件实时推送服务。订阅 cereal 消息总线，把告警事件、openpilot 状态机跳转、
-方向盘按键、播报声音、导航/交通信息五类**边沿事件**通过 **WebSocket** 或 **SSE**
-推给局域网客户端，并提供一次性状态快照 `GET /state`。
+方向盘按键、播报声音四类**边沿事件**与 2Hz 的 **frame 周期状态帧**（car/radar 段）
+通过 **WebSocket** 或 **SSE** 推给局域网客户端，并提供一次性状态快照 `GET /state`。
 
-参考实现是 cp_byd 的 `local_collector/collector.py`；mate 是其事件子集——
-**没有** 10Hz 周期帧，**没有** admin 管理 API（日志/参数/carinfo）。
-「当前值」类需求一律走 `/state`，不靠推流。
+> **协议版本：v3**（`hello.version = 3`）。v2 → v3 迁移要点见 §9。
+
+## 0. 服务定位原则与架构
+
+**mate 只推「op 能获取、而局域网客户端无法自产」的数据；数据源在客户端侧的数据
+禁止回推。** v2 的 `navi` kind 即因此移除——其输入 `carrotNavi` 是 carrotmate
+（Android 车机端）自己推给 op 的导航数据，回推属回声。新增 kind 一律先过此审计。
+
+设备拓扑与数据流（两条链路互不相干）：
+
+```
+┌──────────────── Android 车机大屏（carrotmate 运行处）────────────────┐
+│  高德地图车机版 ──全局广播──▶ carrotmate                              │
+└──────────┬──────────────────────────────────┬───────────────────────┘
+           │ 导航上行（7706 UDP / 7714 WS）     │ 状态下行（8083 WS）
+           ▼                                  ▼
+┌─────────────────────┐          ┌──────────────────────────────┐
+│ CarrotPilot 设备     │          │  mate :8083（本服务）          │
+│  carrot_navi.py      │          │  只推 op 独有数据：             │
+│   → carrotNavi       │          │   events/opstate/button/sound │
+│   → op 内部消费       │          │   + 2Hz frame（car/radar）     │
+│  （HUD/soundd/规划）  │          └──────────────────────────────┘
+└─────────────────────┘
+```
+
+- 上行（导航）：高德 → carrotmate → `carrot_navi.py` → cereal `carrotNavi` →
+  op 内部（HUD / soundd / 规划）。**mate 不参与，也不回推**。
+- 下行（状态）：mate 订阅 cereal → WS/SSE → 客户端。
 
 - 服务代码：`openpilot/mate/server.py`（事件推导在 `openpilot/mate/poller.py`）
 - 默认端口：**8083**（env `MATE_PORT` 可覆盖）
@@ -21,7 +46,7 @@
 
 | 端点 | 协议 | 鉴权 | 说明 |
 |---|---|---|---|
-| `ws://<车机IP>:8083/ws` | WebSocket | ✔ | 双向：收事件，可发 subscribe / snapshot / ping |
+| `ws://<车机IP>:8083/ws` | WebSocket | ✔ | 双向：收事件与 frame，可发 subscribe / snapshot / ping |
 | `http://<车机IP>:8083/stream` | SSE | ✔ | 单向推流，`?kinds=events,sound` 过滤 |
 | `http://<车机IP>:8083/state` | HTTP GET | ✔ | 一次性全量状态快照：数据段 + 服务状态段（见 §5） |
 | `http://<车机IP>:8083/sounds/<file.wav>` | HTTP GET | ✔ | sound 事件对应音效文件 |
@@ -44,7 +69,11 @@ rm /data/params/d/MateToken                          # 关
 - 请求头：`Authorization: Bearer your-secret`
 - SSE 用 query 参数（浏览器 EventSource 不支持自定义头）
 
-鉴权失败返回 HTTP 401 `{"error":"invalid token"}`。
+鉴权失败语义（v3）：
+
+- **WS**：连接升级成功 → 服务端发 `{"type":"error","data":{"msg":"invalid token"}}` →
+  关闭连接。客户端应按消息语义处理（如显示"配对失败"），而非笼统的连接失败重试。
+- **SSE / HTTP**：HTTP 401 `{"error":"invalid token"}`。
 
 ### 1.3 事件类型（kind）
 
@@ -54,7 +83,7 @@ rm /data/params/d/MateToken                          # 关
 | `opstate` | openpilot 状态机跳转 / enabled/active/engageable 变化 | ✔ | ✘ |
 | `button` | 方向盘按键按下/松开（边沿帧） | ✘ | ✘ |
 | `sound` | 播报声音切换（含 carrot 倒计时报数） | ✔ | ✔（正在播报时） |
-| `navi` | 导航/交通信息边沿（限速/电子眼/信号灯/偏航/转向，v2 新增） | ✔（全量值） | ✘（走快照） |
+| `frame` | **2Hz 周期状态帧**（car/radar 段，驾驶屏连续值） | ✘（段进快照） | ✘（走快照） |
 
 ---
 
@@ -70,19 +99,20 @@ rm /data/params/d/MateToken                          # 关
 
 | type | 触发时机 | 说明 |
 |---|---|---|
-| `hello` | 连接建立后第一条 | `{"service":"mate","version":2,"port":8083,"kinds":[...]}`；`version` 供客户端探测能力（v2 起含 `navi`） |
-| `events` / `opstate` / `button` / `sound` / `navi` | 见 §4 | 事件本体 |
+| `hello` | 连接建立后第一条 | `{"service":"mate","version":3,"port":8083,"kinds":[...]}`；`version` 供客户端探测能力 |
+| `events` / `opstate` / `button` / `sound` / `frame` | 见 §4 | 事件/状态本体 |
 | `snapshot` | 响应 snapshot 请求 | 见 §5 |
 | `subscribed` | 响应 subscribe 请求 | `{"kinds":[...]}` 当前生效过滤 |
+| `error` | **鉴权失败**（v3 新增） | `{"msg":"invalid token"}`，随后连接关闭 |
 | `pong` | 响应 ping | `{"ts": <monotonic>}` |
 
-> **版本约定**：`hello.version` 升级代表新增 kind/字段。客户端**必须忽略未知 type**
-> （未升级的客户端连 v2 服务会多收到 `navi` 消息，按此约定静默忽略即可），据此实现
-> 前后向兼容。
+> **版本约定**：`hello.version` 升级代表 kind 集或语义变化。客户端**必须忽略未知
+> type**（未升级的客户端连 v3 服务会多收到 `frame` 消息，按此约定静默忽略即可），
+> 据此实现前后向兼容。
 
 连接建立后依次收到：`hello` → （当前活跃告警的 `events` 补发，有则发）→
-（当前正在播报的 `sound` 补发，有则发）。**按键不补发**——客户端拿当前车辆状态请用
-`snapshot` / `GET /state`。
+（当前正在播报的 `sound` 补发，有则发）。**按键与 frame 不补发**——客户端拿当前
+车辆/雷达状态请用 `snapshot` / `GET /state`。
 
 服务端每 20s 发 WebSocket protocol ping，死连接自动清理。
 
@@ -99,6 +129,7 @@ rm /data/params/d/MateToken                          # 关
 { "type": "ping" }
 ```
 
+订阅规则：白名单外的 kind 被忽略；`kinds` 缺省或全为非法值时回退全量白名单。
 未知消息与非法 JSON 直接忽略（不报错），便于客户端版本迭代。
 
 ### 2.3 JavaScript 示例
@@ -130,12 +161,10 @@ ws.onmessage = (e) => {
     case "sound":
       console.log("播报:", msg.data.sound, msg.data.loop ? "循环" : "单次");
       break;
-    case "navi":
-      if (msg.data.speedLimit?.valid) console.log("限速:", msg.data.speedLimit.limitKph);
-      if (msg.data.sdi) console.log("电子眼:", msg.data.sdi);
-      if (msg.data.signal) console.log("信号灯:", msg.data.signal);
-      if (msg.data.route?.offRoute) console.log("已偏航！");
-      if (msg.data.guidance) console.log("转向:", msg.data.guidance.mainText);
+    case "frame":
+      // 2Hz 驾驶屏连续值：车速/挡位/巡航/前车距离（last-wins，丢帧无害）
+      if (msg.data.car) console.log("车速:", msg.data.car.vEgoKph);
+      if (msg.data.radar) console.log("前车距离:", msg.data.radar.leadOne?.dRel);
       break;
     default:
       // 未知 type 一律忽略（协议向前兼容的关键约定）
@@ -152,7 +181,7 @@ import websocket
 
 def on_message(ws, message):
     msg = json.loads(message)
-    if msg["type"] in ("events", "opstate", "button", "sound", "navi"):
+    if msg["type"] in ("events", "opstate", "button", "sound", "frame"):
         print(msg["type"], msg["data"])
 
 ws = websocket.WebSocketApp("ws://192.168.1.100:8083/ws?token=your-secret",
@@ -166,11 +195,11 @@ ws.run_forever()
 
 - 地址：`http://<车机IP>:8083/stream?kinds=events,sound&token=your-secret`
   （`kinds` 省略 = 全部；非法 kind 被忽略）
-- SSE 的 `event:` 名即消息类型（`events`/`opstate`/`button`/`sound`/`navi`），
+- SSE 的 `event:` 名即消息类型（`events`/`opstate`/`button`/`sound`/`frame`），
   `data:` 为同样的 JSON 信封
-- 新连接同样先补发活跃告警与正在播报的声音
+- 新连接同样先补发活跃告警与正在播报的声音（frame 不补发）
 - 空闲 15s 输出一条 `: ping` 注释行保活
-- 慢客户端：队列上限 256，满了丢最旧（事件频率很低，正常使用不会触发）
+- 慢客户端：队列上限 256，满了丢最旧（frame 为状态语义，丢旧保新无害）
 - 浏览器 `EventSource` 断线自动重连
 
 ```bash
@@ -179,7 +208,7 @@ curl -N "http://<车机IP>:8083/stream?kinds=events,opstate"
 
 ---
 
-## 4. 事件数据字典
+## 4. 事件与帧数据字典
 
 ### 4.1 `events` 告警事件
 
@@ -249,7 +278,7 @@ onroad 告警集合**发生变化时**推送（出现/消失去抖，不每帧�
 | `decelCruise` | 巡航减速 | | `paddleLeft` / `paddleRight` | 换挡拨片 |
 | `cancel` | 取消巡航 | | `altButton2` / `unknown` | 备用 / 未识别 |
 
-> 转向灯持续状态请用 `/state` 的 `car.leftBlinker/rightBlinker`；
+> 转向灯持续状态请用 frame/快照的 `car.leftBlinker/rightBlinker`；
 > 此事件是拨杆的**瞬间动作**。BYD 宋PLUS 注意：下拨 SET 厂商即激活（SET 是激活语义
 > 而非设定，属厂商行为），客户端别把 `setCruise` 按下直接映射成"设定巡航"文案。
 
@@ -293,46 +322,58 @@ onroad 告警集合**发生变化时**推送（出现/消失去抖，不每帧�
 - **与 soundd 的唯一差异**：soundd 会等有限长音效播完才转 `none`，mate 没有音频时钟，
   推导结束即推 `none`（客户端只会提前停播，不会漏停）
 
-### 4.5 `navi` 导航/交通信息（v2 新增）
+### 4.5 `frame` 周期状态帧（v3 新增）
 
-来源是 `carrotNavi`（2Hz，`carrot_navi` 常驻发布，**offroad 也更新**）。mate 在帧间
-做差分，**payload 只包含发生变化的分组**，无变化不推：
+**2Hz 周期推送** `{car?, radar?}`，喂驾驶屏的连续值（车速/挡位/巡航/前车距离）。
+段与快照 `car`/`radar` 段**同源同函数**——一个拉（快照）一个推（frame），结构一致。
+last-wins 语义：允许丢帧（客户端直接以最新帧覆盖状态即可），offroad（数据源停止）
+自动停推。
 
 ```json
 {
-  "type": "navi",
+  "type": "frame",
   "data": {
-    "speedLimit": { "valid": true, "limitKph": 100 },
-    "sdi": { "present": true, "type": 0, "distanceM": 480, "limitKph": 80,
-             "secondary": { "type": 22, "distanceM": 930 } },
-    "signal": { "present": true, "visible": true, "distanceM": 120,
-                "green": { "on": true, "remainSec": 4 } },
-    "route": { "offRoute": false, "guidanceActive": true, "mode": "guiding",
-               "remainDistanceM": 12300, "remainTimeSec": 900 },
-    "guidance": { "mainText": "前方 500m 右转", "turnType": 3, "distanceM": 480, "roadName": "" }
+    "car":   { "vEgoKph": 54.0, "gearShifter": "drive", "...": "..." },
+    "radar": { "leadOne": { "status": true, "dRel": 32.5, "...": "..." } }
   }
 }
 ```
 
-| 分组 | 推送时机 | 字段 |
+段出现规则：仅包含有数据的段——`radarState` 从未见数据（offroad 启动初期）时
+`radar` 段不出现；两段都无更新（offroad）则整帧不推。
+
+#### `car` 段字段
+
+见 §5 `car` 段字段表（与快照完全一致，含 v3 新增的 `fuelGauge`/`charging`）。
+
+#### `radar` 段字段
+
+取自 `radarState`（radarld 发布，100Hz，frame 取最新值）：
+
+| 字段 | 类型 | 说明 |
 |---|---|---|
-| `speedLimit` | `roadLimitValid` 边沿，或 valid 下限速值变化 | `valid`；`limitKph`（仅 valid 时出现） |
-| `sdi` | `sdiPresent` 边沿（消失=`{"present":false}`）；出现期间跨越 **500m / 200m** 里程碑各推一次 | `present`、`type`、`distanceM`、`limitKph`（>0 才有）、`secondary`（第二个电子眼点，同构） |
-| `signal` | 任一灯 `on` 边沿；绿灯 `remainSec` **由大到小跨越 5** 推一次（倒计时逐秒递减不推） | `present`、`visible`、`distanceM`、红/绿/左转/右转/U转各自 `{on, remainSec}`（仅 valid 的灯出现） |
-| `route` | `offRoute` / `guidanceActive` 边沿（导航结束回落为全 false） | `offRoute`、`guidanceActive`、`mode`（`idle`/`guiding`/`off_route`）、`remainDistanceM`、`remainTimeSec` |
-| `guidance` | 转向指令文本或 `turnType` 变化；**消失不推**（下次出现重新推） | `mainText`、`turnType`、`distanceM`、`roadName` |
+| `leadOne` / `leadTwo` | Lead 对象 | 本车道前车一/二目标 |
+| `leadLeft` / `leadRight` | Lead 对象 | 左/右邻车道目标（Carrot 扩展跟踪） |
+| `leadsCenterCount` | int | 本车道中心跟踪目标数 |
+| `radarErrors` | string[] | 非空雷达错误名列表：`canError`/`radarFault`/`wrongConfig`/`radarUnavailableTemporary` |
 
-要点：
+Lead 对象（字段名与 carrotmate `Lead` 模型一致，`trackId` 即 cereal
+`radarTrackId`）：
 
-- **字段有效性**：APK 数据无效（`valid`/`present` 为假）时对应数值字段**不出现**
-  而非置 0；`type=0` 是有效测速值，`type=22` 为减速带（TMAP 类型码，随 APK 透传）
-- **首次连接不补发也不推存量**：初始化拿 `navi` 当前值走 `snapshot` / `GET /state`
-  的 `navi` 段；此后纯靠边沿
-- **里程碑只推一次**：同一电子眼（type+limit 身份）存续期内 500/200 各一次，
-  换点或消失即重置
-- 典型用法：`speedLimit` 变化→「限速变化提醒」；`sdi.present`+里程碑→「前方测速」；
-  `signal.green`+`remainSec≤5`→「绿灯快没了」；`route.offRoute=true`→「已偏航」；
-  `guidance`→「准备右转/出匝道」
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `status` | bool | 该目标是否有效 |
+| `dRel` | float | 纵向距离 m（前正后负） |
+| `yRel` | float | 横向偏移 m（左正右负） |
+| `vRel` | float | 相对速度 m/s（负=接近） |
+| `aRel` | float | 相对加速度 m/s² |
+| `vLead` | float | 前车绝对速度 m/s |
+| `dPath` | float | 沿规划路径的纵向距离 m（dPath 雷达管道） |
+| `fcw` | bool | 前碰撞预警标志 |
+| `trackId` | int | 雷达轨迹号（跨帧跟踪身份） |
+
+典型用法：`leadOne.dRel` → 前车距离条；`vRel<0` 持续 → 接近趋势；
+`leadLeft/leadRight.status` → 邻车道车可视化。
 
 ---
 
@@ -345,7 +386,7 @@ onroad 告警集合**发生变化时**推送（出现/消失去抖，不每帧�
   "ts": 1791472951.467,
   "data": {
     "car":      { "ts": 1791472951.400, "data": { "vEgoKph": 54.0, "...": "..." } },
-    "navi":     { "ts": 1791472951.410, "data": { "speedLimit": { "...": "..." }, "...": "..." } },
+    "radar":    { "ts": 1791472951.410, "data": { "leadOne": { "...": "..." }, "...": "..." } },
     "opstate":  { "ts": 1791472940.123, "data": { "state": "enabled", "...": "..." } },
     "events":   { "ts": 1791472947.925, "data": { "added": [...], "removed": [...], "active": [...] } },
     "sound":    { "ts": 1791472948.300, "data": { "sound": "stopStop", "...": "..." } },
@@ -358,25 +399,11 @@ onroad 告警集合**发生变化时**推送（出现/消失去抖，不每帧�
 
 - 每段自带 `ts`（Unix 墙钟秒，车机时钟错时自行对齐），客户端据此判断新鲜度
 - **未收到过的数据段不出现**（offroad 刚启动时 `car`/`opstate` 可能缺失；
-  `navi` 段只在收到过 carrotNavi 帧后出现，常驻发布所以通常都在）；
-  `button` 永远不在快照里（瞬时边沿）
+  `radar` 段只在收到过 radarState 帧后出现）；`button` 永远不在快照里（瞬时边沿）
 - `events` 段在告警清空后保留空 `active`（表示"确认无告警"，区别于未收到）
-- `meta` / `services` 每轮 poller 循环（≤100ms）刷新，`panda` 随 pandaStates（10Hz）刷新，
-  `navi` 随 carrotNavi（2Hz）刷新；
+- `meta` / `services` 每轮 poller 循环刷新，`panda` 随 pandaStates（10Hz）刷新，
+  `car`/`radar` 随各自数据源（onroad 100Hz 级）刷新；
   这些段是**服务/状态段**，只出现在 `/state` 与 WS `snapshot`，不进事件流广播
-
-### `navi` 段字段
-
-结构即 §4.5 五组的**当前全量值**（事件里只有变化组，快照里是全量），外加：
-
-| 分组 | 字段 | 说明 |
-|---|---|---|
-| `speedLimit` / `sdi` / `signal` / `route` / `guidance` | 同 §4.5 | 当前值（有效才出现） |
-| `lane` | `count` / `currentLane` / `distanceM` | 当前车道组（原车导航车道引导） |
-| `roadName` | string | 当前道路名（来自 vehicle 段） |
-
-> `navi` 段 offroad 也持续更新（`carrot_navi` always_run）；导航 APK 未连接时各分组
-> 不出现（而非全 0）。polyline 不进快照。
 
 ### 服务状态段（meta / services / panda）
 
@@ -385,7 +412,7 @@ onroad 告警集合**发生变化时**推送（出现/消失去抖，不每帧�
 1. **meta.ts 是不是在变旧** → 变旧超过 1–2s = poller 线程已死/卡死（HTTP 服务本身
    仍会正常应答，别信 200）。`frame` 是 SubMaster 循环计数，单调递增，可当心跳序号。
 2. **meta.onroad**（params `IsOnroad`）→ `false` 时 `card`/`selfdrived` 不运行，
-   `car`/`opstate`/`events`/`sound` 缺段属**常态**，不是故障。
+   `car`/`opstate`/`events`/`sound`/`radar` 缺段属**常态**，不是故障。
 3. **services**：每个订阅 topic 一条，字段如下：
 
 | 字段 | 类型 | 含义 |
@@ -414,6 +441,8 @@ onroad 告警集合**发生变化时**推送（出现/消失去抖，不每帧�
 
 ### `car` 段字段
 
+与 frame 的 `car` 段完全一致：
+
 | 字段 | 类型 | 单位 | 说明 |
 |---|---|---|---|
 | `vEgo` / `vEgoKph` | float | m/s, km/h | 最佳估计车速 |
@@ -439,6 +468,8 @@ onroad 告警集合**发生变化时**推送（出现/消失去抖，不每帧�
 | `accFaulted` / `espDisabled` | bool | | ACC 故障 / ESP 关闭 |
 | `canValid` / `canTimeout` | bool | | CAN 校验 / 掉线 |
 | `carrotCruise` | int | | carrot 巡航设定 |
+| `fuelGauge` | float | 0–1 | **v3 新增**：油量或电池电量比例（`carState.fuelGauge` 直传；BYD DM-i 上语义按 CAN population 为 SOC 或油位，实测为准） |
+| `charging` | bool | | **v3 新增**：充电中（`carState.charging` 直传） |
 
 > 快照在 card 停发（offroad）后保持最后一次 onroad 值，新鲜度看 `car.ts`。
 
@@ -467,16 +498,20 @@ sound 事件的配套音效。目录随语言设置切换（`sounds` / `sounds_c
 
 ## 7. 客户端开发建议
 
-- **初始化流程**：连 WS → 收 `hello` → 主动发 `{"type":"snapshot"}`（或 HTTP GET
-  `/state`）建立当前状态 → 之后纯靠事件维护增量。重连后重复此流程（补发的
-  `events`/`sound` 已覆盖告警与播报，但车速/档位/`navi` 当前值要另取快照）。
+- **初始化流程**：连 WS → 收 `hello`（看 `version`）→ 主动发 `{"type":"snapshot"}`
+  （或 HTTP GET `/state`）建立当前状态 → 之后靠事件维护增量、靠 `frame` 维护连续值。
+  重连后重复此流程（补发的 `events`/`sound` 已覆盖告警与播报，车速/前车距离等
+  连续值由 `frame` 在 ≤0.5s 内自然刷新）。
 - **向前兼容**：服务端可能新增 kind 或字段（看 `hello.version`）；客户端对未知
   `type` 与未知字段**一律忽略**，禁止因未知消息报错断连。
-- **重连**：指数退避；SSE 浏览器自带。
+- **frame 消费**：状态语义、last-wins——直接以最新帧覆盖 UI 状态，无需排队/去重；
+  断线重连期间的帧丢失无害（快照 + 下一帧即恢复）。
+- **重连**：指数退避；SSE 浏览器自带。收到 `error` 帧（鉴权失败）禁止盲目重试，
+  先引导用户检查 token。
 - **对时**：用每段 `ts`（车机墙钟），不要用客户端本地收包时间推算状态时序。
 - **枚举容错**：所有枚举为字符串，未来新增值可能显示为 `"unknown"`，客户端要兜底。
-- **流量**：事件为低频边沿（全订阅约 1–3 条/秒，峰值出现在按键/告警瞬间），
-  无需 topic 级节流；`/state` 一次约 3–6 KB（含 services/panda/meta 状态段）。
+- **流量**：边沿事件全订阅约 1–3 条/秒（峰值在按键/告警瞬间）+ frame 2 条/秒
+  （约 0.6 KB/s），无需 topic 级节流；`/state` 一次约 4–8 KB。
 - **不要公网暴露**：设计为局域网使用；远程访问走 VPN/内网穿透并务必设置 `MateToken`。
 
 ## 8. 部署
@@ -498,3 +533,17 @@ cd /data/openpilot && source launch_env.sh && python -m openpilot.mate
 `curl -N http://localhost:8083/stream` 能看到 `hello` 后的补发与边沿事件。
 卸载：删注册行重启 manager，删 `openpilot/mate/` 目录与
 `/data/params/d/MateToken` 即可，无其他残留。
+
+---
+
+## 9. v2 → v3 客户端迁移要点
+
+| 变化 | v2 | v3 | 客户端动作 |
+|---|---|---|---|
+| `navi` kind | 导航/交通边沿事件 + 快照 navi 段 | **移除** | 删除 navi 消费分支；导航数据（限速/SDI/信号灯/转向）改从客户端自持的上行流计算——其数据源本就是客户端推给 op 的 |
+| `frame` kind | ✘ | 2Hz `{car, radar}` 状态帧 | 新增 frame 分支；未升级客户端按 Unknown 忽略即可（无害） |
+| `hello.version` | 2 | 3 | 按版本探测能力，未知 type 一律忽略 |
+| subscribe 字段 | `kinds`（服务端只认它） | `kinds` | 若客户端误发 `topics` 字段，v2 下会回退全量、v3 语义相同（未知字段忽略）；统一改用 `kinds` |
+| WS 鉴权失败 | HTTP 401（握手失败，客户端只见连接错误） | 升级后 `error` 帧 → 关闭 | 增加 `error` 分支，按消息语义提示配对失败，禁止盲目重试 |
+| car 段 | — | 新增 `fuelGauge`/`charging` | 全可空模型自然容忍；需要时展示 |
+| 快照段 | 含 `navi` 段 | `navi` 段移除，新增 `radar` 段 | 初始化解析去 navi；前车距离初始化改读 `radar` 段 |

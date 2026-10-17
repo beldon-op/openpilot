@@ -1,28 +1,32 @@
 """
-mate 事件源：订阅 cereal 总线，推导五类边沿事件并交给广播器（server.py）。
+mate 事件源：订阅 cereal 总线，推导边沿事件与周期状态帧并交给广播器（server.py）。
 
   events  onroadEvents 集合变化   {"added", "removed", "active"}
   opstate selfdriveState 状态机跳转 {"state", "enabled", "active", "engageable"}
   button  方向盘按键边沿           {"button", "pressed"}
   sound   播报声音变化             {"sound", "file", "loop", "alertText1", "alertText2"}
-  navi    导航/交通信息边沿        {"speedLimit", "sdi", "signal", "route", "guidance"}
-          （carrotNavi 2Hz 帧间差分，payload 只含变化分组，限速/SDI/信号灯/偏航/转向）
+  frame   2Hz 周期状态帧           {"car"?, "radar"?}：驾驶屏连续值，段与快照同源；
+          窗口内 carState/radarState 均无更新（offroad）则不推
 
-参考实现是 cp_byd local_collector/collector.py；周期帧（frame）、topic 订阅过滤与
-admin API（日志/参数管理）都不在 mate 范围内。
+v3 起不再有 navi kind：其输入 carrotNavi 即 carrotmate（客户端）经 7706/7714 上行
+推送的导航数据，回推属回声——服务定位原则：mate 只推 op 独有数据，客户端自产的
+数据不回推。
 
-除边沿事件外，poller 还维护一份最新状态快照，供 server.py 的 GET /state 与
+除边沿事件与 frame 外，poller 还维护一份最新状态快照，供 server.py 的 GET /state 与
 WS snapshot 请求做客户端初始化，避免客户端为了拿“当前值”而重引入周期推流：
 
-  car       每帧 carState 刷新
-  navi      每帧 carrotNavi 刷新（carrot_navi always_run，offroad 也更新）
+  car/radar 每帧刷新（与 frame 的同名段共用同一构建函数）
   events/opstate/sound  随边沿更新
   meta      每轮心跳（frame 计数 + onroad 标志）——快照整体变旧 = poller 挂了
   services  每轮 SubMaster 健康度——topic seen=false = 数据源进程没跑（offroad 常态）
   panda     随 pandaStates 更新——pandad always_run，offroad 下唯一的活数据源
+
+参考实现是 cp_byd local_collector/collector.py；其 10Hz 周期帧不移植（frame 为
+2Hz 状态语义），admin API 也不在 mate 范围内。
 """
 import time
 from functools import cache
+from typing import Optional
 
 import openpilot.cereal.messaging as messaging
 from openpilot.cereal import car, log
@@ -36,7 +40,7 @@ from openpilot.selfdrive.ui.soundd import (
   sound_list,
 )
 
-SERVICES = ["carState", "selfdriveState", "onroadEvents", "carrotMan", "carrotNavi", "pandaStates"]
+SERVICES = ["carState", "selfdriveState", "onroadEvents", "carrotMan", "radarState", "pandaStates"]
 
 EVENT_FLAGS = ("enable", "noEntry", "warning", "userDisable", "softDisable",
                "immediateDisable", "preEnable", "permanent",
@@ -45,10 +49,9 @@ EVENT_FLAGS = ("enable", "noEntry", "warning", "userDisable", "softDisable",
 NONE_ALERT = int(AudibleAlert.none)
 MS_TO_KPH = 3.6
 
-# navi（carrotNavi 2Hz）边沿差分参数：SDI 出现期间临近里程碑、绿灯剩余跨过该秒数
-SDI_MILESTONES_M = (500, 200)
-GREEN_REMAIN_ALERT_S = 5
-SIGNAL_LIGHTS = ("red", "green", "left", "right", "uturn")
+# frame 周期状态帧：驾驶屏连续值刷新率；窗口内无新数据即整帧跳过（offroad 自然停推）
+FRAME_HZ = 2
+FRAME_PERIOD_S = 1.0 / FRAME_HZ
 
 
 @cache
@@ -98,7 +101,8 @@ def button_payloads(cs) -> list[dict]:
 
 
 def car_snapshot(cs) -> dict:
-  """GET /state 的 car 段：当前车辆状态快照（非周期推流），字段对照本仓 car.capnp。"""
+  """GET /state 的 car 段：当前车辆状态快照（非周期推流），字段对照本仓 car.capnp。
+  与 frame 的 car 段同源同函数（一个拉一个推）。"""
   cruise = cs.cruiseState
   return {
     "vEgo": round(cs.vEgo, 3),
@@ -141,154 +145,74 @@ def car_snapshot(cs) -> dict:
     "canValid": cs.canValid,
     "canTimeout": cs.canTimeout,
     "carrotCruise": cs.carrotCruise,
+    "fuelGauge": round(cs.fuelGauge, 3),
+    "charging": cs.charging,
   }
 
 
-# ---------------- navi：carrotNavi 导航/交通信息 ----------------
+def radar_snapshot(rs) -> dict:
+  """radarState → radar 快照段 / frame radar 段（JSON-able）。字段名与 carrotmate
+  Lead 模型一致（其 trackId 对应 cereal radarTrackId）；radarErrors 为非空错误名列表
+  （Car.RadarData.Error 是四个 Bool 的 struct）。"""
+  def lead(l) -> dict:
+    return {
+      "status": bool(l.status),
+      "dRel": round(l.dRel, 2),
+      "yRel": round(l.yRel, 2),
+      "vRel": round(l.vRel, 2),
+      "aRel": round(l.aRel, 2),
+      "vLead": round(l.vLead, 2),
+      "dPath": round(l.dPath, 2),
+      "fcw": bool(l.fcw),
+      "trackId": int(l.radarTrackId),
+    }
 
-def navi_state(navi) -> dict:
-  """carrotNavi → navi 快照段当前值（JSON-able）。分组仅在对应子结构 meta.present
-  为真时出现；无效字段（valid/present 为假）不出现或只留标志位；polyline 不进快照。"""
+  err = rs.radarErrors
+  return {
+    "leadOne": lead(rs.leadOne),
+    "leadTwo": lead(rs.leadTwo),
+    "leadLeft": lead(rs.leadLeft),
+    "leadRight": lead(rs.leadRight),
+    "leadsCenterCount": len(rs.leadsCenter),
+    "radarErrors": [name for name, on in (
+      ("canError", err.canError), ("radarFault", err.radarFault),
+      ("wrongConfig", err.wrongConfig),
+      ("radarUnavailableTemporary", err.radarUnavailableTemporary)) if on],
+  }
+
+
+# ---------------- frame：周期状态帧 ----------------
+
+def frame_payload(car: dict | None, radar: dict | None) -> dict | None:
+  """frame 帧组装（纯函数）：仅出现有数据的段；两段全空（窗口无更新）返回 None。"""
+  if car is None and radar is None:
+    return None
   out: dict = {}
-  sp = navi.speed
-  if sp.meta.present:
-    out["speedLimit"] = ({"valid": True, "limitKph": int(sp.roadLimitKph)} if sp.roadLimitValid
-                         else {"valid": False})
-    sdi: dict = {"present": bool(sp.sdiPresent)}
-    if sp.sdiPresent:
-      sdi.update({"type": int(sp.sdiType), "distanceM": int(sp.sdiDistanceM)})
-      if sp.sdiSpeedLimitKph > 0:
-        sdi["limitKph"] = int(sp.sdiSpeedLimitKph)
-      if sp.secondarySdiPresent:
-        secondary: dict = {"type": int(sp.secondarySdiType), "distanceM": int(sp.secondarySdiDistanceM)}
-        if sp.secondarySdiSpeedLimitKph > 0:
-          secondary["limitKph"] = int(sp.secondarySdiSpeedLimitKph)
-        sdi["secondary"] = secondary
-    out["sdi"] = sdi
-  ts = navi.trafficSignal
-  if ts.meta.present:
-    signal: dict = {"present": True, "visible": bool(ts.visible)}
-    if ts.visible:
-      signal["distanceM"] = int(ts.distanceM)
-    for key, valid, on, remain in (
-        ("red", ts.redValid, ts.redOn, ts.redRemainSec),
-        ("green", ts.greenValid, ts.greenOn, ts.greenRemainSec),
-        ("left", ts.leftValid, ts.leftOn, ts.leftRemainSec),
-        ("right", ts.rightValid, ts.rightOn, ts.rightRemainSec),
-        ("uturn", ts.uturnValid, ts.uturnOn, ts.uturnRemainSec)):
-      if valid:
-        signal[key] = {"on": bool(on), "remainSec": int(remain)}
-    out["signal"] = signal
-  ns = navi.navigationStatus
-  if ns.meta.present:
-    route: dict = {"offRoute": bool(ns.offRoute), "guidanceActive": bool(ns.guidanceActive),
-                   "mode": str(ns.mode)}
-    if navi.route.meta.present:
-      route["remainDistanceM"] = int(navi.route.remainingDistanceM)
-      route["remainTimeSec"] = int(navi.route.remainingTimeSec)
-    out["route"] = route
-  gc = navi.guidanceCurrent
-  if gc.meta.present:
-    out["guidance"] = {"mainText": str(gc.mainText), "turnType": int(gc.turnType),
-                       "distanceM": int(gc.distanceM), "roadName": str(gc.roadName)}
-  lc = navi.laneCurrent
-  if lc.meta.present:
-    out["lane"] = {"count": int(lc.count), "currentLane": int(lc.currentLane),
-                   "distanceM": int(lc.distanceM)}
-  veh = navi.vehicle
-  if veh.meta.present:
-    out["roadName"] = str(veh.roadName)
+  if car is not None:
+    out["car"] = car
+  if radar is not None:
+    out["radar"] = radar
   return out
 
 
-def _cmp_speed_limit(g: dict):
-  return (g.get("valid"), g.get("limitKph"))
+class FrameTicker:
+  """frame 周期调度（纯逻辑，时钟注入便于测试）：到点检查窗口内是否有段更新，
+  有则出帧并清空窗口（next tick 重新积累），无更新返回 None——offroad 数据源
+  停止后自然停推。节拍落后（轮询阻塞）时按 period 推进而非追赶积压。"""
 
+  def __init__(self, period_s: float, now: float) -> None:
+    self.period_s = period_s
+    self.next_t = now + period_s
+    self.car: Optional[dict] = None
+    self.radar: Optional[dict] = None
 
-def _cmp_sdi(g: dict):
-  sec = g.get("secondary") or {}
-  return (g.get("present"), g.get("type"), g.get("limitKph"),
-          bool(sec), sec.get("type"), sec.get("limitKph"))
-
-
-def _cmp_signal(g: dict):
-  # 只比 present/visible/各灯 on 边沿；remainSec 每秒递减、distanceM 连续变化，不参与比较
-  return (g.get("present"), g.get("visible"),
-          *(g.get(k, {}).get("on") for k in SIGNAL_LIGHTS))
-
-
-def _cmp_route(g: dict):
-  return (g.get("offRoute"), g.get("guidanceActive"))
-
-
-def _cmp_guidance(g: dict):
-  return (g.get("turnType"), g.get("mainText"))
-
-
-NAVI_COMPARE = {
-  "speedLimit": _cmp_speed_limit,
-  "sdi": _cmp_sdi,
-  "signal": _cmp_signal,
-  "route": _cmp_route,
-  "guidance": _cmp_guidance,
-}
-
-# 分组消失（meta.present 为假）时的等价形态；guidance 消失仅重置，不推空值
-NAVI_GROUP_DEFAULTS = {
-  "speedLimit": {"valid": False},
-  "sdi": {"present": False},
-  "signal": {"present": False},
-  "route": {"offRoute": False, "guidanceActive": False},
-}
-
-
-def diff_navi(prev: dict | None, cur: dict) -> tuple[dict, dict | None]:
-  """navi 分组边沿差分（纯函数）。prev 为上轮返回的 state（首轮 None），cur 为
-  navi_state() 输出。返回 (新 state, payload)：payload 只含发生变化的分组，无变化
-  为 None；首轮只建状态不推送（客户端初始化走 /state 快照）。"""
-  first = prev is None
-  state: dict = {"sent": {}, "milestones": [], "sdiKey": None,
-                 "greenOn": False, "greenRemain": None, "greenFired": False}
-  payload: dict = {}
-
-  for group, compare in NAVI_COMPARE.items():
-    g = cur.get(group)
-    if g is None:
-      g = NAVI_GROUP_DEFAULTS.get(group)
-      if g is None:  # guidance 消失：仅重置，下次出现重新当边沿推
-        state["sent"][group] = None
-        continue
-    form = compare(g)
-    state["sent"][group] = form
-    if not first and prev["sent"].get(group) != form:
-      payload[group] = g
-
-  # SDI 临近里程碑：同一 SDI（present/type/limit 身份）存续期内 500/200m 各推一次
-  sdi = cur.get("sdi") or NAVI_GROUP_DEFAULTS["sdi"]
-  state["sdiKey"] = (sdi.get("present"), sdi.get("type"), sdi.get("limitKph"))
-  if sdi.get("present"):
-    state["milestones"] = [] if first or state["sdiKey"] != prev.get("sdiKey") \
-      else list(prev.get("milestones", []))
-    for m in SDI_MILESTONES_M:
-      if m not in state["milestones"] and sdi.get("distanceM", 1 << 30) < m:
-        state["milestones"].append(m)
-        if not first:
-          payload.setdefault("sdi", sdi)
-
-  # 绿灯剩余跨越 GREEN_REMAIN_ALERT_S（由大到小）推一次；灯灭即重置
-  green = (cur.get("signal") or {}).get("green") or {}
-  state["greenOn"] = bool(green.get("on"))
-  state["greenRemain"] = green.get("remainSec") if state["greenOn"] else None
-  if state["greenOn"] and not first and prev.get("greenOn"):
-    fired = prev.get("greenFired", False)
-    prev_remain = prev.get("greenRemain")
-    if not fired and prev_remain is not None and \
-        prev_remain > GREEN_REMAIN_ALERT_S >= state["greenRemain"]:
-      fired = True
-      payload.setdefault("signal", cur["signal"])
-    state["greenFired"] = fired
-
-  return state, (payload or None)
+  def tick(self, now: float) -> Optional[dict]:
+    if now < self.next_t:
+      return None
+    self.next_t = max(self.next_t + self.period_s, now + self.period_s)
+    payload = frame_payload(self.car, self.radar)
+    self.car = self.radar = None
+    return payload
 
 
 def services_status(sm) -> dict:
@@ -398,20 +322,21 @@ class SoundTracker:
 class MatePoller:
   def __init__(self, emit, set_state=None):
     self.emit = emit  # emit(kind: str, data: dict)，server.Hub 提供，线程安全
-    self.set_state = set_state  # set_state(kind, data)，维护 /state 快照（car 段），可选
+    self.set_state = set_state  # set_state(kind, data)，维护 /state 快照，可选
 
   def run(self):
     sm = messaging.SubMaster(SERVICES)
     params = Params()
     events_map: dict[str, dict] = {}
     last_opstate: dict | None = None
-    navi: dict | None = None  # diff_navi 状态（首轮 None）
     tracker = SoundTracker()
     cruise_main_toggle = CruiseMainOpenpilotToggle(ButtonType.mainCruise)
+    ticker = FrameTicker(FRAME_PERIOD_S, time.monotonic())
 
     cloudlog.info("mate poller started")
     while True:
       sm.update(100)  # 与参考 collector 一致：有消息即返回，空闲最多 100ms 一轮
+      now = time.monotonic()
 
       # 每轮心跳 + 总线健康度：/state 的 data 为空时，客户端靠这两段自查——
       # meta ts 变旧=poller 线程挂了；services 全 seen=false=offroad 没数据源。
@@ -432,22 +357,27 @@ class MatePoller:
           last_opstate = payload
           self.emit("opstate", payload)
 
-      # navi：diff_navi 返回的 payload 是「变化分组」而非全量值，所以快照不能走
-      # emit→set_state（那会拿 payload 覆盖状态段），由这里显式喂全量 cur。
-      if sm.updated["carrotNavi"]:
-        cur = navi_state(sm["carrotNavi"])
-        navi, payload = diff_navi(navi, cur)
-        if payload:
-          self.emit("navi", payload)
-        if self.set_state is not None:
-          self.set_state("navi", cur)
-
+      # car/radar：快照段与 frame 窗口同源同帧——快照取全量，frame 只取窗口内更新。
+      # radarState 100Hz，onroad 下 poller 每轮（~10ms）都 updated，随轮刷新即可
+      # （快照写入与 frame 窗口赋值都是 O(1)，与既有 meta/services 每轮刷新同模式）。
       if sm.updated["carState"]:
         cs = sm["carState"]
+        car = car_snapshot(cs)
         if self.set_state is not None:
-          self.set_state("car", car_snapshot(cs))
+          self.set_state("car", car)
+        ticker.car = car
         for payload in button_payloads(cs):
           self.emit("button", payload)
+
+      if sm.updated["radarState"]:
+        radar = radar_snapshot(sm["radarState"])
+        if self.set_state is not None:
+          self.set_state("radar", radar)
+        ticker.radar = radar
+
+      payload = ticker.tick(now)
+      if payload:
+        self.emit("frame", payload)
 
       # 声音：与 soundd 主循环一致——每轮先过 main toggle 短路，再做推导。
       # update() 必须在拿到新 carState 后立刻调用，长按计时依赖逐帧喂同一批事件。

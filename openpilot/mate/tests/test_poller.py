@@ -4,14 +4,18 @@ import time
 from openpilot.cereal import car, custom, log
 from openpilot.mate.poller import (
   EVENT_FLAGS,
+  FRAME_PERIOD_S,
+  FrameTicker,
   SoundTracker,
   button_payloads,
   car_snapshot,
   diff_events,
   enum_name,
   event_to_dict,
+  frame_payload,
   opstate_payload,
   panda_payload,
+  radar_snapshot,
   services_status,
   sound_payload,
 )
@@ -117,6 +121,7 @@ class TestCarSnapshot:
                    "standstill": False, "nonAdaptive": False},
       vCruise=12.5, doorOpen=True, latEnabled=True, carrotCruise=2,
       leftBlindspot=True, rightBlindspot=False,
+      fuelGauge=0.42, charging=True,
     )
     snap = car_snapshot(cs)
     assert snap["vEgo"] == 10.0 and snap["vEgoKph"] == 36.0
@@ -126,6 +131,7 @@ class TestCarSnapshot:
     assert snap["latEnabled"] is True
     assert snap["carrotCruise"] == 2
     assert snap["leftBlindspot"] is True and snap["rightBlindspot"] is False  # 盲区直通
+    assert snap["fuelGauge"] == 0.42 and snap["charging"] is True  # 车辆健康（v3 新增）
     assert json.dumps(snap)  # 必须始终可序列化
 
   def test_car_snapshot_defaults_readable(self):
@@ -224,3 +230,69 @@ class TestSoundTracker:
     # 未收录进 sound_list 的值：file/loop 兜底，与 soundd 的 loaded_sounds 检查对应
     p = sound_payload(99999, selfdrive_state())
     assert p["sound"] == "unknown" and p["file"] is None and p["loop"] is False
+
+
+class TestRadarSnapshot:
+  def test_lead_field_mapping(self):
+    # 字段名与 carrotmate Lead 模型一致：trackId ← cereal radarTrackId
+    rs = log.RadarState.new_message(
+      leadsCenter=[{}, {}],
+      radarErrors={"canError": True, "radarFault": True},
+      leadOne={"status": True, "dRel": 30.567, "yRel": -1.2, "vRel": -5.0, "aRel": -1.0,
+               "vLead": 25.0, "dPath": 0.5, "fcw": True, "radarTrackId": 42},
+    )
+    snap = radar_snapshot(rs)
+    assert snap["leadOne"] == {
+      "status": True, "dRel": 30.57, "yRel": -1.2, "vRel": -5.0, "aRel": -1.0,
+      "vLead": 25.0, "dPath": 0.5, "fcw": True, "trackId": 42,
+    }
+    assert snap["leadsCenterCount"] == 2
+    assert snap["radarErrors"] == ["canError", "radarFault"]  # 固定顺序，非空才出现
+    assert snap["leadTwo"]["status"] is False  # 无目标也是合法段
+    json.dumps(snap)
+
+  def test_defaults_readable(self):
+    # 全默认（从未 update 过的 RadarState，offroad 首帧）不能抛
+    snap = radar_snapshot(log.RadarState.new_message())
+    assert snap["leadOne"]["status"] is False and snap["leadOne"]["trackId"] == -1
+    assert snap["leadsCenterCount"] == 0 and snap["radarErrors"] == []
+
+
+class TestFramePayload:
+  def test_segments(self):
+    car = {"vEgo": 10.0}
+    radar = {"leadOne": {"status": True}}
+    assert frame_payload(car, radar) == {"car": car, "radar": radar}
+    assert frame_payload(car, None) == {"car": car}          # 单段出现
+    assert frame_payload(None, radar) == {"radar": radar}
+    assert frame_payload(None, None) is None                 # 窗口全空不出帧
+
+
+class TestFrameTicker:
+  def test_window_accumulates_and_emits_once(self):
+    t = FrameTicker(FRAME_PERIOD_S, now=100.0)
+    assert t.tick(100.4) is None              # 未到点，持续积累窗口
+    t.car = {"vEgo": 10.0}
+    t.radar = {"leadOne": {"status": True}}
+    p = t.tick(100.5)                          # 到点出帧
+    assert p == {"car": {"vEgo": 10.0}, "radar": {"leadOne": {"status": True}}}
+    assert t.tick(100.6) is None               # 出帧后窗口清空，下个节拍重新积累
+
+  def test_no_update_skips_frame(self):
+    # offroad（数据源停止）：到点但窗口无更新 → 不出帧，自然停推
+    t = FrameTicker(FRAME_PERIOD_S, now=100.0)
+    assert t.tick(100.5) is None
+    assert t.tick(101.0) is None               # 下个节拍仍无更新
+
+  def test_single_segment_only(self):
+    t = FrameTicker(FRAME_PERIOD_S, now=100.0)
+    t.radar = {"leadOne": {"status": False}}
+    assert t.tick(100.5) == {"radar": {"leadOne": {"status": False}}}
+
+  def test_lag_catches_up_without_burst(self):
+    # 轮询阻塞落后多个周期：追一个节拍（不积压连发），窗口照常清空
+    t = FrameTicker(FRAME_PERIOD_S, now=100.0)
+    t.car = {"vEgo": 1.0}
+    assert t.tick(103.0) == {"car": {"vEgo": 1.0}}
+    assert t.next_t == 103.5                   # now + period，而非连追三个周期
+    assert t.car is None and t.radar is None

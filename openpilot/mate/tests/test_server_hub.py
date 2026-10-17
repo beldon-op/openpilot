@@ -1,7 +1,11 @@
 import asyncio
 import json
 
-from openpilot.mate.server import ALL_KINDS, PROTOCOL_VERSION, Hub
+from aiohttp import WSMsgType, web
+from aiohttp.test_utils import TestClient, TestServer
+
+from openpilot.mate import server
+from openpilot.mate.server import ALL_KINDS, PROTOCOL_VERSION, SLOW_CLIENT_QUEUE, Hub, ws_handler
 
 
 class TestHubSnapshot:
@@ -21,30 +25,51 @@ class TestHubSnapshot:
     assert snap["data"]["opstate"]["data"]["state"] == "enabled"
     assert "button" not in snap["data"]  # 边沿瞬时事件不进快照
 
-  def test_navi_not_state_kind_and_version_bumped(self):
-    # navi 的 emit 数据是变化分组，不能当全量值写快照（poller 显式喂全量 cur）
+  def test_frame_kind_and_v3_whitelist(self):
+    # v3：navi 移除（回声——输入即客户端上行数据）；frame 为周期状态帧，
+    # kind 本身不进快照也不补发（car/radar 段由 poller 显式喂快照）
     hub = Hub()
-    hub.emit("navi", {"speedLimit": {"valid": True, "limitKph": 80}})
-    assert "navi" not in hub.state_snapshot()["data"]
-    assert "navi" in ALL_KINDS  # 默认订阅集与 subscribe 白名单
-    assert PROTOCOL_VERSION == 2  # hello.version，客户端据此探测 navi 能力
+    hub.emit("frame", {"car": {"vEgo": 10.0}, "radar": {"leadOne": {"status": False}}})
+    snap = hub.state_snapshot()
+    assert "frame" not in snap["data"]
+    assert hub.replay_snapshot() == []
+    assert "navi" not in ALL_KINDS and "frame" in ALL_KINDS
+    assert PROTOCOL_VERSION == 3
 
-  def test_navi_reaches_only_subscribed_clients(self):
+  def test_frame_reaches_only_subscribed_clients(self):
     hub = Hub()
     loop = asyncio.new_event_loop()
     hub.loop = loop
     try:
       q_all = hub.add_client(ALL_KINDS)
-      q_navi = hub.add_client(("navi",))
-      hub.emit("navi", {"speedLimit": {"valid": True, "limitKph": 100}})
+      q_other = hub.add_client(("events",))  # 未订 frame 的客户端收不到 frame
+      hub.emit("frame", {"car": {"vEgo": 1.0}})
       hub.emit("events", {"added": [], "removed": [], "active": []})
       for _ in range(2):
         loop.run_until_complete(asyncio.sleep(0))
-      # navi 订阅者只收到 navi；全订阅者收到 navi + events
-      assert q_navi.get_nowait()[0] == "navi"
-      assert q_navi.empty()
+      assert q_other.get_nowait()[0] == "events"  # 只收到其订阅的 events
+      assert q_other.empty()
       kinds = [q_all.get_nowait()[0] for _ in range(2)]
-      assert kinds == ["navi", "events"]
+      assert kinds == ["frame", "events"]
+    finally:
+      loop.close()
+
+  def test_slow_client_drops_oldest_last_wins(self):
+    # frame 是状态语义：队列满丢最旧 ≈ last-wins，最新状态总能进队
+    hub = Hub()
+    loop = asyncio.new_event_loop()
+    hub.loop = loop
+    try:
+      q = hub.add_client(ALL_KINDS)
+      for i in range(SLOW_CLIENT_QUEUE):
+        # 手动塞满队列（信封格式与 emit 输出一致）
+        q.put_nowait(("frame", json.dumps({"type": "frame", "data": {"seq": i}})))
+      hub.emit("frame", {"seq": SLOW_CLIENT_QUEUE})
+      for _ in range(2):
+        loop.run_until_complete(asyncio.sleep(0))
+      assert q.qsize() == SLOW_CLIENT_QUEUE  # 不增长（不积压）
+      seqs = [json.loads(q.get_nowait()[1])["data"]["seq"] for _ in range(SLOW_CLIENT_QUEUE)]
+      assert seqs[0] == 1 and seqs[-1] == SLOW_CLIENT_QUEUE  # 最旧 seq=0 被丢
     finally:
       loop.close()
 
@@ -78,7 +103,35 @@ class TestHubServiceState:
     hub = Hub()
     hub.set_state("services", {"carState": {"seen": False}})
     hub.set_state("panda", {"count": 0, "pandas": []})
+    hub.set_state("radar", {"leadOne": {"status": False}})  # poller 显式喂的新段
     assert hub.replay_snapshot() == []  # 状态段只进 /state，不广播不补发
     snap = hub.state_snapshot()
     assert snap["data"]["services"]["data"]["carState"] == {"seen": False}
     assert snap["data"]["panda"]["data"] == {"count": 0, "pandas": []}
+    assert snap["data"]["radar"]["data"]["leadOne"]["status"] is False
+
+
+class TestWsAuth:
+  def test_auth_failure_sends_error_frame_then_closes(self, monkeypatch):
+    # v3：WS 鉴权失败不再抛 HTTP 401，而是完成升级 → error 帧 → 关闭
+    # （carrotmate 的 AuthFailed 分支按消息语义处理）
+    monkeypatch.setattr(server, "read_token", lambda: "secret")
+
+    async def run():
+      app = web.Application()
+      app.add_routes([web.get("/ws", ws_handler)])
+      client = TestClient(TestServer(app))
+      await client.start_server()
+      try:
+        ws = await client.ws_connect("/ws?token=wrong")
+        msg = json.loads((await ws.receive()).data)
+        assert msg == {"type": "error", "data": {"msg": "invalid token"}}
+        assert (await ws.receive()).type == WSMsgType.CLOSE
+      finally:
+        await client.close()
+
+    loop = asyncio.new_event_loop()
+    try:
+      loop.run_until_complete(run())
+    finally:
+      loop.close()
