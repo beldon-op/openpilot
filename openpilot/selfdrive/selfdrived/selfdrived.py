@@ -21,6 +21,11 @@ from openpilot.selfdrive.locationd.helpers import PoseCalibrator, Pose
 from openpilot.selfdrive.selfdrived.camera_config import get_camera_packets
 from openpilot.selfdrive.selfdrived.events import Events, ET, EmptyAlert
 from openpilot.selfdrive.selfdrived.helpers import ExcessiveActuationCheck
+from openpilot.selfdrive.selfdrived.proximity_alert import (
+  LeadHardBrakeTracker,
+  LeadStartTracker,
+  LeadTtcCloseTracker,
+)
 from openpilot.selfdrive.controls.lib.assist_less_lane_change import get_assist_less_lane_change
 from openpilot.selfdrive.selfdrived.state import StateMachine
 from openpilot.selfdrive.selfdrived.impact_detector import ImpactDetector
@@ -165,6 +170,9 @@ class SelfdriveD:
     self.dm_lockout_set = self.params.get_bool("DriverTooDistracted")
     self.cutin_audio_tracker = CutinAlertTracker()
     self.radar_only_warning = RadarOnlyWarning(front_radar_distance_delay_s(self.CP))
+    self.lead_hard_brake_tracker = LeadHardBrakeTracker()
+    self.lead_ttc_close_tracker = LeadTtcCloseTracker()
+    self.lead_start_tracker = LeadStartTracker()
     self.car_state_time_s = 0.0
     self.dm_uncertain_alerted = False
     self.dm_disabled_prev = False
@@ -283,6 +291,20 @@ class SelfdriveD:
       self.enabled and self.CP.openpilotLongitudinalControl,
     ):
       self.events.add(EventName.radarStationaryLead)
+
+    # 接近性提醒（纯提醒，不依赖 enabled；radarState invalid 时不计算，不改控制状态）
+    if self.sm.valid['radarState']:
+      lead_one = self.sm['radarState'].leadOne
+      lead_now = self.car_state_time_s if REPLAY else time.monotonic()
+      if self.lead_hard_brake_tracker.update(bool(lead_one.status), float(lead_one.dRel),
+                                             float(lead_one.aRel), CS.vEgo, lead_now):
+        self.events.add(EventName.leadHardBrake)
+      if self.lead_ttc_close_tracker.update(bool(lead_one.status), float(lead_one.dRel),
+                                            float(lead_one.vRel), CS.vEgo, lead_now):
+        self.events.add(EventName.leadTtcClose)
+      if self.lead_start_tracker.update(bool(lead_one.status), float(lead_one.dRel),
+                                        float(lead_one.vRel), CS.standstill, lead_now):
+        self.events.add(EventName.leadStart)
 
     # Block resume if cruise never previously enabled
     resume_pressed = any(be.type in (ButtonType.accelCruise, ButtonType.resumeCruise) for be in CS.buttonEvents)

@@ -1151,6 +1151,24 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
   EventName.radarCutin: {
      ET.WARNING: EngagementAlert(AudibleAlert.radarCutin),
   },
+  EventName.leadHardBrake: {
+    ET.WARNING: Alert(
+      "前车急刹", "注意减速",
+      AlertStatus.normal, AlertSize.mid,
+      Priority.HIGH, VisualAlert.none, AudibleAlert.warningSoft, 2.),
+  },
+  EventName.leadTtcClose: {
+    ET.WARNING: Alert(
+      "跟车过近", "请保持车距",
+      AlertStatus.normal, AlertSize.mid,
+      Priority.MID, VisualAlert.none, AudibleAlert.prompt, 2.),
+  },
+  EventName.leadStart: {
+    ET.WARNING: Alert(
+      "前车已起步", "",
+      AlertStatus.normal, AlertSize.small,
+      Priority.LOW, VisualAlert.none, AudibleAlert.prompt, 1.5),
+  },
   EventName.radarStationaryLead: {
     ET.WARNING: Alert(
       "전방 물체 주의", "전방을 확인하고 감속을 준비하세요",

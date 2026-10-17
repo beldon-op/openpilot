@@ -1,10 +1,12 @@
 """
-mate 事件源：订阅 cereal 总线，推导四类边沿事件并交给广播器（server.py）。
+mate 事件源：订阅 cereal 总线，推导五类边沿事件并交给广播器（server.py）。
 
   events  onroadEvents 集合变化   {"added", "removed", "active"}
   opstate selfdriveState 状态机跳转 {"state", "enabled", "active", "engageable"}
   button  方向盘按键边沿           {"button", "pressed"}
   sound   播报声音变化             {"sound", "file", "loop", "alertText1", "alertText2"}
+  navi    导航/交通信息边沿        {"speedLimit", "sdi", "signal", "route", "guidance"}
+          （carrotNavi 2Hz 帧间差分，payload 只含变化分组，限速/SDI/信号灯/偏航/转向）
 
 参考实现是 cp_byd local_collector/collector.py；周期帧（frame）、topic 订阅过滤与
 admin API（日志/参数管理）都不在 mate 范围内。
@@ -13,6 +15,7 @@ admin API（日志/参数管理）都不在 mate 范围内。
 WS snapshot 请求做客户端初始化，避免客户端为了拿“当前值”而重引入周期推流：
 
   car       每帧 carState 刷新
+  navi      每帧 carrotNavi 刷新（carrot_navi always_run，offroad 也更新）
   events/opstate/sound  随边沿更新
   meta      每轮心跳（frame 计数 + onroad 标志）——快照整体变旧 = poller 挂了
   services  每轮 SubMaster 健康度——topic seen=false = 数据源进程没跑（offroad 常态）
@@ -33,7 +36,7 @@ from openpilot.selfdrive.ui.soundd import (
   sound_list,
 )
 
-SERVICES = ["carState", "selfdriveState", "onroadEvents", "carrotMan", "pandaStates"]
+SERVICES = ["carState", "selfdriveState", "onroadEvents", "carrotMan", "carrotNavi", "pandaStates"]
 
 EVENT_FLAGS = ("enable", "noEntry", "warning", "userDisable", "softDisable",
                "immediateDisable", "preEnable", "permanent",
@@ -41,6 +44,11 @@ EVENT_FLAGS = ("enable", "noEntry", "warning", "userDisable", "softDisable",
 
 NONE_ALERT = int(AudibleAlert.none)
 MS_TO_KPH = 3.6
+
+# navi（carrotNavi 2Hz）边沿差分参数：SDI 出现期间临近里程碑、绿灯剩余跨过该秒数
+SDI_MILESTONES_M = (500, 200)
+GREEN_REMAIN_ALERT_S = 5
+SIGNAL_LIGHTS = ("red", "green", "left", "right", "uturn")
 
 
 @cache
@@ -118,6 +126,8 @@ def car_snapshot(cs) -> dict:
     "vCruiseKph": round(cs.vCruise * MS_TO_KPH, 1),
     "leftBlinker": cs.leftBlinker,
     "rightBlinker": cs.rightBlinker,
+    "leftBlindspot": cs.leftBlindspot,
+    "rightBlindspot": cs.rightBlindspot,
     "doorOpen": cs.doorOpen,
     "seatbeltUnlatched": cs.seatbeltUnlatched,
     "parkingBrake": cs.parkingBrake,
@@ -132,6 +142,153 @@ def car_snapshot(cs) -> dict:
     "canTimeout": cs.canTimeout,
     "carrotCruise": cs.carrotCruise,
   }
+
+
+# ---------------- navi：carrotNavi 导航/交通信息 ----------------
+
+def navi_state(navi) -> dict:
+  """carrotNavi → navi 快照段当前值（JSON-able）。分组仅在对应子结构 meta.present
+  为真时出现；无效字段（valid/present 为假）不出现或只留标志位；polyline 不进快照。"""
+  out: dict = {}
+  sp = navi.speed
+  if sp.meta.present:
+    out["speedLimit"] = ({"valid": True, "limitKph": int(sp.roadLimitKph)} if sp.roadLimitValid
+                         else {"valid": False})
+    sdi: dict = {"present": bool(sp.sdiPresent)}
+    if sp.sdiPresent:
+      sdi.update({"type": int(sp.sdiType), "distanceM": int(sp.sdiDistanceM)})
+      if sp.sdiSpeedLimitKph > 0:
+        sdi["limitKph"] = int(sp.sdiSpeedLimitKph)
+      if sp.secondarySdiPresent:
+        secondary: dict = {"type": int(sp.secondarySdiType), "distanceM": int(sp.secondarySdiDistanceM)}
+        if sp.secondarySdiSpeedLimitKph > 0:
+          secondary["limitKph"] = int(sp.secondarySdiSpeedLimitKph)
+        sdi["secondary"] = secondary
+    out["sdi"] = sdi
+  ts = navi.trafficSignal
+  if ts.meta.present:
+    signal: dict = {"present": True, "visible": bool(ts.visible)}
+    if ts.visible:
+      signal["distanceM"] = int(ts.distanceM)
+    for key, valid, on, remain in (
+        ("red", ts.redValid, ts.redOn, ts.redRemainSec),
+        ("green", ts.greenValid, ts.greenOn, ts.greenRemainSec),
+        ("left", ts.leftValid, ts.leftOn, ts.leftRemainSec),
+        ("right", ts.rightValid, ts.rightOn, ts.rightRemainSec),
+        ("uturn", ts.uturnValid, ts.uturnOn, ts.uturnRemainSec)):
+      if valid:
+        signal[key] = {"on": bool(on), "remainSec": int(remain)}
+    out["signal"] = signal
+  ns = navi.navigationStatus
+  if ns.meta.present:
+    route: dict = {"offRoute": bool(ns.offRoute), "guidanceActive": bool(ns.guidanceActive),
+                   "mode": str(ns.mode)}
+    if navi.route.meta.present:
+      route["remainDistanceM"] = int(navi.route.remainingDistanceM)
+      route["remainTimeSec"] = int(navi.route.remainingTimeSec)
+    out["route"] = route
+  gc = navi.guidanceCurrent
+  if gc.meta.present:
+    out["guidance"] = {"mainText": str(gc.mainText), "turnType": int(gc.turnType),
+                       "distanceM": int(gc.distanceM), "roadName": str(gc.roadName)}
+  lc = navi.laneCurrent
+  if lc.meta.present:
+    out["lane"] = {"count": int(lc.count), "currentLane": int(lc.currentLane),
+                   "distanceM": int(lc.distanceM)}
+  veh = navi.vehicle
+  if veh.meta.present:
+    out["roadName"] = str(veh.roadName)
+  return out
+
+
+def _cmp_speed_limit(g: dict):
+  return (g.get("valid"), g.get("limitKph"))
+
+
+def _cmp_sdi(g: dict):
+  sec = g.get("secondary") or {}
+  return (g.get("present"), g.get("type"), g.get("limitKph"),
+          bool(sec), sec.get("type"), sec.get("limitKph"))
+
+
+def _cmp_signal(g: dict):
+  # 只比 present/visible/各灯 on 边沿；remainSec 每秒递减、distanceM 连续变化，不参与比较
+  return (g.get("present"), g.get("visible"),
+          *(g.get(k, {}).get("on") for k in SIGNAL_LIGHTS))
+
+
+def _cmp_route(g: dict):
+  return (g.get("offRoute"), g.get("guidanceActive"))
+
+
+def _cmp_guidance(g: dict):
+  return (g.get("turnType"), g.get("mainText"))
+
+
+NAVI_COMPARE = {
+  "speedLimit": _cmp_speed_limit,
+  "sdi": _cmp_sdi,
+  "signal": _cmp_signal,
+  "route": _cmp_route,
+  "guidance": _cmp_guidance,
+}
+
+# 分组消失（meta.present 为假）时的等价形态；guidance 消失仅重置，不推空值
+NAVI_GROUP_DEFAULTS = {
+  "speedLimit": {"valid": False},
+  "sdi": {"present": False},
+  "signal": {"present": False},
+  "route": {"offRoute": False, "guidanceActive": False},
+}
+
+
+def diff_navi(prev: dict | None, cur: dict) -> tuple[dict, dict | None]:
+  """navi 分组边沿差分（纯函数）。prev 为上轮返回的 state（首轮 None），cur 为
+  navi_state() 输出。返回 (新 state, payload)：payload 只含发生变化的分组，无变化
+  为 None；首轮只建状态不推送（客户端初始化走 /state 快照）。"""
+  first = prev is None
+  state: dict = {"sent": {}, "milestones": [], "sdiKey": None,
+                 "greenOn": False, "greenRemain": None, "greenFired": False}
+  payload: dict = {}
+
+  for group, compare in NAVI_COMPARE.items():
+    g = cur.get(group)
+    if g is None:
+      g = NAVI_GROUP_DEFAULTS.get(group)
+      if g is None:  # guidance 消失：仅重置，下次出现重新当边沿推
+        state["sent"][group] = None
+        continue
+    form = compare(g)
+    state["sent"][group] = form
+    if not first and prev["sent"].get(group) != form:
+      payload[group] = g
+
+  # SDI 临近里程碑：同一 SDI（present/type/limit 身份）存续期内 500/200m 各推一次
+  sdi = cur.get("sdi") or NAVI_GROUP_DEFAULTS["sdi"]
+  state["sdiKey"] = (sdi.get("present"), sdi.get("type"), sdi.get("limitKph"))
+  if sdi.get("present"):
+    state["milestones"] = [] if first or state["sdiKey"] != prev.get("sdiKey") \
+      else list(prev.get("milestones", []))
+    for m in SDI_MILESTONES_M:
+      if m not in state["milestones"] and sdi.get("distanceM", 1 << 30) < m:
+        state["milestones"].append(m)
+        if not first:
+          payload.setdefault("sdi", sdi)
+
+  # 绿灯剩余跨越 GREEN_REMAIN_ALERT_S（由大到小）推一次；灯灭即重置
+  green = (cur.get("signal") or {}).get("green") or {}
+  state["greenOn"] = bool(green.get("on"))
+  state["greenRemain"] = green.get("remainSec") if state["greenOn"] else None
+  if state["greenOn"] and not first and prev.get("greenOn"):
+    fired = prev.get("greenFired", False)
+    prev_remain = prev.get("greenRemain")
+    if not fired and prev_remain is not None and \
+        prev_remain > GREEN_REMAIN_ALERT_S >= state["greenRemain"]:
+      fired = True
+      payload.setdefault("signal", cur["signal"])
+    state["greenFired"] = fired
+
+  return state, (payload or None)
 
 
 def services_status(sm) -> dict:
@@ -248,6 +405,7 @@ class MatePoller:
     params = Params()
     events_map: dict[str, dict] = {}
     last_opstate: dict | None = None
+    navi: dict | None = None  # diff_navi 状态（首轮 None）
     tracker = SoundTracker()
     cruise_main_toggle = CruiseMainOpenpilotToggle(ButtonType.mainCruise)
 
@@ -273,6 +431,16 @@ class MatePoller:
         if payload != last_opstate:
           last_opstate = payload
           self.emit("opstate", payload)
+
+      # navi：diff_navi 返回的 payload 是「变化分组」而非全量值，所以快照不能走
+      # emit→set_state（那会拿 payload 覆盖状态段），由这里显式喂全量 cur。
+      if sm.updated["carrotNavi"]:
+        cur = navi_state(sm["carrotNavi"])
+        navi, payload = diff_navi(navi, cur)
+        if payload:
+          self.emit("navi", payload)
+        if self.set_state is not None:
+          self.set_state("navi", cur)
 
       if sm.updated["carState"]:
         cs = sm["carState"]

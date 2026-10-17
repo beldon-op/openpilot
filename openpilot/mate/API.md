@@ -1,8 +1,8 @@
 # mate 接口文档
 
 车机事件实时推送服务。订阅 cereal 消息总线，把告警事件、openpilot 状态机跳转、
-方向盘按键、播报声音四类**边沿事件**通过 **WebSocket** 或 **SSE** 推给局域网客户端，
-并提供一次性状态快照 `GET /state`。
+方向盘按键、播报声音、导航/交通信息五类**边沿事件**通过 **WebSocket** 或 **SSE**
+推给局域网客户端，并提供一次性状态快照 `GET /state`。
 
 参考实现是 cp_byd 的 `local_collector/collector.py`；mate 是其事件子集——
 **没有** 10Hz 周期帧，**没有** admin 管理 API（日志/参数/carinfo）。
@@ -54,6 +54,7 @@ rm /data/params/d/MateToken                          # 关
 | `opstate` | openpilot 状态机跳转 / enabled/active/engageable 变化 | ✔ | ✘ |
 | `button` | 方向盘按键按下/松开（边沿帧） | ✘ | ✘ |
 | `sound` | 播报声音切换（含 carrot 倒计时报数） | ✔ | ✔（正在播报时） |
+| `navi` | 导航/交通信息边沿（限速/电子眼/信号灯/偏航/转向，v2 新增） | ✔（全量值） | ✘（走快照） |
 
 ---
 
@@ -69,11 +70,15 @@ rm /data/params/d/MateToken                          # 关
 
 | type | 触发时机 | 说明 |
 |---|---|---|
-| `hello` | 连接建立后第一条 | `{"service":"mate","version":1,"port":8083,"kinds":[...]}` |
-| `events` / `opstate` / `button` / `sound` | 见 §4 | 事件本体 |
+| `hello` | 连接建立后第一条 | `{"service":"mate","version":2,"port":8083,"kinds":[...]}`；`version` 供客户端探测能力（v2 起含 `navi`） |
+| `events` / `opstate` / `button` / `sound` / `navi` | 见 §4 | 事件本体 |
 | `snapshot` | 响应 snapshot 请求 | 见 §5 |
 | `subscribed` | 响应 subscribe 请求 | `{"kinds":[...]}` 当前生效过滤 |
 | `pong` | 响应 ping | `{"ts": <monotonic>}` |
+
+> **版本约定**：`hello.version` 升级代表新增 kind/字段。客户端**必须忽略未知 type**
+> （未升级的客户端连 v2 服务会多收到 `navi` 消息，按此约定静默忽略即可），据此实现
+> 前后向兼容。
 
 连接建立后依次收到：`hello` → （当前活跃告警的 `events` 补发，有则发）→
 （当前正在播报的 `sound` 补发，有则发）。**按键不补发**——客户端拿当前车辆状态请用
@@ -84,7 +89,7 @@ rm /data/params/d/MateToken                          # 关
 ### 2.2 客户端 → 服务端
 
 ```jsonc
-// 订阅过滤（不发送则默认全部 4 类；重复发送覆盖之前的选择）
+// 订阅过滤（不发送则默认全部 5 类；重复发送覆盖之前的选择）
 { "type": "subscribe", "kinds": ["events", "sound"] }
 
 // 请求一次全量状态快照（立即返回，不影响后续推送）
@@ -125,6 +130,16 @@ ws.onmessage = (e) => {
     case "sound":
       console.log("播报:", msg.data.sound, msg.data.loop ? "循环" : "单次");
       break;
+    case "navi":
+      if (msg.data.speedLimit?.valid) console.log("限速:", msg.data.speedLimit.limitKph);
+      if (msg.data.sdi) console.log("电子眼:", msg.data.sdi);
+      if (msg.data.signal) console.log("信号灯:", msg.data.signal);
+      if (msg.data.route?.offRoute) console.log("已偏航！");
+      if (msg.data.guidance) console.log("转向:", msg.data.guidance.mainText);
+      break;
+    default:
+      // 未知 type 一律忽略（协议向前兼容的关键约定）
+      break;
   }
 };
 ```
@@ -137,7 +152,7 @@ import websocket
 
 def on_message(ws, message):
     msg = json.loads(message)
-    if msg["type"] in ("events", "opstate", "button", "sound"):
+    if msg["type"] in ("events", "opstate", "button", "sound", "navi"):
         print(msg["type"], msg["data"])
 
 ws = websocket.WebSocketApp("ws://192.168.1.100:8083/ws?token=your-secret",
@@ -151,7 +166,7 @@ ws.run_forever()
 
 - 地址：`http://<车机IP>:8083/stream?kinds=events,sound&token=your-secret`
   （`kinds` 省略 = 全部；非法 kind 被忽略）
-- SSE 的 `event:` 名即消息类型（`events`/`opstate`/`button`/`sound`），
+- SSE 的 `event:` 名即消息类型（`events`/`opstate`/`button`/`sound`/`navi`），
   `data:` 为同样的 JSON 信封
 - 新连接同样先补发活跃告警与正在播报的声音
 - 空闲 15s 输出一条 `: ping` 注释行保活
@@ -278,6 +293,47 @@ onroad 告警集合**发生变化时**推送（出现/消失去抖，不每帧�
 - **与 soundd 的唯一差异**：soundd 会等有限长音效播完才转 `none`，mate 没有音频时钟，
   推导结束即推 `none`（客户端只会提前停播，不会漏停）
 
+### 4.5 `navi` 导航/交通信息（v2 新增）
+
+来源是 `carrotNavi`（2Hz，`carrot_navi` 常驻发布，**offroad 也更新**）。mate 在帧间
+做差分，**payload 只包含发生变化的分组**，无变化不推：
+
+```json
+{
+  "type": "navi",
+  "data": {
+    "speedLimit": { "valid": true, "limitKph": 100 },
+    "sdi": { "present": true, "type": 0, "distanceM": 480, "limitKph": 80,
+             "secondary": { "type": 22, "distanceM": 930 } },
+    "signal": { "present": true, "visible": true, "distanceM": 120,
+                "green": { "on": true, "remainSec": 4 } },
+    "route": { "offRoute": false, "guidanceActive": true, "mode": "guiding",
+               "remainDistanceM": 12300, "remainTimeSec": 900 },
+    "guidance": { "mainText": "前方 500m 右转", "turnType": 3, "distanceM": 480, "roadName": "" }
+  }
+}
+```
+
+| 分组 | 推送时机 | 字段 |
+|---|---|---|
+| `speedLimit` | `roadLimitValid` 边沿，或 valid 下限速值变化 | `valid`；`limitKph`（仅 valid 时出现） |
+| `sdi` | `sdiPresent` 边沿（消失=`{"present":false}`）；出现期间跨越 **500m / 200m** 里程碑各推一次 | `present`、`type`、`distanceM`、`limitKph`（>0 才有）、`secondary`（第二个电子眼点，同构） |
+| `signal` | 任一灯 `on` 边沿；绿灯 `remainSec` **由大到小跨越 5** 推一次（倒计时逐秒递减不推） | `present`、`visible`、`distanceM`、红/绿/左转/右转/U转各自 `{on, remainSec}`（仅 valid 的灯出现） |
+| `route` | `offRoute` / `guidanceActive` 边沿（导航结束回落为全 false） | `offRoute`、`guidanceActive`、`mode`（`idle`/`guiding`/`off_route`）、`remainDistanceM`、`remainTimeSec` |
+| `guidance` | 转向指令文本或 `turnType` 变化；**消失不推**（下次出现重新推） | `mainText`、`turnType`、`distanceM`、`roadName` |
+
+要点：
+
+- **字段有效性**：APK 数据无效（`valid`/`present` 为假）时对应数值字段**不出现**
+  而非置 0；`type=0` 是有效测速值，`type=22` 为减速带（TMAP 类型码，随 APK 透传）
+- **首次连接不补发也不推存量**：初始化拿 `navi` 当前值走 `snapshot` / `GET /state`
+  的 `navi` 段；此后纯靠边沿
+- **里程碑只推一次**：同一电子眼（type+limit 身份）存续期内 500/200 各一次，
+  换点或消失即重置
+- 典型用法：`speedLimit` 变化→「限速变化提醒」；`sdi.present`+里程碑→「前方测速」；
+  `signal.green`+`remainSec≤5`→「绿灯快没了」；`route.offRoute=true`→「已偏航」；
+  `guidance`→「准备右转/出匝道」
+
 ---
 
 ## 5. `GET /state` 与 WS `snapshot`
@@ -289,6 +345,7 @@ onroad 告警集合**发生变化时**推送（出现/消失去抖，不每帧�
   "ts": 1791472951.467,
   "data": {
     "car":      { "ts": 1791472951.400, "data": { "vEgoKph": 54.0, "...": "..." } },
+    "navi":     { "ts": 1791472951.410, "data": { "speedLimit": { "...": "..." }, "...": "..." } },
     "opstate":  { "ts": 1791472940.123, "data": { "state": "enabled", "...": "..." } },
     "events":   { "ts": 1791472947.925, "data": { "added": [...], "removed": [...], "active": [...] } },
     "sound":    { "ts": 1791472948.300, "data": { "sound": "stopStop", "...": "..." } },
@@ -300,11 +357,26 @@ onroad 告警集合**发生变化时**推送（出现/消失去抖，不每帧�
 ```
 
 - 每段自带 `ts`（Unix 墙钟秒，车机时钟错时自行对齐），客户端据此判断新鲜度
-- **未收到过的数据段不出现**（offroad 刚启动时 `car`/`opstate` 可能缺失）；
+- **未收到过的数据段不出现**（offroad 刚启动时 `car`/`opstate` 可能缺失；
+  `navi` 段只在收到过 carrotNavi 帧后出现，常驻发布所以通常都在）；
   `button` 永远不在快照里（瞬时边沿）
 - `events` 段在告警清空后保留空 `active`（表示"确认无告警"，区别于未收到）
-- `meta` / `services` 每轮 poller 循环（≤100ms）刷新，`panda` 随 pandaStates（10Hz）刷新；
-  这三段是**服务状态**，只出现在 `/state` 与 WS `snapshot`，不进事件流广播
+- `meta` / `services` 每轮 poller 循环（≤100ms）刷新，`panda` 随 pandaStates（10Hz）刷新，
+  `navi` 随 carrotNavi（2Hz）刷新；
+  这些段是**服务/状态段**，只出现在 `/state` 与 WS `snapshot`，不进事件流广播
+
+### `navi` 段字段
+
+结构即 §4.5 五组的**当前全量值**（事件里只有变化组，快照里是全量），外加：
+
+| 分组 | 字段 | 说明 |
+|---|---|---|
+| `speedLimit` / `sdi` / `signal` / `route` / `guidance` | 同 §4.5 | 当前值（有效才出现） |
+| `lane` | `count` / `currentLane` / `distanceM` | 当前车道组（原车导航车道引导） |
+| `roadName` | string | 当前道路名（来自 vehicle 段） |
+
+> `navi` 段 offroad 也持续更新（`carrot_navi` always_run）；导航 APK 未连接时各分组
+> 不出现（而非全 0）。polyline 不进快照。
 
 ### 服务状态段（meta / services / panda）
 
@@ -356,6 +428,7 @@ onroad 告警集合**发生变化时**推送（出现/消失去抖，不每帧�
 | `cruiseState` | object | | `{enabled, available, speed, speedKph, speedCluster, standstill, nonAdaptive}` |
 | `vCruise` / `vCruiseKph` | float | m/s, km/h | 巡航设定速度 |
 | `leftBlinker` / `rightBlinker` | bool | | 转向灯 |
+| `leftBlindspot` / `rightBlindspot` | bool | | 左/右盲区有车（CAN BSM，轮询用） |
 | `doorOpen` | bool | | 车门开启 |
 | `seatbeltUnlatched` | bool | | 安全带未系 |
 | `parkingBrake` | bool | | 手刹 |
@@ -396,7 +469,9 @@ sound 事件的配套音效。目录随语言设置切换（`sounds` / `sounds_c
 
 - **初始化流程**：连 WS → 收 `hello` → 主动发 `{"type":"snapshot"}`（或 HTTP GET
   `/state`）建立当前状态 → 之后纯靠事件维护增量。重连后重复此流程（补发的
-  `events`/`sound` 已覆盖告警与播报，但车速/档位要另取快照）。
+  `events`/`sound` 已覆盖告警与播报，但车速/档位/`navi` 当前值要另取快照）。
+- **向前兼容**：服务端可能新增 kind 或字段（看 `hello.version`）；客户端对未知
+  `type` 与未知字段**一律忽略**，禁止因未知消息报错断连。
 - **重连**：指数退避；SSE 浏览器自带。
 - **对时**：用每段 `ts`（车机墙钟），不要用客户端本地收包时间推算状态时序。
 - **枚举容错**：所有枚举为字符串，未来新增值可能显示为 `"unknown"`，客户端要兜底。

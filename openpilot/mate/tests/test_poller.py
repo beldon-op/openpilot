@@ -116,6 +116,7 @@ class TestCarSnapshot:
       cruiseState={"enabled": True, "available": True, "speed": 12.5, "speedCluster": 12.3,
                    "standstill": False, "nonAdaptive": False},
       vCruise=12.5, doorOpen=True, latEnabled=True, carrotCruise=2,
+      leftBlindspot=True, rightBlindspot=False,
     )
     snap = car_snapshot(cs)
     assert snap["vEgo"] == 10.0 and snap["vEgoKph"] == 36.0
@@ -124,12 +125,14 @@ class TestCarSnapshot:
     assert snap["doorOpen"] is True
     assert snap["latEnabled"] is True
     assert snap["carrotCruise"] == 2
+    assert snap["leftBlindspot"] is True and snap["rightBlindspot"] is False  # 盲区直通
     assert json.dumps(snap)  # 必须始终可序列化
 
   def test_car_snapshot_defaults_readable(self):
     # 从未 update 过的 CarState（offroad 首帧）也要能出快照，不能抛
     snap = car_snapshot(car.CarState.new_message())
     assert snap["standstill"] is False and snap["gearShifter"] == "unknown"
+    assert snap["leftBlindspot"] is False and snap["rightBlindspot"] is False
 
 
 class TestServiceStatus:

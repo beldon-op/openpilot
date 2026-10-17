@@ -117,3 +117,4 @@ Pipfile
 *.pyd
 .claude
 openspec
+local_docs

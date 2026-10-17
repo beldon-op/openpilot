@@ -166,6 +166,10 @@ struct OnroadEvent @0xc4fa6047f024e718 {
     impactDashcamReboot @129;
     bydLongFirmwareMissing @130;
 
+    leadHardBrake @131;
+    leadTtcClose @132;
+    leadStart @133;
+
     soundsUnavailableDEPRECATED @47;
   }
 }

@@ -1,7 +1,7 @@
 """
 mate — 车机事件实时推送服务（局域网）
 
-把 poller.py 推导的四类边沿事件（events / opstate / button / sound）通过
+把 poller.py 推导的五类边沿事件（events / opstate / button / sound / navi）通过
 WebSocket 和 SSE 推给局域网客户端。参考实现为 cp_byd local_collector，
 其中 admin 管理 API 与 10Hz 周期帧均不移植。
 
@@ -42,8 +42,10 @@ from openpilot.selfdrive.ui.soundd import (
 )
 
 PORT = int(os.environ.get("MATE_PORT", "8083"))
-ALL_KINDS = ("events", "opstate", "button", "sound")
-STATE_KINDS = ("events", "opstate", "sound")  # emit 时同步写进 /state 快照的类型
+PROTOCOL_VERSION = 2  # v2：新增 navi kind；客户端按 hello.version 探测能力
+ALL_KINDS = ("events", "opstate", "button", "sound", "navi")
+STATE_KINDS = ("events", "opstate", "sound")  # emit 时同步写进 /state 快照的类型；
+# navi 不在其中——其 emit 数据是「变化分组」而非全量值，快照由 poller 显式喂
 REPLAY_KINDS = ("events", "sound")  # 新连接先补发这两类的当前状态
 TOKEN_PARAM = "MateToken"
 SLOW_CLIENT_QUEUE = 256
@@ -190,7 +192,7 @@ async def ws_handler(request: web.Request):
   cloudlog.event("mate ws connected", n=len(hub.clients))
   await ws.send_str(json.dumps({
     "type": "hello",
-    "data": {"service": "mate", "version": 1, "port": PORT, "kinds": list(ALL_KINDS)},
+    "data": {"service": "mate", "version": PROTOCOL_VERSION, "port": PORT, "kinds": list(ALL_KINDS)},
   }, ensure_ascii=False))
   for payload in hub.replay_snapshot():
     await ws.send_str(payload)

@@ -1,6 +1,7 @@
+import asyncio
 import json
 
-from openpilot.mate.server import Hub
+from openpilot.mate.server import ALL_KINDS, PROTOCOL_VERSION, Hub
 
 
 class TestHubSnapshot:
@@ -19,6 +20,33 @@ class TestHubSnapshot:
     snap = hub.state_snapshot()
     assert snap["data"]["opstate"]["data"]["state"] == "enabled"
     assert "button" not in snap["data"]  # 边沿瞬时事件不进快照
+
+  def test_navi_not_state_kind_and_version_bumped(self):
+    # navi 的 emit 数据是变化分组，不能当全量值写快照（poller 显式喂全量 cur）
+    hub = Hub()
+    hub.emit("navi", {"speedLimit": {"valid": True, "limitKph": 80}})
+    assert "navi" not in hub.state_snapshot()["data"]
+    assert "navi" in ALL_KINDS  # 默认订阅集与 subscribe 白名单
+    assert PROTOCOL_VERSION == 2  # hello.version，客户端据此探测 navi 能力
+
+  def test_navi_reaches_only_subscribed_clients(self):
+    hub = Hub()
+    loop = asyncio.new_event_loop()
+    hub.loop = loop
+    try:
+      q_all = hub.add_client(ALL_KINDS)
+      q_navi = hub.add_client(("navi",))
+      hub.emit("navi", {"speedLimit": {"valid": True, "limitKph": 100}})
+      hub.emit("events", {"added": [], "removed": [], "active": []})
+      for _ in range(2):
+        loop.run_until_complete(asyncio.sleep(0))
+      # navi 订阅者只收到 navi；全订阅者收到 navi + events
+      assert q_navi.get_nowait()[0] == "navi"
+      assert q_navi.empty()
+      kinds = [q_all.get_nowait()[0] for _ in range(2)]
+      assert kinds == ["navi", "events"]
+    finally:
+      loop.close()
 
   def test_replay_follows_events_and_sound(self):
     hub = Hub()
