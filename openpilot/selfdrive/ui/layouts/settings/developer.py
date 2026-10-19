@@ -1,13 +1,23 @@
 from openpilot.common.params import Params
+from openpilot.common.raw_params import get_float_param, put_raw_param
 from openpilot.selfdrive.ui.widgets.ssh_key import ssh_key_item
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.system.ui.widgets import Widget
-from openpilot.system.ui.widgets.list_view import toggle_item
+from openpilot.system.ui.widgets.list_view import multiple_button_item, toggle_item
 from openpilot.system.ui.widgets.scroller_tici import Scroller
 from openpilot.system.ui.widgets.confirm_dialog import ConfirmDialog
 from openpilot.system.ui.lib.application import gui_app
 from openpilot.system.ui.lib.multilang import tr, tr_noop
 from openpilot.system.ui.widgets import DialogResult
+
+# BYD 0x109 b7 distance scale u [m/count] (docs/byd-radar-010x.md ②; pinned 0.25
+# 2026-10-19 by owner decision, kept tunable for the road test). The gap monitor
+# is u-free (r=b7/vEgo counts space) and the b7 counts path reads the factor-1
+# MSG_109_B7 placeholder, so changing this can only affect future meters-side
+# consumers (track synthesis / distance display), never control behavior.
+RADAR_SCALE_PARAM = "BydRadarDistScale"
+RADAR_SCALE_DEFAULT = 0.25
+RADAR_SCALE_CHOICES = [0.20, 0.25, 0.3048, 0.30]
 
 # Description constants
 DESCRIPTIONS = {
@@ -24,6 +34,12 @@ DESCRIPTIONS = {
     "On this car, openpilot defaults to the car's built-in ACC instead of openpilot's longitudinal control. " +
     "Enable this to switch to openpilot longitudinal control. Enabling Experimental mode is recommended when enabling openpilot longitudinal control alpha. " +
     "Changing this setting will restart openpilot if the car is powered on."
+  ),
+  'byd_radar_scale': tr_noop(
+    "Distance scale u (meters per radar count) for the BYD 0x109 b7 field. " +
+    "Pinned at 0.25 m/count; adjust only if a measured stop-to-lead gap disagrees. " +
+    "Lane-change gap gating is scale-free and unaffected. " +
+    "Applies when the radar process (radarcan) restarts - a power cycle is the simplest path."
   ),
 }
 
@@ -75,6 +91,16 @@ class DeveloperLayout(Widget):
       enabled=lambda: not ui_state.engaged,
     )
 
+    self._radar_scale_item = multiple_button_item(
+      lambda: tr("BYD Radar Distance Scale"),
+      description=lambda: tr(DESCRIPTIONS["byd_radar_scale"]),
+      buttons=[f"{u:g} m" for u in RADAR_SCALE_CHOICES],
+      button_width=255,
+      callback=self._on_radar_scale,
+      selected_index=self._radar_scale_index(),
+      icon="speed_limit.png",
+    )
+
     self._ui_debug_toggle = toggle_item(
       lambda: tr("UI Debug Mode"),
       description="",
@@ -90,6 +116,7 @@ class DeveloperLayout(Widget):
       self._joystick_toggle,
       self._long_maneuver_toggle,
       self._alpha_long_toggle,
+      self._radar_scale_item,
       self._ui_debug_toggle,
     ], line_separator=True, spacing=0)
 
@@ -184,3 +211,10 @@ class DeveloperLayout(Widget):
       self._params.put_bool("AlphaLongitudinalEnabled", False)
       self._params.put_bool("OnroadCycleRequested", True)
       self._update_toggles()
+
+  def _radar_scale_index(self) -> int:
+    u = get_float_param(self._params, RADAR_SCALE_PARAM, RADAR_SCALE_DEFAULT)
+    return min(range(len(RADAR_SCALE_CHOICES)), key=lambda i: abs(RADAR_SCALE_CHOICES[i] - u))
+
+  def _on_radar_scale(self, button_index: int):
+    put_raw_param(self._params, RADAR_SCALE_PARAM, RADAR_SCALE_CHOICES[button_index])

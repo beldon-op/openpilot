@@ -77,6 +77,22 @@ class CarInterface(CarInterfaceBase):
     self._lat_state_is_torque = False
     self._lat_torque_i = 0.0
 
+  def update(self, can_packets):
+    # carrot adaptation of the source override (sunnypilot returns (ret, ret_sp);
+    # this fork's base returns a single CarState)
+    ret = super().update(can_packets)
+    # T8 gap monitor rides the bus1 parser owned by CarState (see the note in
+    # carstate init: deliberately outside can_parsers, canValid/canTimeout are
+    # NOT affected). Fields are telemetry until desire_helper_byd gates on them.
+    # Guarded: update() shares card's never-raise contract with apply() - a crash
+    # here gaps 0x316 and latches EPS TorqueFailed. The extra parser must not be
+    # able to kill the loop; worst case the gap fields stay False.
+    try:
+      ret.radarGapClosing, ret.radarGapNew = self.CS.update_radar_gap(can_packets, ret.vEgo)
+    except Exception:
+      pass
+    return ret
+
   def apply(self, c: structs.CarControl, now_nanos: int | None = None, model_v2=None, radar_state=None) -> tuple[structs.CarControl.Actuators, list]:
     # ABSOLUTE rule on BYD: apply()/card must never raise - a gap in the 0x316 stream
     # latches EPS TorqueFailed until the next ignition cycle. Everything below is soft.
@@ -109,15 +125,20 @@ class CarInterface(CarInterfaceBase):
       ret.lateralTuning.torque.ki = 0.0
     ret.steerLimitTimer = 0.5
 
-    # No valid MRR target exists on any recorded bus (docs/byd-lane-change.md
-    # §8.5): 0x374 absent, 0x380-0x38f is a status table, and the 0x351-354
-    # track slots on bus 1 are present but logged IsValid=0 only. RadarInterface
-    # parses those slots (community tangdm layout) and falls back to the 0x32D
-    # HUD bar synthesis; the slot path auto-lights if a real target stream ever
-    # appears (private-CAN tap / AEB duty). It stays inert until
-    # RADAR_HUD_BARS_TO_M is calibrated on-road; flipping this flag is then the
-    # only change needed. Behavior today is unchanged.
-    ret.radarUnavailable = True
+    # Radar interface LIVE (2026-10-19, alpha-longitudinal verification round;
+    # ported 2026-10-20): primary synthesized lead = continuous 0x109 b7 *
+    # BydRadarDistScale (pinned 0.25 m/count) with the presence==7 gate and
+    # median-filtered vRel; 0x351-354 slot path stays as the auto-lighting
+    # future source (private-CAN tap), 0x32D HUD bars as the last-resort
+    # fallback (published measured=False on this fork, see radar_interface
+    # _update_hud). In stock-ACC mode radarState feeds nothing longitudinal
+    # (the vendor's MPC keeps owning the session), so this flag is
+    # behavior-neutral there; with AlphaLongitudinalEnabled the synthesized
+    # lead reaches the MPC only through this fork's vision-association matcher
+    # (farther-than-vision veto + strongly-visible fallback - a bad lead is
+    # dropped, not trusted; V2/V3 road-test items, docs/byd-radar-010x.md).
+    # The gap monitor (BydRadarGapGate) is unaffected (counts space, own parser).
+    ret.radarUnavailable = False
 
     # longitudinal control is done by the stock ACC; openpilot does lateral
     # control only (unless AlphaLongitudinalEnabled). The spoofed RES-button

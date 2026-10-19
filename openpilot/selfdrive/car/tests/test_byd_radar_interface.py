@@ -1,12 +1,13 @@
-"""Host tests for the BYD radar interface: MRR track slots + HUD-bar fallback (§8.5)."""
+"""Host tests for the BYD radar interface: MRR track slots + b7 continuous
+lead + HUD-bar fallback (docs/byd-radar-010x.md ⑧/⑨/⑩, §8.5)."""
 import time
 
 import pytest
 
 from opendbc.car import CanData, structs
-from opendbc.car.byd.radar_interface import (ACC_HUD_ADAS_MSG, HUD_TRACK_ID, RadarInterface,
-                                             TRACK_ID_BASE, TRACK_MSGS)
-from opendbc.car.byd.values import CAR, RADAR_HUD_BARS_TO_M
+from opendbc.car.byd.radar_interface import (ACC_HUD_ADAS_MSG, B7_HI, B7_LO, DIST_MSGS,
+                                             HUD_TRACK_ID, RadarInterface, TRACK_ID_BASE, TRACK_MSGS)
+from opendbc.car.byd.values import CAR, RADAR_DIST_SCALE_DEFAULT, RADAR_HUD_BARS_TO_M
 
 MSG_T_NS = int(1e9 / 50)  # HUD rate; track frames ride the same tick, fine for tests
 
@@ -50,7 +51,16 @@ def make_ri(radar_unavailable: bool) -> RadarInterface:
   return RadarInterface(make_cp(radar_unavailable))
 
 
-def feed(ri: RadarInterface, has_lead: bool, bar: int, n: int = 60, tracks=None) -> structs.RadarDataT | None:
+def dist_data(b7: int, presence: int) -> tuple[bytes, bytes]:
+  d9 = bytearray(8)
+  d9[7] = b7
+  dA = bytearray(8)
+  dA[3] = (presence & 0x7) << 5
+  return bytes(d9), bytes(dA)
+
+
+def feed(ri: RadarInterface, has_lead: bool, bar: int, n: int = 60, tracks=None,
+         b7: int | None = None, presence: int = 7) -> structs.RadarDataT | None:
   out = None
   for i in range(n):
     frames = [CanData(ACC_HUD_ADAS_MSG, hud_data(has_lead, bar), 2)]
@@ -58,6 +68,10 @@ def feed(ri: RadarInterface, has_lead: bool, bar: int, n: int = 60, tracks=None)
       for idx, payload in enumerate(tracks):
         if payload is not None:
           frames.append(CanData(TRACK_MSGS[idx], payload, 1))
+    if b7 is not None:
+      d9, dA = dist_data(b7, presence)
+      frames.append(CanData(DIST_MSGS[0], d9, 1))
+      frames.append(CanData(DIST_MSGS[1], dA, 1))
     ret = ri.update([(i * MSG_T_NS, frames)])
     if ret is not None:
       out = ret
@@ -67,7 +81,7 @@ def feed(ri: RadarInterface, has_lead: bool, bar: int, n: int = 60, tracks=None)
 class TestInert:
   def test_no_parsers_when_radar_unavailable(self):
     ri = make_ri(True)
-    assert ri.rcp_hud is None and ri.rcp_tracks is None
+    assert ri.rcp_hud is None and ri.rcp_tracks is None and ri.rcp_dist is None
 
   def test_never_produces_tracks_when_unavailable(self):
     out = feed(make_ri(True), True, 4)
@@ -83,7 +97,10 @@ class TestHudFallback:
     p = out.points[0]
     assert p.trackId == HUD_TRACK_ID
     assert p.dRel == pytest.approx(RADAR_HUD_BARS_TO_M[4])
-    assert p.measured
+    # carrot deviation (design.md D2): the position-only HUD fallback is
+    # published measured=False so this fork's radard never consumes it (its
+    # _finite() would coerce the NaN vRel to a bogus vLead=vEgo "moving lead")
+    assert not p.measured
     assert p.vRel != p.vRel  # NaN
 
   def test_bar_ordering_and_switch(self):
@@ -162,3 +179,59 @@ class TestTrackPriority:
       if ret is not None and ret.errors.canError:
         out = ret
     assert out is not None and out.errors.canError
+
+
+class TestB7Lead:
+  """0x109 b7 continuous lead: primary synthesized source (docs ⑧/⑨)."""
+
+  def test_b7_beats_hud_bar(self):
+    # same tick: b7=100 (25 m at pinned u) vs HUD bar 4 (35 m) -> b7 wins
+    out = feed(make_ri(False), True, 4, b7=100)
+    assert len(out.points) == 1
+    p = out.points[0]
+    assert p.trackId == HUD_TRACK_ID
+    assert p.dRel == pytest.approx(100 * RADAR_DIST_SCALE_DEFAULT)
+    assert p.measured
+
+  def test_steady_lead_vrel_near_zero(self):
+    out = feed(make_ri(False), True, 4, b7=120)
+    assert abs(out.points[0].vRel) < 1e-9
+
+  def test_closing_vrel_negative_and_finite(self):
+    # shrink 2 counts/frame; implementation assumes the 25 Hz frame rate, and
+    # this test feeds at 50 Hz ticks, so expect 2*u*25 per frame step
+    ri = make_ri(False)
+    out = None
+    for i in range(60):
+      out = ri.update([(i * MSG_T_NS, [CanData(ACC_HUD_ADAS_MSG, hud_data(True, 4), 2)] +
+                        [CanData(a, d, 1) for a, d in zip(DIST_MSGS, dist_data(max(B7_LO, 160 - 2 * i), 7), strict=True)])])
+    assert out is not None
+    p = out.points[0]
+    assert p.vRel == pytest.approx(-2 * RADAR_DIST_SCALE_DEFAULT * 25, abs=0.3)
+    # finite vRel: this is the point radard CAN consume; the HUD fallback's
+    # NaN never reaches the matcher at all (measured=False, design D2)
+    assert p.vRel == p.vRel
+
+  def test_presence_and_sentinel_gate(self):
+    # presence != 7 -> invisible; b7=247 (loss-edge transient) -> invisible;
+    # HUD fallback keeps a position-only point while HUD HasLead stands
+    for b7, pres in ((120, 0), (120, 6), (0, 7), (247, 7), (B7_HI + 1, 7)):
+      out = feed(make_ri(False), True, 4, b7=b7, presence=pres)
+      assert len(out.points) == 1
+      assert out.points[0].trackId == HUD_TRACK_ID
+      assert out.points[0].dRel == pytest.approx(RADAR_HUD_BARS_TO_M[4])
+      assert not out.points[0].measured  # it fell back to the HUD tier
+
+  def test_no_target_no_hud_no_point(self):
+    out = feed(make_ri(False), False, 0, b7=0, presence=0)
+    assert len(out.points) == 0
+
+  def test_hist_resets_across_gap(self):
+    # a loss gap must clear the diff history: vRel after recovery must not
+    # span the distance jump
+    ri = make_ri(False)
+    feed(ri, True, 4, b7=200)
+    feed(ri, True, 0, b7=0, presence=0, n=30)          # gap
+    out = feed(ri, True, 4, b7=60, n=12)               # recovered far away
+    assert out.points[0].vRel == out.points[0].vRel    # finite while refilling
+    feed(ri, True, 4, b7=60, n=40)                     # window full again

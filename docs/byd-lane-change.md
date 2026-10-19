@@ -226,6 +226,7 @@ class AssistLessLaneChange:
 
 - [x] ~~T7 设备探针~~ **10-11 已被日志回放代答（§8.5）**：bus1 有流量（"仅 bus0/2"错误），前向 MRR 目标流候选 0x380-38f 已在档内；bus3 与"后方 SRR 目标流是否在可及总线"仍待设备探针补一答（`tools/byd/radar_bus_probe.py` 保留可用）。
 - [ ] T8 找到目标流后：入 dbc→（可选 radar_interface/radarState 或新增车型侧信号）→ starting 前做距离+接近速度门控（参照 stock `can_change_lane` 语义，本仓库已无该函数，需自建）。**10-11 进度：前向 0x38x 挖掘与入库见 §8.5 待办；后方若证实无目标流，T8 退化为"BSD 档位语义精细化"（0x418 2-bit 的 1 vs 2）。**
+  **10-18 夜 ⑤ 前向路落码（门控默认关，启用=路测；10-20 移植本仓库）**：源=0x109 b7/0x10A 存在位（非 0x38x 旧假设），`opendbc/car/byd/radar_gap.py`=u-free r=b7/vEgo 平台穿越+迟滞去抖监视器，BYD CarState 独立 CANParser 265/266 喂入（不进 can_parsers，canValid/canTimeout 不受影响）→ `CarState.radarGapClosing/radarGapNew`（capnp @104/@105，本仓库 @61/@62 已被 activateCruise/latEnabled 占用）→ desire_helper_byd 三 hook（`_update_clear_window`/`_clear_window_ok`/`_mid_maneuver_abort`）承载三档 `BydRadarGapGate`（0 关/1 clear 窗+禁发起/2 追加"新目标出现且逼近"starting abort；已有前车逼近**不**退——无 yRel 无法区分本车道/目标车道，退回撞向本车道逼近车更坏）。分层规范：标品 desire_helper.py 零改动（与 sunnypilot 源工程直改标品的落码不同，行为等价）。415 段回放验收（源工程 `tools/byd/radar_t8_replay.py`）：稳态误阻塞 8.3%（静态阈 29-60%）、closing 翻转预警 4→3 33.3%/3→2 22.9%、提前量中位 4.8s、告警 22 次/h、新目标 41 次/h；测试 `selfdrive/car/tests/test_byd_radar_gap.py` 20 例（monitor 9 + CarState 解码 3 + hook 契约 8；源工程 Layer3 驱动 sunnypilot 标品状态机，本仓库改测三 hook 契约，全状态机集成留路测）。剩余=路测开 gate1 观察阻塞体验→gate2 验证新目标 abort 语义；后方数据源仍未解决（本门控只覆盖前向锥）。**10-19 凌晨 ⑦ 追加（docs/byd-radar-010x.md §⑦）**：0x109 b3 判非横向量（123 个横移窗回归 slope med 0.0 LSB/m、r² 0.04）——level-2「新目标才退」即终态，分道输入的可及总线两条腿全断（b3 非横向 + ⑥ bus3 无后向），押注 67ms 槽表逆向或引线。
 - [ ] T9 复测 §8.2 三行为（路测）：①满窗才起 ②途中亮盲区=回原车道+blocked 提示 ③连续变道二次确认；顺带回归 10-09 拨杆集合判 2/3 左、4/5 右。
 - 语义留白：0x418 2-bit 的 1 vs 2 档位含义未知（实测 2 值仅 0.05% 帧）；若路测证实"2=紧迫"，可把发起条件收紧为特定档位而 bool 保留中止。BSD 19.66% 帧占意味着正常跟车就可能常亮——路测若发现 0.5s 窗频繁延误发起，回来重定 `LANE_CHANGE_CLEAR_TIME_MIN` 或改用档位语义。
 
@@ -245,7 +246,7 @@ class AssistLessLaneChange:
    - 测试 `selfdrive/car/tests/test_byd_radar_interface.py` 6 例（真 CANParser 位序回归+惰性+清槽）；host 回归 **81/81**（75 基线+6）。rlog 回放段 113：3620 返回帧，lead→单点 100% 一致、0 错值、0 无中生有。
 6. 待办：
    - [ ] 8.5.4 **路测标定档位→米**：人工测 1-4 档实际车间距（GPS/雷达实测对照），定稿 `RADAR_HUD_BARS_TO_M`；标定后翻转 `interface.py` 的 radarUnavailable 即点亮（无其他改动）。
-   - [ ] 8.5.5 后方方向不变：可及总线无 SRR 目标流（曾疑 0x2e0-2e8 块，复核为跨总线统计串入，bus1 无此地址）；要么 0x418 档位语义细化，要么设备探针（`radar_bus_probe.py` 补 bus3 与后方 SRR 两问）后评估引线代价。
+   - [ ] 8.5.5 后方方向不变：可及总线无 SRR 目标流（曾疑 0x2e0-2e8 块，复核为跨总线统计串入，bus1 无此地址）；要么 0x418 档位语义细化，要么设备探针（`radar_bus_probe.py` 补 bus3 与后方 SRR 两问）后评估引线代价。**10-18 勘误（`docs/byd-radar-rear-bus3-2026-10-18.md`）：两问日志侧已定案——①415 段全局 src 集合={0,1,2,128,130,192}，无 bus3 流量（128/130/192=panda LOOPBACK/REJECTED 回声，厂商 CanBus 枚举同证）；②0x418 实测 20Hz（非本文多处"10Hz"，0.5s clear 窗设计数字不受影响反而更充裕），b6/b7=低位恒 0xF 滚动计数器、798 次 L/R onset 无任何字节响应=纯结果位；车侧为 MPC 视频方案（两侧加塞=MPC 融合、前 MRR 走 MPC 私有 CAN 物理隔离），后方目标流在公开 CAN 不存在，T8 后方升级放弃等总线、维持 BSD 位+0x109 前向路。**
 
 ### 8.5.6 社区 mypilot 资产 + 槽位双路接口落码（2026-10-11 拍板 A+B）
 

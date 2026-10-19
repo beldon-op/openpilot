@@ -1,56 +1,76 @@
-"""BYD Song Plus DM-i radar interface: MRR track slots with HUD-bar fallback.
+"""BYD Song Plus DM-i radar interface: b7 continuous lead + MRR track slots + HUD-bar fallback.
 
-Two sources, in priority order (docs/byd-lane-change.md §8.5):
+Three sources, in priority order (docs/byd-radar-010x.md ②/⑧/⑨, docs/byd-lane-change.md §8.5):
 
   1. 0x351-0x354 RADAR_TRACK_35x on bus 1 - MRR target slots, ~25 Hz, layout
-     taken verbatim from the mypilot community byd_tangdm_radar.dbc (same IDs
-     the vendor's decompiled radar_interface parses for some BYD models).
-     On the Song these slots are logged across all 415 archive segments as
-     IsValid=0 placeholder frames (793k ticks/slot, 0 with IsValid=1 or
-     TrackID!=0 - even during 0.9M HUD lead frames, docs §8.5.7), i.e. the
-     MRR does not export targets onto bus 1 - but the frames ARE this
-     protocol family, and the slot path auto-lights the moment a real target
+     taken verbatim from the mypilot community byd_tangdm_radar.dbc. On the
+     Song these slots are logged as IsValid=0 placeholder frames across all
+     415 archive segments - the path auto-lights the moment a real target
      stream becomes reachable (radar private CAN tap; no duty state on the
-     car's wired buses fills the slots - 0x374 is also 0 frames on every bus
-     across the full archive rescan).
+     car's wired buses fills the slots).
 
-  2. 0x32D ACC_HUD_ADAS on bus 2 - the stock radar's fused single-lead
-     summary (HasLead + LeadingDistance 0-7 gap bars). Always available;
-     used whenever no track slot is valid.
+  2. 0x109/0x10A on bus 1 - the continuous fused lead distance (b7, 25 Hz)
+     with the presence nibble gate (b3[7:5]==7, ④f), PINNED u=0.25 m/count.
+     dRel = b7*u; vRel = median-filtered dRel diff over a 0.4 s window
+     (radar_dvrel_quality: steady noise ~0 m/s, group delay 0.24 s, closing
+     tracking r=0.56-0.90 on 13 stop-to-lead events). This is the PRIMARY
+     synthesized source for radarState; the scale is runtime-tunable via the
+     BydRadarDistScale raw param (radarcan.py injection, RadarInterface
+     .radar_dist_scale). b7>=246 is the loss-edge band (④a), treated invalid;
+     any invalid frame resets the diff history so vRel never spans a gap.
+
+  3. 0x32D ACC_HUD_ADAS on bus 2 - the stock radar's fused single-lead
+     summary (HasLead + LeadingDistance gap bars). Used only when neither
+     source above produced a point. The bars are TIME-GAP bands (tau
+     {0.71,1.02,1.4} s at u=0.25), so RADAR_HUD_BARS_TO_M is shape-true at
+     one speed only; the point is published with measured=False so this
+     fork's radard never consumes it (see _update_hud) - position-only
+     fallback, matching the source project's intent (docs/byd-radar-010x.md ⑩).
 
 Vendor branch sets, extracted from the decompiled _create_radar_can_parser
 bytecode (co_names, 2026-10-11): {BYD_TANG_GAS, BYD_TANG_DM} parse (849,852)
 @25Hz on CanBus.BYD_AUX=bus 1 - this IS the tangdm slot protocol; the Song is
-in NEITHER vendor branch (no parser), because the MRR does not export targets
-on the Song's bus 1. We therefore parse all four slots ourselves with the
-community layout; the vendor's Tang-branch consumption is confirmed consistent
-(vRel = REL_SPEED * KPH_TO_MS, yRel clip +-5, track_id==0 sentinel).
+in NEITHER vendor branch (no parser). We parse all four slots ourselves with
+the community layout. RelSpeed caveat: community dbc labels it km/s (wrong);
+we apply KPH_TO_MS. TODO(belabor): verify against the first real IsValid=1.
 
-RelSpeed unit caveat: the community dbc labels it km/s (obviously wrong) and
-its code passes the raw value (factor 1, offset -512) to vRel as m/s - an
-implausible +-512 m/s range, so we apply KPH_TO_MS as the physically sane
-reading. TODO(belabor): verify against the first real IsValid=1 frame.
-
-Status: inert by default. interface.py keeps CP.radarUnavailable=True until
-RADAR_HUD_BARS_TO_M is calibrated on-road and a track source is live;
-flipping that flag is then the only change needed. Behavior today is
-unchanged (no parser, no liveTracks).
+Status: LIVE for alpha-longitudinal verification (2026-10-19, ported
+2026-10-20): interface.py flips CP.radarUnavailable=False. In stock-ACC mode
+radarState is not consumed by any longitudinal path, so the flag flip is
+behavior-neutral there; with AlphaLongitudinalEnabled the synthesized lead
+feeds the longitudinal MPC through this fork's radard (carrot/radar_motion:
+a radar point becomes leadOne only through the vision association matcher -
+dPath/distance/velocity sanity with a farther-than-vision veto and a
+"strongly visible" vision fallback - so a bad-quality lead is dropped, not
+trusted; HUD-bar points never enter at all (measured=False)).
 """
+from collections import deque
+from statistics import median
+
 from opendbc.can import CANParser
 from opendbc.car import Bus, structs
 from opendbc.car.common.conversions import Conversions as CV
-from opendbc.car.byd.values import DBC, RADAR_HUD_BARS_TO_M
+from opendbc.car.byd.values import DBC, RADAR_DIST_SCALE_DEFAULT, RADAR_HUD_BARS_TO_M
 from opendbc.car.interfaces import RadarInterfaceBase
 
 ACC_HUD_ADAS_MSG = 813  # 0x32D, bus 2
 TRACK_MSGS = [849, 850, 851, 852]  # 0x351-0x354, bus 1 (MRR slot block)
+DIST_MSGS = [265, 266]  # 0x109 RADAR_DIST_109 / 0x10A RADAR_PRESENCE_10A, bus 1
 TRACK_FREQ = 25
 TRACK_BUS = 1
+DIST_FREQ = 25
 HUD_BUS = 2
 # track-slot point ids are namespaced away from the HUD fallback id so
-# switching sources mid-drive never aliases a KF-tracked point
+# switching sources mid-drive never aliases a KF-tracked point; the b7 lead
+# IS the HUD lead (same fused target), so it shares HUD_TRACK_ID
 TRACK_ID_BASE = 101
 HUD_TRACK_ID = 1
+
+# ④f/④a lead gate + diff window (radar_dvrel_quality.py quantification)
+PRESENCE_VISIBLE = 7
+B7_LO = 1
+B7_HI = 245          # >=246 is the loss-edge band, not a trustworthy gap
+VREL_DIFF_FRAMES = 10  # 0.4 s @ 25 Hz: steady noise ~0, delay 0.24 s
 
 
 def _create_track_can_parser(CP):
@@ -61,14 +81,24 @@ def _create_hud_can_parser(CP):
   return CANParser(DBC[CP.carFingerprint][Bus.radar], [(ACC_HUD_ADAS_MSG, 50)], HUD_BUS)
 
 
+def _create_dist_can_parser(CP):
+  return CANParser(DBC[CP.carFingerprint][Bus.radar], [(addr, DIST_FREQ) for addr in DIST_MSGS], TRACK_BUS)
+
+
 class RadarInterface(RadarInterfaceBase):
   def __init__(self, CP):
     # NOTE: single-arg CP - this fork's RadarInterfaceBase takes no CP_SP
-    # (sunnypilot source had (CP, CP_SP); adapted on port, 2026-10-11)
+    # (sunnypilot source had (CP, CP_SP); adapted on port, 2026-10-11/2026-10-20)
     super().__init__(CP)
     self.rcp_tracks = None if CP.radarUnavailable else _create_track_can_parser(CP)
     self.rcp_hud = None if CP.radarUnavailable else _create_hud_can_parser(CP)
+    self.rcp_dist = None if CP.radarUnavailable else _create_dist_can_parser(CP)
     self.updated_messages: set[int] = set()
+    # meters-per-count scale, injected by radarcan.py from the BydRadarDistScale
+    # raw param (default pinned 0.25); counts paths never read this
+    self.radar_dist_scale = RADAR_DIST_SCALE_DEFAULT
+    self._lead_hist: deque[int] = deque(maxlen=VREL_DIFF_FRAMES + 1)  # b7 counts
+    self._lead_visible = False
 
   def _update_tracks(self) -> bool:
     """Refresh points from valid MRR slots. True if any slot is valid."""
@@ -104,7 +134,53 @@ class RadarInterface(RadarInterfaceBase):
         del self.pts[track_id]
     return any_valid
 
+  def _update_lead_b7(self) -> bool:
+    """Continuous fused lead from 0x109 b7 + 0x10A presence. True if visible."""
+    vl = self.rcp_dist.vl[265]
+    presence = int(self.rcp_dist.vl[266]["Presence_10A"])
+    b7 = int(vl["MSG_109_B7"])
+    visible = presence == PRESENCE_VISIBLE and B7_LO <= b7 <= B7_HI
+    if not visible:
+      # reset the diff history: vRel must never span a target gap/loss edge
+      self._lead_hist.clear()
+      self._lead_visible = False
+      return False
+    if not self._lead_visible:
+      # rising edge: fresh target, no pre-gap history
+      self._lead_hist.clear()
+    self._lead_visible = True
+
+    if HUD_TRACK_ID not in self.pts:
+      self.pts[HUD_TRACK_ID] = structs.RadarData.RadarPoint()
+      self.pts[HUD_TRACK_ID].trackId = HUD_TRACK_ID
+    pt = self.pts[HUD_TRACK_ID]
+    d_rel = b7 * self.radar_dist_scale
+    pt.dRel = d_rel
+    pt.yRel = 0.0  # ⑦: no lateral field on the reachable buses
+    # median-filtered diff over the last 0.4 s of raw per-frame diffs
+    self._lead_hist.append(b7)
+    if len(self._lead_hist) >= 2:
+      hist = list(self._lead_hist)
+      dt = 1.0 / DIST_FREQ
+      diffs = [(b - a) * self.radar_dist_scale / dt for a, b in zip(hist[:-1], hist[1:], strict=True)]
+      pt.vRel = median(diffs)
+    else:
+      pt.vRel = 0.0  # single fresh frame: closing unknown, start at rest
+    pt.aRel = float('nan')  # radard KF derives aLeadK
+    pt.yvRel = float('nan')
+    pt.measured = True
+    return True
+
   def _update_hud(self) -> None:
+    # carrot port deviation (this change's design.md D2): the source project
+    # guarantees this position-only fallback is never selected by radard via
+    # vRel=NaN + its vel_sane matcher. This fork's radard (carrot/radar_motion)
+    # coerces every NaN through _finite() to 0.0, which would turn the fake
+    # velocity into a vLead=vEgo "moving lead" that CAN associate with a real
+    # stopped visual lead - the one path that could corrupt longitudinal. The
+    # measured flag is the first gate of snapshot_live_radar_points (dropped
+    # wholesale), so measured=False reproduces the original "reference only,
+    # never consumed" intent exactly. vRel stays NaN for the display consumer.
     vl = self.rcp_hud.vl[ACC_HUD_ADAS_MSG]
     if vl["HasLead"] and vl["LeadingDistance"] in RADAR_HUD_BARS_TO_M:
       if HUD_TRACK_ID not in self.pts:
@@ -116,7 +192,7 @@ class RadarInterface(RadarInterfaceBase):
       pt.vRel = float('nan')
       pt.aRel = float('nan')
       pt.yvRel = float('nan')
-      pt.measured = True
+      pt.measured = False
     else:
       self.pts.pop(HUD_TRACK_ID, None)
 
@@ -126,20 +202,23 @@ class RadarInterface(RadarInterfaceBase):
 
     self.updated_messages.update(self.rcp_tracks.update(can_packets))
     self.updated_messages.update(self.rcp_hud.update(can_packets))
-    if not (self.updated_messages & set(TRACK_MSGS) or ACC_HUD_ADAS_MSG in self.updated_messages):
+    self.updated_messages.update(self.rcp_dist.update(can_packets))
+    watch = set(TRACK_MSGS) | set(DIST_MSGS) | {ACC_HUD_ADAS_MSG}
+    if not (self.updated_messages & watch):
       return None
     self.updated_messages.clear()
 
     ret = structs.RadarData()
     # only the HUD parser is guaranteed present on the car's wired buses;
-    # the track block can be legitimately silent (e.g. radar powered down on
-    # some trims) so its timeout must not raise canError on its own
+    # the track/dist blocks can be legitimately silent (e.g. radar powered
+    # down on some trims) so their timeout must not raise canError on its own
     if not self.rcp_hud.can_valid:
       ret.errors.canError = True
       return ret
 
     if not self._update_tracks():
-      self._update_hud()
+      if not self._update_lead_b7():
+        self._update_hud()
 
     ret.points = list(self.pts.values())
     return ret

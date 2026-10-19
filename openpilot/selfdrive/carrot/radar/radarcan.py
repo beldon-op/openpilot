@@ -5,6 +5,7 @@ import time
 
 from openpilot.cereal import car, messaging
 from openpilot.common.params import Params
+from openpilot.common.raw_params import get_float_param
 from openpilot.common.realtime import Priority, config_realtime_process
 from openpilot.common.runtime_diagnostics import RuntimeDiagnostics
 from openpilot.common.swaglog import cloudlog
@@ -31,6 +32,15 @@ def _rebuild_radar_interface(radar_interface, CP, previous=None):
   recover = getattr(radar, 'recover_from_input_fault', None)
   if previous is not None and type(recovery_api) is int and recovery_api == 1 and callable(recover):
     recover(previous)
+  # BYD synthesized-lead scale (docs/byd-radar-010x.md ⑨): u is pinned 0.25 and
+  # tunable on the Developer panel; injected here because opendbc stays
+  # params-free. This is the carrot analog of sunnypilot's card.py injection -
+  # _rebuild_radar_interface is where both the initial construction and every
+  # input-fault rebuild funnel, so one hook covers both. Other platforms'
+  # RadarInterface simply lacks the attribute. Clamped [0.1, 0.5] like the source.
+  if hasattr(radar, "radar_dist_scale"):
+    u = get_float_param(Params(), "BydRadarDistScale", radar.radar_dist_scale)
+    radar.radar_dist_scale = min(0.5, max(0.1, u))
   return radar
 
 

@@ -38,3 +38,34 @@ def get_int_param(params: Params, key: str, default: int) -> int:
     return int(val) if val else default
   except (OSError, ValueError):
     return default
+
+
+def get_float_param(params: Params, key: str, default: float) -> float:
+  try:
+    return float(params.get(key, return_default=True))
+  except UnknownKeyName:
+    pass
+  except (TypeError, ValueError):
+    return default
+  try:
+    with open(params.get_param_path(key)) as f:
+      val = f.read().strip()
+    return float(val) if val else default
+  except (OSError, ValueError):
+    return default
+
+
+def put_raw_param(params: Params, key: str, value) -> None:
+  """Write a param through the unvalidated storage path. Needed for keys the
+  device's prebuilt params_pyx.so registry does not know yet: Params.put()
+  silently skips those (UnknownKeyName), but the plain file under
+  /data/params/d/<key> is read by get_*_param on every consumer. Once a rebuilt
+  .so registers the key, the registered path wins on read; this write still
+  keeps the file in sync for the fallback."""
+  try:
+    params.put(key, str(value))
+    return
+  except UnknownKeyName:
+    pass
+  with open(params.get_param_path(key), "w") as f:
+    f.write(str(value))

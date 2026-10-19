@@ -206,11 +206,20 @@ HUD_MULTIPLIER = 10 / 9
 
 # HUD-synthesized radar lead: gap-bar midpoint distances, meters (bar 1=near
 # .. 7=far, per 0x32D LeadingDistance VAL_ semantics of SetDistance 1BAR..4BAR).
-# PLACEHOLDERS - 415 logged segments (0.9M lead frames, docs §8.5.7) only ever
-# show bars 1-4 (0.4% / 9.7% / 39.9% / 50.0%; 0/5/6/7 never observed), so
-# absolute meters are unmeasurable offline; calibrate on-road with measured
-# stand-off gaps at each bar before anything control-relevant reads these.
-# RadarInterface only exposes the value; no control path uses it while
-# CP.radarUnavailable stays True (interface.py).
+# SEMANTICS (2026-10-19): the bars are TIME-GAP bands, not fixed distances -
+# bar-flip regression gives tau {0.71, 1.02, 1.4} s at the pinned u=0.25, so a
+# static meters map is only shape-true at one speed. Keep this table as the
+# LAST-RESORT fallback (0x109 silent); the primary synthesized lead uses the
+# continuous 0x109 b7 distance (see RADAR_DIST_SCALE_DEFAULT below).
+# 415 logged segments (0.9M lead frames, docs §8.5.7) only ever show bars 1-4
+# (0.4% / 9.7% / 39.9% / 50.0%; 0/5/6/7 never observed).
 RADAR_HUD_BARS_TO_M: dict[int, float] = {1: 6.0, 2: 13.0, 3: 22.0, 4: 35.0,
                                          5: 50.0, 6: 70.0, 7: 90.0}
+
+# 0x109 b7 distance scale u [m/count], PINNED 2026-10-19 by owner decision
+# (recalled real stop-to-lead gap: 15c -> 3.75 m; docs/byd-radar-010x.md ②).
+# Runtime-tunable via the BydRadarDistScale raw param (Developer panel buttons,
+# default 0.25): radarcan.py injects it into RadarInterface.radar_dist_scale.
+# The gap monitor is scale-free (counts space); only this meters-side synthesis
+# consumes it.
+RADAR_DIST_SCALE_DEFAULT = 0.25
