@@ -213,6 +213,24 @@ HUD_MULTIPLIER = 10 / 9
 # continuous 0x109 b7 distance (see RADAR_DIST_SCALE_DEFAULT below).
 # 415 logged segments (0.9M lead frames, docs §8.5.7) only ever show bars 1-4
 # (0.4% / 9.7% / 39.9% / 50.0%; 0/5/6/7 never observed).
+#
+# COLLISION REGRESSION (2026-10-21, byd-offline-prep A): fitted the HUD bar
+# (0x32D LeadingDistance) against the measured 0x109 b7*u distance over all 415
+# segments (window: AccState 2/3/5 + HasLead=1 + presence==7 + 2<=b7<=245 +
+# vEgo>1; script local_docs/byd/offline_prep_2026-10-21/hud_bar_fit.py, output
+# hud_bar_fit.json). NO bar met the spec gate (>=60 s AND cross-route median
+# spread <=15%): bar1 had only 58 s on a single route; bars 2/3/4 cleared the
+# sample-time gate but cross-route spread was 105% / 72% / 80%, and the median
+# drifts monotonically with vEgo within a bar (bar4: 14 m @ 1-5 km/h -> 45 m @
+# 20-40 km/h). The V0 dry-run independently confirms the mismatch: the HUD
+# fallback point's dRel minus the same-timestamp b7*u residual is median
+# -14.75 m (route2--40), i.e. this table systematically OVER-states the true
+# gap. So the bars are time-gap bands (tau), NOT distance - the meters table is
+# UNCALIBRATED and these values are retained ONLY as the last-resort
+# position-only fallback shape (measured=False, radard never consumes it).
+# V2 must still calibrate on-road with a real ruler; a single-value meters table
+# is structurally the wrong shape (see the 档×速 two-dimensional upgrade proposal
+# in openspec/changes/byd-radar-synth-lead-port/observations.md).
 RADAR_HUD_BARS_TO_M: dict[int, float] = {1: 6.0, 2: 13.0, 3: 22.0, 4: 35.0,
                                          5: 50.0, 6: 70.0, 7: 90.0}
 
