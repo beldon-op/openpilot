@@ -168,3 +168,41 @@
 - (c) HUD 档层 measured=False 丢弃生效确认(liveTracks 有点、radarState 不消费)。
 
 **验证金字塔(路测门禁,§⑩ 路测清单的本仓库版)**:V0=Mac 三套件 49 例 + 归档段离线回放(已确认可行:hour_logs 4 段/415 段 rlog.zst 可喂本仓库纯 Python CANParser);V1=gap 链车上遥测(不过 radarUnavailable 闸);V2=stock ACC 下 dRel/vRel 同屏标定(AlphaLongitudinalEnabled=0,行为中性,观察项 a/b/c);V3=alpha 纵向跟停+瞬态(源工程 ⑩ 清单剩余项)。
+
+## ⑪ HUD 档位对撞回归（2026-10-21，byd-offline-prep A，未标定）
+
+用 415 段实车 rlog 把 HUD 档位（0x32D LeadingDistance）与实测跟车距离（0x109
+b7·u，u=0.25 钉定）对撞，验证 `RADAR_HUD_BARS_TO_M` 占位表。脚本
+`local_docs/byd/offline_prep_2026-10-21/hud_bar_fit.py`，产物 `hud_bar_fit.json`。
+
+窗口判据（design D1）：跟车 engaged（AccState∈{2,3,5} ∧ HasLead=1）+ presence==7
++ 2≤b7≤245 + vEgo>1。按 (路线, 档位, vEgo 分层) 分桶统计 b7·0.25 的中位数/IQR/样本秒数。
+
+**结论：四档全部不满足更新判据（spec 场景「样本不足」），表值保持不变。**
+
+| 档 | 样本秒 | 中位 | 跨路线中位数偏差 | 判定 |
+|---|---|---|---|---|
+| bar1 | 58.3s | 11.75m | 单路线（不足60s） | FAIL 样本 |
+| bar2 | 991.5s | 9.75m | 105.1%（{2:16.0, 3:5.75, 5:6.75}） | FAIL 偏差 |
+| bar3 | 5557.3s | 9.75m | 71.8%（{2:14.5, 3:7.5, 5:12.5}） | FAIL 偏差 |
+| bar4 | 7397.7s | 30.75m | 79.7%（{2:36.5, 3:12.0, 5:30.0}） | FAIL 偏差 |
+
+**vEgo 漂移形态坐实**（design D1 升级条款触发）——同一档位中位数随车速单调上升：
+
+| 档 | 1-5km/h | 5-10 | 10-20 | 20-40 |
+|---|---|---|---|---|
+| bar2 | 5.5 | 6.5 | 10.5 | 17.75 |
+| bar3 | 7.25 | 9.75 | 15.25 | 20.25 |
+| bar4 | 14.0 | 15.5 | 31.0 | 45.0 |
+
+即 HUD 档位是**时距带（τ s × vEgo）而非固定距离**，与 ②/⑧「档位是厂商融合后的
+量化」一致。单值米表在结构上就是错的形状。
+
+**dry-run 独立佐证**（V0，见任务 3 产出）：route2--40 段 HUD 兜底点 dRel 与同期
+b7·0.25 残差中位 **−14.75m**（表值系统性偏大），route5--30 段 +18.75m 聚于 22m
+单值——表在低速/高速两端的错标方向不同，不可用一个标量修。
+
+**处置**：`RADAR_HUD_BARS_TO_M` 注释登记本节证据 + 「UNCALIBRATED」声明（不改数值）。
+「档×速二维表」升级提案登记于 `openspec/changes/byd-radar-synth-lead-port/observations.md`。
+V2 上车复核仍用真实尺子（原门禁不变）。measured=False 闸使表在 radard 侧永不被消费，
+故错标不直接进纵向控制——但 liveTracks 显示会用，UI 距离读数在跟车时会偏大。
