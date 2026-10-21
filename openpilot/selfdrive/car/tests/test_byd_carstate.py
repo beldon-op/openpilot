@@ -2,9 +2,10 @@ from collections import defaultdict
 
 import pytest
 
-from opendbc.car import Bus, structs
+from opendbc.can import CANPacker, CANParser
+from opendbc.car import Bus, CanData, structs
 from opendbc.car.byd.carstate import AVAIL_FALL_DEBOUNCE_TIME, BOOT_LATCH_HOLD_TIME, CarState
-from opendbc.car.byd.values import CAR
+from opendbc.car.byd.values import CAR, DBC
 
 
 class FakeParser:
@@ -180,3 +181,59 @@ class TestBydStalkBlinkers:
       pt.vl['STALKS']['TURN_SIGNAL_SWITCH'] = switch
       ret = cs.update({Bus.pt: pt, Bus.adas: adas})
       assert (bool(ret.leftBlinker), bool(ret.rightBlinker)) == expected
+
+
+class TestBydYawRate:
+  """bus0 0x222 YAW_RATE -> carState.yawRate (openspec byd-fingerprint-yaw-hardening;
+  dbc from carrot2, three-way validated against kinematic yaw on the real car:
+  corr 0.90-0.97, slope ~1.0, left positive - docs/byd-carrot2-reference-2026-10-21.md s7.6)."""
+
+  def run_yaw(self, yaw_rate: float, yaw_offset: float) -> float:
+    cs = make_carstate()
+    pt, adas = FakeParser(), FakeParser()
+    pt.vl['YAW_RATE']['YawRate'] = yaw_rate
+    pt.vl['YAW_RATE']['YawRateOffset'] = yaw_offset
+    ret = cs.update({Bus.pt: pt, Bus.adas: adas})
+    return float(ret.yawRate)
+
+  def test_parser_init_zero_is_zero(self):
+    # vl before the first frame is the 0.0 init (parser.py _add_message
+    # signals_dict) - straight difference, stays 0.0
+    assert self.run_yaw(0.0, 0.0) == 0.0
+
+  def test_all_zero_raw_guard_is_zero(self):
+    # ECU-not-ready pattern: factor/offset on raw 0/0 decodes to pure
+    # garbage (-2.094)-(-0.13) = -1.964 rad/s - never a real sample
+    # (straight driving idles at mid-scale raw ~981/61)
+    assert self.run_yaw(-2.094, -0.13) == 0.0
+
+  def test_difference_and_left_positive_sign(self):
+    # yawRate is a capnp float32 field - tolerance follows that precision
+    assert self.run_yaw(-1.99, -2.09) == pytest.approx(0.10, abs=1e-6)
+    assert self.run_yaw(-2.09, -1.99) == pytest.approx(-0.10, abs=1e-6)
+
+
+class TestBydYawDbcRoundtrip:
+  """0x222/0x223 registered in byd_general_pt.dbc: packer->parser roundtrip
+  pins the signal layout (Intel @1+ 12-bit fields, byte6-low Counter)"""
+
+  def test_roundtrip(self):
+    dbc = DBC[CAR.BYD_SONG_PLUS_DMI_22][Bus.pt]
+    pk = CANPacker(dbc)
+    cp = CANParser(dbc, [("YAW_RATE", 50), ("AXAY", 50)], 0)
+    t_ns = 0
+    for i in range(10):
+      frames = []
+      addr, dat, src = pk.make_can_msg("YAW_RATE", 0,
+                                       {"YawRate": 0.10, "YawRateOffset": -0.02, "Counter": i})
+      frames.append(CanData(addr, dat, src))
+      addr, dat, src = pk.make_can_msg("AXAY", 0,
+                                       {"Ax": 1.0, "AxOffset": 0.0, "Counter": i})
+      frames.append(CanData(addr, dat, src))
+      cp.update([(t_ns, frames)])
+      t_ns += 20_000_000
+    # 12-bit resolution: YAW 0.002133 rad/s per count, AX 0.027 m/s2 per count
+    assert cp.vl["YAW_RATE"]["YawRate"] == pytest.approx(0.10, abs=0.0022)
+    assert cp.vl["YAW_RATE"]["YawRateOffset"] == pytest.approx(-0.02, abs=0.0022)
+    assert cp.vl["AXAY"]["Ax"] == pytest.approx(1.0, abs=0.028)
+    assert int(cp.vl["YAW_RATE"]["Counter"]) == 9

@@ -174,6 +174,20 @@ class CarState(CarStateBase):
     # EPS-reported wheel rate in deg/s (4 deg/s/bit, 0-1020); used by the LKAS
     # envelope gate to tell a settled wheel from a full-lock-speed swing
     ret.steeringRateDeg = cp.vl["EPS"]["SteeringAngleRate"]
+    # bus0 0x222 YAW_RATE (dbc from carrot2 byd_han_dmev_2020.dbc, validated
+    # against kinematic yaw on our car: corr 0.90-0.97, slope ~1.0, left
+    # positive - docs/byd-carrot2-reference-2026-10-21.md s7.6). Guard: fields
+    # decoded from an all-zero raw payload are the ECU-not-ready pattern -
+    # (0*0.002133-2.094)-(0*0.002133-0.13) = -1.964 rad/s of pure offset-factor
+    # garbage, never a real sample (straight driving idles at raw ~981/61,
+    # i.e. mid-scale). Before the very first frame the parser leaves vl at its
+    # 0.0 init (no factor applied) and both branches below yield 0.0 anyway.
+    yaw_rate = cp.vl["YAW_RATE"]["YawRate"]
+    yaw_offset = cp.vl["YAW_RATE"]["YawRateOffset"]
+    if abs(yaw_rate + 2.094) < 1e-9 and abs(yaw_offset + 0.13) < 1e-9:
+      ret.yawRate = 0.0
+    else:
+      ret.yawRate = yaw_rate - yaw_offset
     ret.steeringTorque = cp.vl["ACC_EPS_STATE"]["SteerDriverTorque"]
     ret.steeringTorqueEps = cp.vl["ACC_EPS_STATE"]["MainTorque"]
     # 5-frame debounce: single-frame torque noise spikes must not flap
@@ -309,6 +323,7 @@ class CarState(CarStateBase):
       ("PEDAL", 20),             # 0x342
       ("PCM_BUTTONS", 10),       # 0x3b0
       ("BSD_RADAR", 10),         # 0x418
+      ("YAW_RATE", 50),          # 0x222, real-vehicle rate ~50 Hz (NOT nominal 60)
     ]
     adas_messages = [
       ("ACC_HUD_ADAS", 50),      # 0x32d

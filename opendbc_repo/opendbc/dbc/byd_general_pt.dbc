@@ -367,6 +367,26 @@ BO_ 266 RADAR_PRESENCE_10A: 8 XXX
  SG_ MSG_10A_B6 : 55|8@0+ (1,0) [0|255] "" XXX
  SG_ MSG_10A_B7 : 63|8@0+ (1,0) [0|255] "" XXX
 
+; --------------------------------------------------------------------------------
+; 2026-10-21: chassis dynamics frames, verbatim from carrot2 (huheas/carrotpilot)
+; byd_han_dmev_2020.dbc BO_ 546/547. YAW_RATE was validated against kinematic yaw
+; on our own car: corr 0.90-0.97, regression slope ~1.0, sign matches the steering
+; angle convention (left positive); observed frame rate ~50 Hz, NOT the nominal 60
+; (docs/byd-carrot2-reference-2026-10-21.md s7.6). AXAY is registered here but has
+; NO consumer in carstate yet. The AxOffset factor 0.027127 is the carrot2 original
+; - suspected typo (Ax uses 0.027167); kept verbatim, no validation basis to change.
+; Bit order is Intel @1+ exactly as carrot2 defines (our kinematic check decoded
+; bytes 0-2 little-endian with the same field split and matched EPS-derived yaw).
+BO_ 546 YAW_RATE: 8 XXX
+ SG_ YawRate : 0|12@1+ (0.002133,-2.094) [-2.0|2.0] "rad/s" XXX
+ SG_ YawRateOffset : 12|12@1+ (0.002133,-0.13) [-0.1|0.1] "rad/s" XXX
+ SG_ Counter : 48|4@1+ (1,0) [0|15] "" XXX
+
+BO_ 547 AXAY: 8 XXX
+ SG_ Ax : 0|12@1+ (0.027167,-21.593) [-10.0|10.0] "m/s^2" XXX
+ SG_ AxOffset : 12|12@1+ (0.027127,-21.593) [-1.0|1.0] "m/s^2" XXX
+ SG_ Counter : 48|4@1+ (1,0) [0|15] "" XXX
+
 CM_ BO_ 257 "transport retransmission twin of 0x105 (99.7-100 pct byte-identical incl b0 checksum); do NOT use as redundancy/checksum source for 0x109";
 CM_ BO_ 258 "sensor-health channel A (pair with 0x106); b4 slow physical quantity ~152 counts, meaning UNKNOWN - all bytes MSG placeholders";
 CM_ BO_ 261 "transport retransmission twin of 0x101 (see BO_ 257)";
