@@ -131,6 +131,40 @@ Mac 适配三处（已改，设备上全部为 no-op）：
 
 定位升级：此前「闭环验证优先 Linux PC/设备」的结论可改为——**M4 本机就能跑 card/controlsd 闭环回归，数值与设备基线可互相校验**；设备侧的不可替代价值收敛到 panda 固件、真机 venv 依赖一致性与 onroad 编排。
 
+## 门禁：byd_bench_gate.py（2026-10-21 起，取代上方散文基线）
+
+一条命令给三态结论，OTA 前检查单以此为准：
+
+```bash
+cd <repo 根>
+.venv/bin/python scripts/byd_bench_gate.py                 # 校验+跑链+比 golden
+.venv/bin/python scripts/byd_bench_gate.py --check-determinism   # 每链×段连跑两次自证确定
+```
+
+- **基线唯一事实源 = `scripts/byd_bench_golden.json`**（语料段 sha256、锚定 commit、全精度
+  n/mean/max、归因表 `drift_notes`）。本文上方 10-08/09 的表格数字为历史记录。
+  当前 golden：主段 card `21.586/174`（与旧基线逐位同）、全链 `43.843/200`（43.851→43.843
+  归因 d5fc77c4 合成雷达）；副段 card `13.138/72`、全链 `28.437/130`。
+- **预检**：先校验两段 rlog.zst 的 sha256（不符=FAIL，数据被换则结论无效）；每次运行自动
+  `rm -rf /tmp/params`（参数持久是 Mac 唯一环境噪声源，落在 gate 里杜绝忘清）。
+- **退出码**：`0` PASS；`1` REGRESSION / FLAKY / 哈希不符 / --accept 缺归因被拒；
+  `2` 环境错误（runner 起不来，非回归）；`3` SKIP（语料不在本地——**SKIP≠过**，检查单执行人
+  须在自己机器上跑绿一次）。
+- **漂移必须带出处**：new≠golden 时默认只报不写。确属预期变更：先在 golden `drift_notes[]`
+  补 `{chain, metric, old, new, commit, mechanism}` 归因条目，再 `--accept`——无归因条目
+  `--accept` 会拒绝。归因不出 = 按回归拦下。
+- **语料不在仓库**（415 段 26GB 级），期望路径记录于 golden `corpus_base`，可用
+  `--corpus-dir` 覆盖。
+
+⚠️ **2026-10-21 harness 修复**（变更 byd-bench-golden-replay design D3.1）：HEAD 直接跑 bench
+会得到退化数字——40ea446e 引入的上游 `LateralStartupGate` 要求 card 的
+modelV2/liveParameters/livePose/selfdriveState 就绪，而 process_replay 的 card 输入集缺这 4 个
+→ 台架闸门永不开、latActive 帧力矩清零 → card-only 漂到日志原值幅值（main 46.601/200）、
+且两档链输出逐位相同（controlsd/雷达侧改动对 bench 不可见）。另 Mac 垫片顺序在 40ea446e 后
+失效（process_replay 导入链早绑原始 Params → card 崩 `/dev/shm/params`、主进程死等）。
+两处已在 `scripts/byd_replay_bench.py` 内修复（垫片前移 + get_process_config 补输入），
+CLI 与 diff 计算语义不变；golden 以修复后 harness 测定。
+
 ## 实时 replay（PC 侧）与设备侧的分工
 
 | 目的 | 方案 |
