@@ -4,7 +4,8 @@ import pytest
 
 from openpilot.common.constants import CV
 from openpilot.cereal import car
-from openpilot.selfdrive.car.cruise import VCruiseCarrot
+from openpilot.selfdrive.car.cruise import V_CRUISE_MAX, VCruiseCarrot
+from openpilot.selfdrive.car.toyota_pcm_speed import ToyotaPcmSetSpeedSync
 
 
 def make_v_cruise_helper(brand, pcm_cruise, speed_from_pcm, prev_kph, available_last):
@@ -12,6 +13,11 @@ def make_v_cruise_helper(brand, pcm_cruise, speed_from_pcm, prev_kph, available_
   helper.CP = SimpleNamespace(brand=brand, pcmCruise=pcm_cruise)
   helper.params = SimpleNamespace(get_int=lambda k: speed_from_pcm, get_bool=lambda k: False, get_float=lambda k: 0.0)
   helper.speed_from_pcm = speed_from_pcm
+  # 40ea446e: update_v_cruise() now consults the PCM sync (cruise.py:374);
+  # the __new__ scaffold must provide it like VCruiseCarrot.__init__ does
+  # (cruise.py:171). Non-toyota brands return None (toyota_pcm_speed.py:22-31),
+  # so this never overrides the BYD stalk-owned branch (cruise.py:395).
+  helper.toyota_pcm_speed_sync = ToyotaPcmSetSpeedSync(V_CRUISE_MAX)
   helper.frame = 0
   helper.is_metric = True
   helper.v_cruise_kph = prev_kph
