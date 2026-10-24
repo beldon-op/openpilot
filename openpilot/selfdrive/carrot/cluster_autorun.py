@@ -81,33 +81,8 @@ def _is_usb_disconnect_error(exc: BaseException) -> bool:
     return False
 
 
-def _s3_transport_failure_reason(exc: BaseException) -> str | None:
-    """Only shorten a transport failure inside the known S3 wrappers."""
-    current: BaseException | None = exc
-    seen: set[int] = set()
-    s3_failure = False
-    transport_error: OSError | None = None
-    while current is not None and id(current) not in seen:
-        seen.add(id(current))
-        if str(current) in (
-            "S3 display disconnected; reconnect required",
-            "S3 display connection failed; waiting for rediscovery",
-        ):
-            s3_failure = True
-        if isinstance(current, OSError):
-            transport_error = current
-        current = current.__cause__ or current.__context__
-    if not s3_failure or transport_error is None:
-        return None
-    detail = " ".join(str(transport_error).split())[:160]
-    return f"{type(transport_error).__name__}: {detail}"
-
-
 def _report_cluster_failure(exc: BaseException) -> None:
-    reason = _s3_transport_failure_reason(exc)
-    if reason is not None:
-        print(f"[cluster_autorun] S3 Wi-Fi disconnected ({reason}); retrying in {RETRY_INTERVAL_S:.0f}s", flush=True)
-    elif _is_usb_disconnect_error(exc):
+    if _is_usb_disconnect_error(exc):
         print(f"[cluster_autorun] USB display disconnected; retrying in {RETRY_INTERVAL_S:.0f}s", flush=True)
     else:
         print(f"[cluster_autorun] cluster HUD failed: {exc}; retrying in {RETRY_INTERVAL_S:.0f}s", flush=True)
@@ -379,7 +354,6 @@ def _wait_for_usb_uevent(sock: socket.socket | None, timeout_s: float, expected_
 
 def _wait_for_supported_usb_device(params: Params, expected_product_id: int, reason: str) -> int | None:
     from cluster_usb_display import find_supported_usb_product, product_id_for_hud_mode, product_label
-    from cluster_wifi_protocol import load_config as load_wifi_config
 
     print(
         f"[cluster_autorun] {product_label(expected_product_id)} {reason}; "
@@ -419,9 +393,6 @@ def _wait_for_supported_usb_device(params: Params, expected_product_id: int, rea
                 if current_product_id != expected_product_id:
                     expected_product_id = current_product_id
                     next_fallback_scan = now
-                if load_wifi_config() is not None:
-                    print("[cluster_autorun] S3 Wi-Fi registration detected; rechecking output", flush=True)
-                    return None
                 next_hud_check = now + HUD_CHECK_INTERVAL_S
 
             now = time.monotonic()
@@ -445,19 +416,9 @@ def _turn_off_supported_usb_device(expected_product_id: int, reason: str) -> boo
     _configure_autorun_locale()
 
     from cluster_usb_display import TuringUsbDisplay, find_supported_usb_product, product_label
-    from cluster_wifi_display import S3WifiDisplay
-    from cluster_wifi_protocol import load_config
-
-    try:
-        config = load_config() if expected_product_id == 0x0092 else None
-    except (ValueError, RuntimeError, OSError):
+    if find_supported_usb_product(expected_product_id) is None:
         return False
-    if config is not None:
-        display = S3WifiDisplay(config, brightness=0, display_fps=0, expected_product_id=expected_product_id)
-    else:
-        if find_supported_usb_product(expected_product_id) is None:
-            return False
-        display = TuringUsbDisplay(brightness=0, display_fps=0, expected_product_id=expected_product_id)
+    display = TuringUsbDisplay(brightness=0, display_fps=0, expected_product_id=expected_product_id)
     try:
         display.open()
         print(
@@ -583,8 +544,8 @@ def main() -> None:
     _ensure_cluster_paths()
     from cluster_graphics_cleanup import ensure_clean_autorun_process
     ensure_clean_autorun_process()
+    from cluster_profile import release_finished_session_memory
     from cluster_usb_display import find_supported_usb_product, product_id_for_hud_mode, product_label
-    from cluster_wifi_protocol import load_config as load_wifi_config
 
     scheduler = DisplayScheduler(4, enabled=TICI)
     scheduler.update(False, force=True)
@@ -608,9 +569,7 @@ def main() -> None:
 
         _wait_for_usbgpu_startup(params)
 
-        if load_wifi_config() is not None:
-            print("[cluster_autorun] discovering registered S3 Wi-Fi HUD", flush=True)
-        elif find_supported_usb_product(expected_product_id) is None:
+        if find_supported_usb_product(expected_product_id) is None:
             if not TICI:
                 print(
                     f"[cluster_autorun] {product_label(expected_product_id)} not found on PC; "
@@ -627,8 +586,10 @@ def main() -> None:
                         flush=True,
                     )
                     traceback.print_exc()
-                    time.sleep(RETRY_INTERVAL_S)
-                    continue
+                finally:
+                    release_finished_session_memory()
+                time.sleep(RETRY_INTERVAL_S)
+                continue
             found_product_id = _wait_for_supported_usb_device(
                 params,
                 expected_product_id,
@@ -668,6 +629,12 @@ def main() -> None:
             )
         except Exception as exc:
             _report_cluster_failure(exc)
+        finally:
+            # run_demo unfreezes on exit. Collect only after its stack and the
+            # handled exception are gone, before another renderer allocates.
+            # Otherwise failed pipeline traceback cycles survive the retry wait
+            # and overlap the next session until its late initialization GC.
+            release_finished_session_memory()
         time.sleep(RETRY_INTERVAL_S)
 
 

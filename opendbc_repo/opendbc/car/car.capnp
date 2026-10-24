@@ -283,11 +283,22 @@ struct CarState {
   blinkerLever @102 :UInt8;           # turn-signal lever position: 0 released, 1 one-touch (half) detent, 2 latched
   blinkerLamp @103 :UInt8;            # turn-signal lamp right now (no hold): 0 dark, 1 left lit, 2 right lit
 
+  vehicleGps @104 :VehicleGps;
+  struct VehicleGps {
+    available @0 :Bool;
+    valid @1 :Bool; # receive/continuity checks, not a decoded satellite fix flag
+    latitude @2 :Float64;
+    longitude @3 :Float64;
+    sampleMonoTime @4 :UInt64;
+    headingDeg @5 :Float32; # course derived from consecutive positions
+    headingValid @6 :Bool;
+  }
+
   # BYD T8 forward-radar gap monitor (docs/byd-radar-010x.md §落地建议/T8,
   # design stats §④e/§④f): 0x109 b7 closing across its HUD-gear band boundary.
   # Telemetry only - consumers behind the BydRadarGapGate param (default off).
-  radarGapClosing @104 :Bool;  # gap ratio r=b7/vEgo crossed the band's lower boundary downward, debounced
-  radarGapNew @105 :Bool;      # target newly became radar-visible (capture leads the HUD gear by >=10 s)
+  radarGapClosing @105 :Bool;  # gap ratio r=b7/vEgo crossed the band's lower boundary downward, debounced
+  radarGapNew @106 :Bool;      # target newly became radar-visible (capture leads the HUD gear by >=10 s)
 
   # Optional original vehicle receive signal. Separate from torque/override.
   struct SteeringTouch {

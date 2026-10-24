@@ -18,9 +18,12 @@ from openpilot.selfdrive.modeld.jetlink.phase import Publisher as PhasePublisher
 from openpilot.selfdrive.modeld.jetlink.mac import prepare, PreparationDeferred
 from openpilot.selfdrive.modeld.jetlink.compat import ProtocolChoice
 from openpilot.selfdrive.modeld.jetlink.mobile import transport_mode, setup_gadget, MobileCable, AutoTransport, MobileLinkError
+from openpilot.selfdrive.modeld.jetlink.power import UsbInputPower
+from openpilot.selfdrive.modeld.jetlink.scheduling import UsbCompletionPriority
 from openpilot.selfdrive.modeld.jetlink.contracts import model_name
 from openpilot.selfdrive.modeld.jetlink.selection import ModelChanged, check_loaded
-from openpilot.selfdrive.modeld.jetlink.startup import CAPABILITY as BOOT_UPDATE_CAPABILITY, wait_for_boot_update
+from openpilot.selfdrive.modeld.jetlink.startup import (CAPABILITY as BOOT_UPDATE_CAPABILITY, wait_for_boot_update,
+                                                       RuntimeHandoff, ConnectionStartup)
 from jetlink.client import JetlinkClient
 from jetlink.transport.base import LinkError, LinkTimeout
 from jetlink.transport.ffs import FfsTransport
@@ -194,7 +197,7 @@ def _serve_local(listener, client, peer, publisher, phase, wifi=None):
   from openpilot.common.runtime_diagnostics import RuntimeDiagnostics
   from openpilot.common.swaglog import cloudlog
   params = Params()
-  diagnostics = RuntimeDiagnostics('jetlinkd', cloudlog.event)
+  diagnostics = RuntimeDiagnostics('jetlinkd', cloudlog.event, peak_metric='usb_exchange_ms')
   last_status = 0.
   last_ping = time.monotonic()
   telemetry_updated = 0.
@@ -308,6 +311,7 @@ def _serve_local(listener, client, peer, publisher, phase, wifi=None):
             ipc_receive_ms=(received-receive_started)*1000,
             request_parse_ms=(started-received)*1000,
             usb_send_ms=(sent-started)*1000,
+            usb_exchange_ms=(completed-started)*1000,
             phase_ms=(phase_done-sent)*1000,
             hud_ms=(hud_done-phase_done)*1000,
             usb_response_ms=(completed-hud_done)*1000,
@@ -361,14 +365,20 @@ def main():
   usb_mode = None
   tcp_seen = False
   mobile_unavailable = False
+  startup = ConnectionStartup()
+  usb_power = UsbInputPower()
   try:
     while True:
+      usb_power.step()
       update_affinity()
       if cleanup_error:
         publish('blocked', peer=None, error=cleanup_error)
         time.sleep(1)
         continue
       if SESSION_DETACHED or not host_attached():
+        from openpilot.common.params import Params
+        road_params = Params()
+        startup.absent(offroad=road_params.get_bool('IsOffroad'), onroad=road_params.get_bool('IsOnroad'))
         if owner is not None or cable is not None:
           cleanup_error = close_resources(cable, owner)
           owner = cable = None
@@ -392,6 +402,9 @@ def main():
       client = None
       wifi = None
       transport = None
+      usb_priority = UsbCompletionPriority()
+      preparing = False
+      startup.begin(time.monotonic())
       try:
         publish('connecting', peer=peer, protocol=protocol.version)
         gc.collect()
@@ -452,6 +465,7 @@ def main():
           peer = probe_usb(client, wire_protocol)
         else:
           peer = greet(client, wire_protocol)
+        preparing = True
         if TRANSPORT_MODE == 'auto':
           selected = classify_auto_peer(peer, 'tcp' if transport is not owner else 'usb')
           if selected is None and transport is owner and legacy_usb_peer(peer):
@@ -488,10 +502,15 @@ def main():
         if spec is None:
           raise ValueError('Jetlink preparation completed without a model spec')
         # Warm independently of camera/modeld; every real session resets state.
+        usb_priority.start(peer, bulk_usb=transport is owner)
         for frame in range(10):
           client.infer(np.zeros(spec.warped_shape, np.uint8), np.zeros(spec.packed_nelem, np.float32), frame, reset=True)
         log.info('Jetlink ready: %s', peer)
+        startup.ready_once = True
         serve_local(listener, client, peer, wifi)
+      except RuntimeHandoff as exc:
+        log.info('%s', exc)
+        publish('connecting', peer=peer, preparation={'stage': 'runtime-handoff'})
       except PreparationDeferred as exc:
         log.info('%s', exc)
         publish('loading', peer=peer, preparation={'stage': 'waiting', 'message': str(exc)})
@@ -507,8 +526,12 @@ def main():
         else:
           publish('retrying', peer=None, error=str(exc)[:300])
       except Exception as exc:
-        log.exception('Jetlink connection failed')
-        publish('retrying', peer=peer, error=str(exc)[:300])
+        if startup.waiting(exc, now=time.monotonic(), preparing=preparing):
+          log.info('Waiting for initial Jetlink handshake: %s', exc)
+          publish('connecting', peer=peer, error=str(exc)[:300], preparation={'stage': 'waiting-host'})
+        else:
+          log.exception('Jetlink connection failed')
+          publish('retrying', peer=peer, error=str(exc)[:300])
       finally:
         ACTIVE_UDC = None
         if client is not None and client.last_state is not None and 'carrot_hud_connected' in client.last_state:
@@ -517,7 +540,7 @@ def main():
             Params().put_bool_nonblocking('ClusterHudConnected', False)
           except Exception:
             log.exception('Jetlink HUD cleanup failed')
-        cleanup_error = close_resources(wifi, client) or cleanup_error
+        cleanup_error = close_resources(usb_priority, wifi, client) or cleanup_error
         if client is None and transport is not owner:
           cleanup_error = close_resources(transport) or cleanup_error
         if TRANSPORT_MODE not in ('auto', 'ios'):

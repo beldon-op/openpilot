@@ -8,6 +8,45 @@ MESSAGE = 0x4003
 RELEASE = Path(__file__).with_name('host_release.json')
 
 
+class RuntimeHandoff(ConnectionError):
+  """The boot gate deliberately handed its transport to the selected runtime."""
+
+
+class ConnectionStartup:
+  """Bounded handshake grace for an attachment after confirmed offroad absence."""
+  def __init__(self):
+    self.started = None
+    self.ready_once = False
+
+  def absent(self, *, offroad, onroad):
+    # jetlinkd survives ignition cycles. A previous drive's successful session
+    # must not turn the next cold boot's unanswered HELLO into a red fault.
+    # A dropout onroad (or contradictory/unknown road state) never rearms this.
+    if offroad and not onroad:
+      self.started = None
+      self.ready_once = False
+
+  def begin(self, now):
+    if self.started is None:
+      self.started = now
+
+  def waiting(self, error, *, now, preparing):
+    return (self.started is not None and
+            initial_connection_wait(error, elapsed=now - self.started,
+                                    ready_once=self.ready_once, preparing=preparing))
+
+
+def initial_connection_wait(error, *, elapsed, ready_once, preparing):
+  # Only an unanswered first handshake is ordinary startup. Engine/model
+  # errors, unsafe cleanup and failures after a working session remain errors.
+  from jetlink.transport.base import LinkError, LinkTimeout
+  no_reader = (isinstance(error, LinkError)
+               and str(error).startswith(('gadget write had no reader for ',
+                                          'gadget write had no reader before deadline;')))
+  return (not ready_once and not preparing and 0 <= elapsed < 120
+          and (isinstance(error, (TimeoutError, LinkTimeout)) or no_reader))
+
+
 def wait_for_boot_update(client, peer, wifi, connected, publish, sleep=time.sleep):
   if peer.get('carrot_host') != 'jetson' or peer.get(CAPABILITY) is not True:
     return
@@ -26,4 +65,6 @@ def wait_for_boot_update(client, peer, wifi, connected, publish, sleep=time.slee
       break
     sleep(.5)
   # The gate has no model. A fresh connection must greet the real server.
-  raise ConnectionError('Jetson boot gate ended; reconnecting to runtime')
+  if not connected():
+    raise ConnectionError('Jetson disconnected during boot release check')
+  raise RuntimeHandoff('Jetson boot gate ended; reconnecting to runtime')
