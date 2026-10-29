@@ -16,6 +16,7 @@ import pyray as rl
 
 from openpilot.common.transformations.camera import DEVICE_CAMERAS, view_frame_from_device_frame
 from openpilot.common.transformations.orientation import rot_from_euler
+from openpilot.selfdrive.assets.fonts.cjk_codepoints import cjk_font_codepoints
 from openpilot.selfdrive.carrot.deceleration_source import navigation_status_presentation
 from openpilot.selfdrive.carrot.signal_display import SignalDisplayReader, project_box
 from openpilot.selfdrive.carrot.lead_brake_lights import BrakeDisplayReader
@@ -107,6 +108,7 @@ SELFDRIVE_DIR = CLUSTER_DIR.parents[1]
 OPENPILOT_FONT_DIR = SELFDRIVE_DIR / "assets" / "fonts"
 OPENPILOT_ADDON_FONT_DIR = SELFDRIVE_DIR / "assets" / "addon" / "font"
 KAIGEN_GOTHIC_KR_BOLD_FONT_PATH = OPENPILOT_FONT_DIR / "KaiGenGothicKR-Bold.ttf"
+MISANS_MEDIUM_FONT_PATH = OPENPILOT_FONT_DIR / "MiSans-Medium.ttf"
 JETBRAINS_MONO_FONT_PATH = OPENPILOT_FONT_DIR / "JetBrainsMono-Medium.ttf"
 VEHICLE_MODEL_PATH = CLUSTER_DIR / "assets" / "models" / "cybertruck" / "cybertruck_cluster.obj"
 TPMS_CAR_ICON_PATH = CLUSTER_DIR / "assets" / "images" / "tpms_toy_car.png"
@@ -378,6 +380,9 @@ NAVI_MODE_MAP_X = NAVI_MODE_LEFT_W
 NAVI_MODE_MAP_W = 880.0
 NAVI_MODE_RIGHT_X = NAVI_MODE_MAP_X + NAVI_MODE_MAP_W
 NAVI_MODE_RIGHT_W = DESIGN_WIDTH - NAVI_MODE_RIGHT_X
+# CJK atlas base size: GB2312-1 + zh/ja translations at 92px keeps the atlas
+# at 8192x4096 (~134 MB RGBA) while HUD text up to ~90px stays near 1:1.
+CJK_FONT_BASE_SIZE = 92
 KOREAN_FONT_BASE_SIZE = 32
 SYSTEM_STATS_REFRESH_SECONDS = 1.0
 TEXT_MEASURE_CACHE_LIMIT = 1024
@@ -926,6 +931,8 @@ class ClusterUiRenderer:
         self._window_open = False
         self._font = None
         self._owns_font = False
+        self._cjk_font = None
+        self._owns_cjk_font = False
         self._korean_font = None
         self._owns_korean_font = False
         self._capture_target = None
@@ -1215,6 +1222,7 @@ class ClusterUiRenderer:
             self._profile_add("renderer.open.set_target_fps", profile_stage)
         profile_stage = self._profile_start()
         self._font = self._load_font()
+        self._cjk_font = self._load_cjk_font()
         self._korean_font = self._load_korean_font()
         self._profile_add("renderer.open.load_font", profile_stage)
         profile_stage = self._profile_start()
@@ -1339,10 +1347,14 @@ class ClusterUiRenderer:
             self._navi_yuv_shader_locations = {}
         if self._owns_font and self._font is not None:
             rl.unload_font(self._font)
+        if self._owns_cjk_font and self._cjk_font is not None:
+            rl.unload_font(self._cjk_font)
         if self._owns_korean_font and self._korean_font is not None:
             rl.unload_font(self._korean_font)
         self._font = None
         self._owns_font = False
+        self._cjk_font = None
+        self._owns_cjk_font = False
         self._korean_font = None
         self._owns_korean_font = False
         if self._vehicle_model is not None:
@@ -2808,11 +2820,34 @@ class ClusterUiRenderer:
         self._owns_font = False
         return rl.get_font_default()
 
-    def _load_korean_font(self):
+    def _load_cjk_font(self):
         codepoints = self._navi_font_codepoints()
         glyph_buffer = rl.ffi.new("int[]", codepoints)
         glyphs = rl.ffi.cast("int *", glyph_buffer)
         for candidate in self._font_candidates():
+            if not candidate.exists():
+                continue
+            try:
+                rl.set_trace_log_level(rl.TraceLogLevel.LOG_ERROR)
+                font = rl.load_font_ex(str(candidate), CJK_FONT_BASE_SIZE, glyphs, len(codepoints))
+                rl.set_trace_log_level(rl.TraceLogLevel.LOG_WARNING)
+                if font.texture.id > 0:
+                    rl.set_texture_filter(font.texture, rl.TextureFilter.TEXTURE_FILTER_BILINEAR)
+                    self._owns_cjk_font = True
+                    return font
+            except Exception as exc:
+                rl.set_trace_log_level(rl.TraceLogLevel.LOG_WARNING)
+                print(f"Cluster CJK font load failed for {candidate}: {exc}")
+        self._owns_cjk_font = False
+        return None
+
+    def _load_korean_font(self):
+        # MiSans has no Hangul glyphs; Korean cluster labels fall back to the
+        # legacy KaiGen copy when present (32px Hangul-only atlas as before).
+        codepoints = self._korean_font_codepoints()
+        glyph_buffer = rl.ffi.new("int[]", codepoints)
+        glyphs = rl.ffi.cast("int *", glyph_buffer)
+        for candidate in self._korean_font_candidates():
             if not candidate.exists():
                 continue
             try:
@@ -2829,14 +2864,35 @@ class ClusterUiRenderer:
         self._owns_korean_font = False
         return None
 
+    def _korean_font_candidates(self) -> list[Path]:
+        return [
+            KAIGEN_GOTHIC_KR_BOLD_FONT_PATH,
+            OPENPILOT_ADDON_FONT_DIR / "KaiGenGothicKR-Bold.ttf",
+            Path("/data/openpilot/openpilot/selfdrive/assets/fonts/KaiGenGothicKR-Bold.ttf"),
+            Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts" / "malgun.ttf",
+        ]
+
+    @staticmethod
+    @lru_cache(maxsize=1)
+    def _korean_font_codepoints() -> tuple[int, ...]:
+        return (
+            *range(0x20, 0x0250),
+            *range(0x2000, 0x2070),
+            0x20A9,
+            *range(0x3131, 0x3190),
+            *range(0xAC00, 0xD7A4),
+        )
+
     def _font_candidates(self) -> list[Path]:
         return [
+            MISANS_MEDIUM_FONT_PATH,
+            OPENPILOT_ADDON_FONT_DIR / "MiSans-Medium.ttf",
             KAIGEN_GOTHIC_KR_BOLD_FONT_PATH,
             OPENPILOT_ADDON_FONT_DIR / "KaiGenGothicKR-Bold.ttf",
             Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts" / "malgun.ttf",
             JETBRAINS_MONO_FONT_PATH,
             OPENPILOT_FONT_DIR / "JetBrainsMono-Bold.ttf",
-            Path("/data/openpilot/openpilot/selfdrive/assets/fonts/KaiGenGothicKR-Bold.ttf"),
+            Path("/data/openpilot/openpilot/selfdrive/assets/fonts/MiSans-Medium.ttf"),
             Path("/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Medium.ttf"),
             Path("/usr/share/fonts/TTF/JetBrainsMono-Medium.ttf"),
             Path("/usr/local/share/fonts/JetBrainsMono-Medium.ttf"),
@@ -2845,13 +2901,13 @@ class ClusterUiRenderer:
     @staticmethod
     @lru_cache(maxsize=1)
     def _navi_font_codepoints() -> tuple[int, ...]:
-        return (
-            *range(0x20, 0x0250),
+        # Shared CJK set (GB2312-1 + zh/ja) plus the Latin/punctuation runs the
+        # HUD draws. Hangul is omitted: MiSans has no Hangul glyphs.
+        extra = (
             *range(0x2000, 0x2070),
             0x20A9,
-            *range(0x3131, 0x3190),
-            *range(0xAC00, 0xD7A4),
         )
+        return tuple(dict.fromkeys((*cjk_font_codepoints(), *extra)))
 
     def _load_vehicle_model(self) -> None:
         if self._vehicle_model_load_attempted:
@@ -7713,8 +7769,13 @@ class ClusterUiRenderer:
     def _font_for_text(self, text: str):
         if self._font is None:
             self._font = rl.get_font_default()
-        if self._korean_font is not None and any(ord(char) > 0x7F for char in text):
+        if self._korean_font is not None and any(
+            0xAC00 <= ord(char) <= 0xD7A3 or 0x1100 <= ord(char) <= 0x11FF or 0x3130 <= ord(char) <= 0x318F
+            for char in text
+        ):
             return self._korean_font
+        if self._cjk_font is not None and any(ord(char) > 0x7F for char in text):
+            return self._cjk_font
         return self._font
 
     def _draw_text_with_stroke(

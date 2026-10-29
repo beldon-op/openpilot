@@ -1,0 +1,22 @@
+MiSans-Medium.ttf — MiSans 字体（Medium 字重）
+===============================================
+
+版权所有 (C) 2021-2025 Xiaomi Inc. 保留所有权利。
+Copyright (C) 2021-2025 Xiaomi Inc. All rights reserved.
+
+本目录中的 MiSans-Medium.ttf 依据小米官方《MiSans字体知识产权许可协议》
+分发使用。协议全文：
+https://hyperos.mi.com/font-download/MiSans%E5%AD%97%E4%BD%93%E7%9F%A5%E8%AF%86%E4%BA%A7%E6%9D%83%E8%AE%B8%E5%8F%AF%E5%8D%8F%E8%AE%AE.pdf
+字体官网：https://hyperos.mi.com/font/
+
+主要条款摘要（以协议原文为准）：
+1. 全球范围内免版税，可免费商用，允许嵌入软件（App/固件）并随软件分发。
+2. 须在软件中特别注明使用了 MiSans 字体（本文件即该注明）。
+3. 不得对字体本身进行改编或二次开发。
+4. 不得将字体文件单独对外租赁、再许可、出借或二次分发；该限制不适用于
+   使用 MiSans 创作的其他作品（如本软件）。
+5. 任何副本中须保留版权声明与本协议。
+
+来源：小米官方 MiSans.zip（2025-07 版本包，MiSans/ttf/MiSans-Medium.ttf，
+文件未作任何修改）。
+用途：carrotpilot 车机 UI 的中日韩（简体中文为主）文字渲染。

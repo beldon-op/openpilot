@@ -21,8 +21,8 @@ from typing import NamedTuple
 from importlib.resources import as_file
 from openpilot.common.basedir import BASEDIR
 from openpilot.common.swaglog import cloudlog
+from openpilot.selfdrive.assets.fonts import cjk_codepoints
 from openpilot.system.hardware import HARDWARE, PC
-from openpilot.system.ui.lib.multilang import multilang
 from openpilot.common.realtime import Ratekeeper
 import datetime
 
@@ -121,7 +121,8 @@ class FontWeight(StrEnum):
   DISPLAY_REGULAR = "Inter-Regular.fnt"
   ROMAN = "Inter-Regular.fnt"
   #DISPLAY = "Inter-Bold.fnt"
-  DISPLAY = "KaiGenGothicKR-Bold.fnt"
+  DISPLAY = "MiSans-Medium.fnt"
+  KOREAN = "KaiGenGothicKR-Bold.fnt"
 
 
 class TextAlignment(IntEnum):
@@ -137,19 +138,29 @@ class TextAlignmentVertical(IntEnum):
 
 
 _KOREAN_TEXT_RE = re.compile(r"[\u1100-\u11ff\u3130-\u318f\uac00-\ud7a3]")
+_CJK_TEXT_RE = re.compile(r"[\u2e80-\u9fff\uf900-\ufaff\uff00-\uffef\u3000-\u30ff\u3400-\u4dbf]")
 
 
 def font_fallback(font: rl.Font, text: str | bytes | None = None) -> rl.Font:
-  """Keep locale fallback and also render Korean text in other locales."""
-  if not gui_app.has_font(FontWeight.DISPLAY):
-    return font
-  if multilang.requires_unifont():
-    return gui_app.font(FontWeight.DISPLAY)
+  """Route strings to a font that can actually render them.
+
+  The display font (MiSans) covers GB2312 hanzi and kana but has no Hangul and
+  lacks a few UI symbols (\u2699\u25c0\u25b6\u232b\u21e7\u2423\u21b3\u2011), so routing is per string: CJK -> MiSans,
+  Hangul -> KaiGen (trimmed to the syllables the UI uses; unifont as backup),
+  and Latin/symbol-only strings stay in the caller's font, which carries the
+  symbols MiSans is missing.
+  """
   if isinstance(text, bytes):
     text = text.decode("utf-8", errors="replace")
-  # Non-ASCII punctuation, Latin accents and emoji do not require a font change.
-  if isinstance(text, str) and _KOREAN_TEXT_RE.search(text):
-    return gui_app.font(FontWeight.DISPLAY)
+  if not text:
+    return font
+  if _KOREAN_TEXT_RE.search(text):
+    for weight in (FontWeight.KOREAN, FontWeight.UNIFONT):
+      if gui_app.has_font(weight):
+        return gui_app.font(weight)
+    return font
+  if _CJK_TEXT_RE.search(text):
+    return gui_app.font(FontWeight.DISPLAY) if gui_app.has_font(FontWeight.DISPLAY) else font
   return font
 
 
@@ -1031,7 +1042,7 @@ class GuiApplication:
       return rl.load_font(font_path.as_posix())
 
     try:
-      font_size = 16 if font_weight == FontWeight.UNIFONT else 48 if font_weight == FontWeight.DISPLAY else 200
+      font_size = 16 if font_weight == FontWeight.UNIFONT else 92 if font_weight in (FontWeight.DISPLAY, FontWeight.KOREAN) else 200
       codepoints = self._font_codepoints(font_weight)
       cp_buffer = rl.ffi.new("int[]", codepoints)
       cp_ptr = rl.ffi.cast("int *", cp_buffer)
@@ -1044,7 +1055,12 @@ class GuiApplication:
     codepoints = set(range(32, 127))
     # Match the common symbols in the generated atlases (fonts/process.py).
     codepoints.update(map(ord, "–‑✓×°§•X⚙✕◀▶✔⌫⇧␣○●↳çêüñ–‑✓×°§•€£¥"))
-    if font_weight in (FontWeight.DISPLAY, FontWeight.UNIFONT):
+    if font_weight == FontWeight.DISPLAY:
+      # Keep in sync with the build-time atlas (fonts/cjk_codepoints.py).
+      codepoints.update(cjk_codepoints.cjk_font_codepoints())
+    elif font_weight == FontWeight.KOREAN:
+      codepoints.update(map(ord, cjk_codepoints.hangul_ui_chars()))
+    elif font_weight == FontWeight.UNIFONT:
       codepoints.update(range(0xAC00, 0xD7A4))
       codepoints.update(range(0x1100, 0x1200))
       codepoints.update(range(0x3130, 0x3190))

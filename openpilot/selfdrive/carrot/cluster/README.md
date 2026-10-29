@@ -694,12 +694,17 @@ The bundled TURZX code includes only the Python vendor library. The openpilot
 device uses the system `libusb-1.0.so` through `pyusb`.
 
 The renderer prefers
-`/data/openpilot/selfdrive/assets/fonts/KaiGenGothicKR-Bold.ttf` for HUD text.
-It falls back to the bundled/addon KaiGen copy, then JetBrainsMono and
-system/platform fonts if KaiGen is not present.
-Latin/numeric text uses the 160-pixel primary font. The complete Korean glyph
-set uses a separate 32-pixel base atlas with bilinear filtering and no mip chain;
-a host resource smoke produced `8192x4096` rather than the former `8192x8192`.
+`/data/openpilot/selfdrive/assets/fonts/MiSans-Medium.ttf` for HUD text
+(carrot-byd: GB2312 hanzi + kana via the shared `fonts/cjk_codepoints.py` set,
+rendered on a 92-pixel base atlas; see `MiSans-LICENSE.txt`). It falls back to
+the bundled/addon MiSans copy, then the legacy bundled/addon KaiGen copy, then
+JetBrainsMono and system/platform fonts if neither is present.
+Latin/numeric text uses the 160-pixel primary font. The CJK glyph set uses a
+separate 92-pixel base atlas with bilinear filtering and no mip chain; the
+shared set keeps it at `8192x4096` (~134 MB RGBA) versus the former
+32-pixel `8192x4096` Korean atlas. Korean cluster labels render only if a
+Hangul-capable fallback font (legacy KaiGen/addon) is present; MiSans has no
+Hangul glyphs.
 Dynamic stroked HUD text keeps the original eight outline draws plus one fill
 draw, but calls the same raylib `DrawTextEx` C symbol directly after preparing
 the font, measurement, UTF-8 text, anchor, and colors once. Set

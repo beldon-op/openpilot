@@ -1,5 +1,6 @@
 """Exercise text rendering without a graphics context or the removed raygui API."""
 import ast
+import importlib.util
 import math
 import re
 from collections import OrderedDict
@@ -106,18 +107,19 @@ def korean_renderer(renderer):
   """Run real fallback, measurement, wrapping and labels with distinct font widths."""
   scope = renderer.namespace
   weights = scope["FontWeight"]
-  weights.DISPLAY, weights.UNIFONT = 1, 2
+  weights.DISPLAY, weights.UNIFONT, weights.KOREAN = 1, 2, 3
   normal = SimpleNamespace(texture=SimpleNamespace(id=1), advance=10, baseSize=20, glyphCount=95, glyphPadding=0)
   display = SimpleNamespace(texture=SimpleNamespace(id=2), advance=20, baseSize=20, glyphCount=12000, glyphPadding=0)
   app = scope["gui_app"]
-  app.font = lambda weight: display if weight == weights.DISPLAY else normal
+  # DISPLAY (MiSans) and KOREAN (KaiGen) both route non-ASCII CJK/Hangul runs.
+  app.font = lambda weight: display if weight in (weights.DISPLAY, weights.KOREAN) else normal
   app.has_font = lambda weight: True
   language = SimpleNamespace(value="en")
   scope.update(re=re, multilang=SimpleNamespace(requires_unifont=lambda: language.value == "ko"))
   tree = ast.parse((UI_DIR / "lib/application.py").read_text(encoding="utf-8"))
-  pattern = next(n for n in tree.body if isinstance(n, ast.Assign) and
-                 any(isinstance(t, ast.Name) and t.id == "_KOREAN_TEXT_RE" for t in n.targets))
-  exec(compile(ast.Module(body=[pattern], type_ignores=[]), "application.py", "exec"), scope)
+  patterns = [n for n in tree.body if isinstance(n, ast.Assign) and
+              any(isinstance(t, ast.Name) and t.id in ("_KOREAN_TEXT_RE", "_CJK_TEXT_RE") for t in n.targets)]
+  exec(compile(ast.Module(body=patterns, type_ignores=[]), "application.py", "exec"), scope)
   load_definitions(UI_DIR / "lib/application.py", scope, {"font_fallback"})
 
   measurements = []
@@ -137,19 +139,38 @@ def test_english_locale_selects_korean_font(korean_renderer, text):
   assert r.font_fallback(r.normal, text) is r.display
 
 
+def test_fallback_requests_the_matching_weight(korean_renderer):
+  r = korean_renderer
+  seen = []
+  app = r.gui_app
+  orig_font = app.font
+  app.font = lambda weight: (seen.append(weight), orig_font(weight))[1]
+  r.font_fallback(r.normal, "한글")
+  assert seen == [r.FontWeight.KOREAN]
+  seen.clear()
+  r.font_fallback(r.normal, "导航")
+  assert seen == [r.FontWeight.DISPLAY]
+  seen.clear()
+  r.font_fallback(r.normal, "speed")
+  assert seen == []
+
+
 @pytest.mark.parametrize("text", [None, "", "speed 100", "35° / € £ ¥", "français – ñü", "⚠️ 🛑", b"speed", b"\xff"])
 def test_latin_symbols_and_emoji_keep_requested_font(korean_renderer, text):
   r = korean_renderer
   assert r.font_fallback(r.normal, text) is r.normal
 
 
-def test_legacy_locale_and_bootstrap_without_display_font(korean_renderer):
+def test_locale_alone_and_bootstrap_without_display_font(korean_renderer):
   r = korean_renderer
+  # Routing is per string: the locale by itself no longer swaps the font.
   assert r.font_fallback(r.normal) is r.normal
   r.language.value = "ko"
-  assert r.font_fallback(r.normal) is r.display
+  assert r.font_fallback(r.normal) is r.normal
+  assert r.font_fallback(r.normal, "speed") is r.normal
   r.gui_app.has_font = lambda weight: False
   assert r.font_fallback(r.normal, "한글") is r.normal
+  assert r.font_fallback(r.normal, "导航") is r.normal
 
 
 @pytest.mark.parametrize("label_class", ["Label", "UnifiedLabel"])
@@ -186,13 +207,19 @@ def test_eliding_away_korean_keeps_measurement_and_draw_font(korean_renderer, la
 
 def test_locale_change_invalidates_label_and_measurement_caches(korean_renderer):
   r = korean_renderer
-  label = r.UnifiedLabel("AB", font_size=20)
   rect = r.rl.Rectangle(0, 0, 100, 40)
-  for language, font, width in [("en", r.normal, 20), ("ko", r.display, 40), ("en", r.normal, 20)]:
+  label = r.UnifiedLabel("AB", font_size=20)
+  # ASCII strings keep the requested font in every locale.
+  for language in ("en", "ko", "en"):
     r.language.value = language
     label.render(rect)
-    assert label.text_width == width
-    assert r.rl.draw_calls[-1][0] is font
+    assert label.text_width == 20
+    assert r.rl.draw_calls[-1][0] is r.normal
+  # A string that routes to the display font re-measures with its metrics.
+  label.set_text("한글")
+  label.render(rect)
+  assert label.text_width == 40
+  assert r.rl.draw_calls[-1][0] is r.display
 
 
 @pytest.mark.parametrize("label_class", ["Label", "UnifiedLabel"])
@@ -220,22 +247,37 @@ def test_generated_and_source_fonts_cover_jamo_and_common_symbols(korean_rendere
   tree = ast.parse((font_dir / "process.py").read_text(encoding="utf-8"))
   extra = next(n for n in tree.body if isinstance(n, ast.Assign) and
                any(isinstance(t, ast.Name) and t.id == "EXTRA_CHARS" for t in n.targets))
-  scope = {"_languages": dict}
+  # cjk_codepoints is stdlib-only, so import it for real; only process.py (which
+  # needs pyray) goes through AST extraction.
+  spec = importlib.util.spec_from_file_location("_test_cjk_codepoints", font_dir / "cjk_codepoints.py")
+  cjk_mod = importlib.util.module_from_spec(spec)
+  spec.loader.exec_module(cjk_mod)
+  scope = {"_languages": dict, "cjk_codepoints": cjk_mod,
+           "TRANSLATIONS_DIR": font_dir.parents[1] / "ui" / "translations"}
   exec(compile(ast.Module(body=[extra], type_ignores=[]), "process.py", "exec"), scope)
   load_definitions(font_dir / "process.py", scope, {"_char_sets"})
-  base, generated = map(set, scope["_char_sets"]())
+  base, generated, cjk_cp, korean_cp = map(set, scope["_char_sets"]())
 
   tree = ast.parse((UI_DIR / "lib/application.py").read_text(encoding="utf-8"))
   app = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "GuiApplication")
   method = next(n for n in app.body if isinstance(n, ast.FunctionDef) and n.name == "_font_codepoints")
-  scope.update(FontWeight=r.FontWeight)
+  scope.update(FontWeight=r.FontWeight, cjk_codepoints=cjk_mod)
   exec(compile(ast.Module(body=[method], type_ignores=[]), "application.py", "exec"), scope)
   source = scope["_font_codepoints"]
   jamo = set(range(0x1100, 0x1200)) | set(range(0x3130, 0x3190))
   common = set(map(ord, scope["EXTRA_CHARS"]))
   assert jamo <= generated
   assert not jamo & base
-  for weight in (r.FontWeight.DISPLAY, r.FontWeight.UNIFONT):
-    assert jamo | common <= set(source(None, weight))
+  # MiSans atlas: full CJK set with symbols, but no Hangul.
+  assert set(cjk_cp) <= set(source(None, r.FontWeight.DISPLAY))
+  assert common <= cjk_cp
+  assert not jamo & cjk_cp
+  # KaiGen atlas: trimmed Hangul (the syllables the UI actually uses) plus the
+  # shared Latin/symbols — not the full jamo blocks.
+  assert set(korean_cp) <= set(source(None, r.FontWeight.KOREAN))
+  assert common <= set(source(None, r.FontWeight.KOREAN))
+  assert {ord(c) for c in "한글주행"} <= set(source(None, r.FontWeight.KOREAN))
+  # Unifont stays the full fallback, jamo included.
+  assert jamo | common <= set(source(None, r.FontWeight.UNIFONT))
   assert common <= set(source(None, r.FontWeight.NORMAL))
   assert not jamo & set(source(None, r.FontWeight.NORMAL))

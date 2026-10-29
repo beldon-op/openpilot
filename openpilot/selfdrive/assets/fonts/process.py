@@ -4,6 +4,8 @@ import json
 
 import pyray as rl
 
+import cjk_codepoints  # same dir; shares the CJK codepoint set with the runtime fallback
+
 FONT_DIR = Path(__file__).resolve().parent
 SELFDRIVE_DIR = FONT_DIR.parents[1]
 TRANSLATIONS_DIR = SELFDRIVE_DIR / "ui" / "translations"
@@ -12,7 +14,17 @@ LANGUAGES_FILE = TRANSLATIONS_DIR / "languages.json"
 GLYPH_PADDING = 6
 EXTRA_CHARS = "–‑✓×°§•X⚙✕◀▶✔⌫⇧␣○●↳çêüñ–‑✓×°§•€£¥"
 UNIFONT_LANGUAGES = {"th", "zh-CHT", "zh-CHS", "ko", "ja"}
-KR_FONTS = {"KaiGenGothicKR-Bold"}
+# High-resolution CJK display font (GB2312-1 + zh/ja translation chars).
+# Kept at 92px so 60-75px UI text downsamples crisply and the ~4.2k-glyph
+# atlas stays at 8192x4096 (~134 MB RGBA); see cjk_codepoints.py.
+CJK_FONTS = {"MiSans-Medium"}
+CJK_FONT_SIZE = 92
+CJK_GLYPH_PADDING = 2
+# Hangul-only fallback (MiSans has no Hangul); trimmed to the syllables the UI
+# actually uses, so the atlas stays tiny even at 64px.
+KOREAN_FONTS = {"KaiGenGothicKR-Bold"}
+KOREAN_FONT_SIZE = 64
+KOREAN_GLYPH_PADDING = 2
 
 def _languages():
   if not LANGUAGES_FILE.exists():
@@ -24,6 +36,7 @@ def _languages():
 def _char_sets():
   base = set(map(chr, range(32, 127))) | set(EXTRA_CHARS)
   unifont = set(base)
+  korean = set(base) | set(cjk_codepoints.hangul_ui_chars())
 
   unifont.update(map(chr, range(0xAC00, 0xD7A4)))
   unifont.update(map(chr, range(0x1100, 0x1200)))
@@ -37,7 +50,8 @@ def _char_sets():
       continue
     (unifont if code in UNIFONT_LANGUAGES else base).update(chars)
 
-  return tuple(sorted(ord(c) for c in base)), tuple(sorted(ord(c) for c in unifont))
+  return (tuple(sorted(ord(c) for c in base)), tuple(sorted(ord(c) for c in unifont)),
+          tuple(cjk_codepoints.cjk_font_codepoints()), tuple(sorted(ord(c) for c in korean)))
 
 
 def _glyph_metrics(glyphs, rects, glyph_count: int):
@@ -102,10 +116,16 @@ def _process_font(font_path: Path, codepoints: tuple[int, ...]):
     font_size = 16
     padding = GLYPH_PADDING
 
-  if font_path.stem in KR_FONTS:
-    font_size = 48
-    padding = 2
-    
+  if font_path.stem in CJK_FONTS:
+    # Full GB2312-1 + translations: ~4.5k glyphs, so pad tight to keep the
+    # atlas around 7k x 7k (~190 MB RGBA).
+    font_size = CJK_FONT_SIZE
+    padding = CJK_GLYPH_PADDING
+
+  if font_path.stem in KOREAN_FONTS:
+    font_size = KOREAN_FONT_SIZE
+    padding = KOREAN_GLYPH_PADDING
+
   data = font_path.read_bytes()
   file_buf = rl.ffi.new("unsigned char[]", data)
   cp_buffer = rl.ffi.new("int[]", codepoints)
@@ -135,12 +155,19 @@ def _process_font(font_path: Path, codepoints: tuple[int, ...]):
 
 
 def main():
-  base_cp, unifont_cp = _char_sets()
+  base_cp, unifont_cp, cjk_cp, korean_cp = _char_sets()
   fonts = sorted(FONT_DIR.glob("*.ttf")) + sorted(FONT_DIR.glob("*.otf"))
   for font in fonts:
     if "emoji" in font.name.lower():
       continue
-    glyphs = unifont_cp if font.stem.lower().startswith("unifont") or font.stem in KR_FONTS else base_cp
+    if font.stem.lower().startswith("unifont"):
+      glyphs = unifont_cp
+    elif font.stem in CJK_FONTS:
+      glyphs = cjk_cp
+    elif font.stem in KOREAN_FONTS:
+      glyphs = korean_cp
+    else:
+      glyphs = base_cp
     _process_font(font, glyphs)
   return 0
 

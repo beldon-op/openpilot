@@ -4311,8 +4311,8 @@ class SimulatorUI:
   @staticmethod
   def _font_candidates() -> tuple[Path, ...]:
     return (
-      REPO_ROOT / "openpilot/selfdrive/assets/fonts/KaiGenGothicKR-Bold.ttf",
       REPO_ROOT / "openpilot/selfdrive/assets/fonts/Pretendard-Medium.ttf",
+      REPO_ROOT / "openpilot/selfdrive/assets/fonts/MiSans-Medium.ttf",
       Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts" / "malgun.ttf",
       REPO_ROOT / "openpilot/selfdrive/assets/fonts/JetBrainsMono-Medium.ttf",
     )
