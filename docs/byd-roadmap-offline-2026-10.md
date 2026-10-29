@@ -57,6 +57,8 @@ paramsd yaw 健康(a551f080 喂料)  D ✓(先验画像)     台架可看       
 任意趟爆雷: 退路顺序 = 关 radarUnavailable(翻标志回 True) → 回退厂商纵向姿态 → ModifiedStockLong(#2 若建成)
 ```
 
+> #3 已落：路测门禁检查单逐项版 = **docs/byd-roadtest-checklist-2026-10-21.md**（趟0/1/2/3 + 每趟必做 + 退路 + 收车回填）。
+
 ## 4. 开放问题
 
 - 设备大概何时回桌？若早于车：#1 验收加一档设备侧 process_replay 对照（文档已证两平台逐位一致，成本≈0）。
@@ -75,6 +77,10 @@ paramsd yaw 健康(a551f080 喂料)  D ✓(先验画像)     台架可看       
     `docs/byd-bsd-quality-*.md`（flicker 0.5%、静止/开门零误报、误放不可离线测）、
     observations.md（ModifiedStockLong + V1-V3 不归档）。
   - 部署检查单见 §1；#2 定级下调为「备胎（非升格）」。
+- 2026-10-21：**#3 路测门禁会话计划完成**：`docs/byd-roadtest-checklist-2026-10-21.md`
+  （趟 0=bench PASS+设备 6.1+采集器重部署；趟 1=6.2/6.3+V1 对表+钉 u；趟 2=V2 观察项 a/b/c
+  +横向 A/B 五点+变道 T4+BSD clear 窗；趟 3=V3 alpha 跟停+GapGate 1→2+T9；退路四步；参数速查）。
+  #4（V1 遥测报告生成器）仍开放——建议格式先定在检查单趟 1「V1 对表」行的数字上。
 - 2026-10-21：**#1 byd-bench-golden-replay 完成**：golden 版本化
   （`scripts/byd_bench_golden.json`，钉定双段 sha256+全精度指标+归因表）+ 门禁
   `scripts/byd_bench_gate.py`（PASS/REGRESSION/FLAKY/哈希不符=1/SKIP=3，--accept 强制归因）；
