@@ -118,3 +118,9 @@ Pipfile
 .claude
 openspec
 local_docs
+
+# Font atlases are build outputs (selfdrive/ui/SConscript -> fonts/process.py).
+# Only the bootstrap-preload Pretendard pair is tracked; anything else that
+# appears here must be added with -f on purpose.
+openpilot/selfdrive/assets/fonts/*.fnt
+openpilot/selfdrive/assets/fonts/*.png
