@@ -193,3 +193,79 @@ file 0xb0e0-0xb618，668 个 u16，`^0xb0e3` 后为全部已实现布局的接�
   NaN 隔离；T8 分道化（gate=3，yRel 迟滞分类）随行落地。
 - 本表未覆盖项：块 D 速度记录无 spec 同构项（probe+回归双源）；横向 y = 引擎学习标定投影，
   离线不可复原，HYPOTHESIS 隔离待 V2。
+
+---
+
+## 13. 2026-11-01 复检：10-27 构建 + 影子雷达 v73（本地容器活体分析）
+
+新语料：`~/Documents/work/op/carrotpilot/byd/byd`（vendor op_custom **2026-10-27** 构建；
+git 树 commit 7873b2d "update"，author Comma Device 10-31 16:08 UTC = 设备拉到 v73 OTA 后同步入 git）。
+
+### 13.1 本地解密管线（重要工具链升级，不再依赖设备）
+
+pyarmor runtime 是 linux-aarch64 ELF，Apple Silicon Mac + docker 原生 arm64 容器可跑：
+
+```bash
+docker build --platform linux/arm64 -t pyarmor-local local_docs/vendor_1027_2026-11-01/  # Dockerfile: python:3.12-slim + numpy/pycapnp/pycryptodome/setproctitle/smbus2/pyzmq/psutil + libzmq5
+docker run --rm -v <vendor树>:/vendor:ro -v <产物目录>:/out -e PYTHONPATH=/out/rootfs:/vendor \
+  pyarmor-local python /out/pydump_local.py <rel路径> <模块名>
+```
+
+- `pydump_local.py` = cp_byd 的 pydump.py 改 ROOT=/vendor、OUT=/out；
+  rootfs/ shadow 目录补 `openpilot/cereal → /vendor/cereal` symlink（设备布局有、git 树没有）。
+- **活体 import 更强**：依赖装齐后厂商混淆模块可整体 import（JIT 解密），dir/inspect/dis/直接调用全可用；
+  BCC 保护函数（new_params/_get_params/create_accel_command 等）读不到字节码但**可以执行观测**。
+- 产物与探针存 `local_docs/vendor_1027_2026-11-01/`（song22_fingerprint.json、radar_interface/interface dis、
+  bydcan 关键函数签名、probes/ 可复跑）。
+
+### 13.2 `_dump.py` / `dump.txt` 谜团关闭
+
+`_dump.py` = pyarmor 化的 build 元数据模块（version/branch/commit/dirty + get_mac_address + enc_b64，
+即 dump.txt 生成器）；dump.txt 解码（XOR 0xFF）= 序列号 + WiFi MAC（`...308766 00:0a:f5:55:73:d7`），
+是 §7 遥测设备标识回退文件，与雷达无关。
+
+### 13.3 影子雷达 v72→v73（唯一雷达相关变化；.so 未变）
+
+`libobject_stream.so` md5 e919d58557995fe27e34f6f88b6e6f8d 与 v72 逆向时**完全一致**——全部逆向结论原样有效；
+变化全在 stream.py（169 行 diff，git 两提交可全量提取），厂商 10-31 专项修标定链（注释明说 Song22）：
+
+1. **_GeometryLearning 门槛大降**：MIN_MOVING 20000→8000、MIN_RANGE 2000→600、MIN_CROSS 200→100、
+   MIN_HOLDOUT 100→60；验收改为**带符号 holdout bias**（±0.15m）+ 绝对中位宽松限（0.8/0.4）；
+   注释披露 Song22 视觉/反射点噪声 ~0.45m。
+2. **槽重排误杀修复**（DUP_SAME_SCAN_NS=35ms）：旧版跨帧槽序变化即封锁，**曾丢弃宋 22 上 24-32% 的观测**。
+3. **pending 持久化**（.pending 文件 + 每分钟 fsync）：修复"每次重启标定进度清零"——熄火周期不再丢样本。
+4. **_LiveCalib 初始锚自举**（initial_anchor）：300 对连续窗播种，配套 reason 遥测字段。
+5. 关联暖机 1.5s/15→0.8s/8、稳定性判据 1000/100→500/50；TELEMETRY_VERSION v73，上传 URL 不变。
+
+**对我方影响**：显示层标定从"实际跑不满"变为"常规通勤可收敛"；控制级锁不动（flags 引擎在 .so）。
+设备已收到 v73 OTA；我方在 carrot 端的复刻如要对齐，重点移植 2/3 两项。
+
+### 13.4 radar_interface 10-27 = 10-13 逐字节一致（本地全字节码读毕）
+
+NonConstantCanSignalRateCalculator(60,16)、Han VALID 门控 + track_id∉(2,4,5)、REL_SPEED·KPH_TO_MS、
+yRel clip±5、measured=VALID、no_var_cnt≥10 剔除——与 10-13 基线完全一致，宋仍无分支。
+
+### 13.5 执行级雷达矩阵定案（容器真跑 get_params，非字节码推断）
+
+- **默认态：全部 BYD 平台 radarUnavailable=True**（10-13 时 Tang_DMI_21/21ALT、QIN_PRO_DM 默认 False 的口径作废）。
+- `BYDEnableRadarMeas=1`（/data/params/d/ 实测）只解锁 **HAN_DMI_22 / HAN_DM_20_21 / HAN_EV_20_21 / HAN_EV_22 / TANG_DM**
+  ——恰是有雷达分支的五款；**宋系（21/22/23/23ALT/5G/EV/Pro/L）恒 True，无任何开关**。
+  我方 radarUnavailable=False 属自主解锁第四次交叉印证。
+- is_release / alpha_long 对 radarUnavailable 无影响。
+
+### 13.6 指纹普查（厂商自家数据交叉印证槽表）
+
+- **宋22 / 5G_DMI_22 / 唐 DM 指纹含完整 0x3c8-0x3ff 全 56 地址**（块 C/D 全段）——厂商指纹独立确认槽表地址域；
+  唐 DM 同时有 0x351-354，与 .so 别名表 Tang→hint8（双布局）吻合。
+- 0x374 MRR 平台比旧认知扩大：汉全系 + **宋 DMI 23** + 宋 Pro 22/22ALT/23 + 唐 DMI 21/23/DMP22 + 元 Plus EV。
+- FRS-OD 段（0x2B-0x5B）无任何平台命中（仅 0x55 已知假碰撞）——私有 CAN 不进指纹，符合预期。
+- 10-27 新增平台：SEAL_06/07_DMI_22/24、SONG_L_DMI、QIN_L_DMI、HWJ_07_DMI、HAN_EV_25、TANG_DMI_23/24、
+  YUAN_UP_EV 等（YUAN_UP alphaLongAvail 唯一 False）。
+
+### 13.7 其他参考（非雷达）
+
+- MM 扭矩模型新格式：`NON_LINEAR_TORQUE_PARAMS` 4 元组按车（宋22 = `(-0.0508, 0.6368, 0.7273, 1.0669)`），
+  全局 MM_TORQUE_TAIL_GAIN 0.05 / TAIL_POWER 2.0 / MM_GAIN_BAND (0.5,2.0)；宋 lateralTuning ki=0.3（旧认知 ki=0）。
+- `BYDToggles` 现为 NamedTuple：enable_radar_meas / reverse_acc_can / reverse_bsm_can / force_low_torque /
+  force_torque_fix / steer_unbalance_coef（后四个是 10-27 新开关，BCC 壳签名已存档可行为级调用）。
+- long_mpc STOP_DISTANCE 6.0→4（vendor 上游跟停距离收紧，V3 标定可参考）。
