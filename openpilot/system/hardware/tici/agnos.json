@@ -56,7 +56,7 @@
   },
   {
     "name": "boot",
-    "url": "https://github.com/ajouatom/agnos-builder/releases/download/agnos-19.8-carrot-bt1/boot-c3x-c4-dccd7965346b0a87a9f64cb6be257f6bb5d3d0f368c8655085efc1e460527f5a.img.xz",
+    "url": "https://gh-proxy.com/https://github.com/ajouatom/agnos-builder/releases/download/agnos-19.8-carrot-bt1/boot-c3x-c4-dccd7965346b0a87a9f64cb6be257f6bb5d3d0f368c8655085efc1e460527f5a.img.xz",
     "compressed_hash": "b308adf97dde96ce049d44500ad13278dcb1645628463c30146f89be12540417",
     "compressed_size": 14273596,
     "hash": "dccd7965346b0a87a9f64cb6be257f6bb5d3d0f368c8655085efc1e460527f5a",
@@ -69,7 +69,7 @@
   },
   {
     "name": "system",
-    "url": "https://github.com/ajouatom/agnos-builder/releases/download/agnos-19.8-carrot-bt1/system-375c5d22335770ac08750660bb5b29a3331c550d6a9875b35f36b88af792ea44.img.xz",
+    "url": "https://gh-proxy.com/https://github.com/ajouatom/agnos-builder/releases/download/agnos-19.8-carrot-bt1/system-375c5d22335770ac08750660bb5b29a3331c550d6a9875b35f36b88af792ea44.img.xz",
     "compressed_hash": "077d42186def98025ffad9723774c96f45da10c87cc6fedbc58d0cf4fa65ffd4",
     "compressed_size": 1010655092,
     "hash": "a67410a888105ecce7bcc05e17cda77fd10572aa4380e9de242a7c92f3497114",
