@@ -58,6 +58,19 @@
 - [ ] 校时验证：仅当 prep-C 设计已实现才跑（冷启动时钟对齐 0x2B6）；当前状态=设计稿，**跳过**
 - [ ] C 档（friction_enhancer）裁决：趟 2/3 横向若有「不平衡感」证据→立项移植，否则销账
 
+## 趟 2/3 随行 —— 槽表层（BydRadarSlotTable）V2 观察项
+
+多层链第 4 层（bus1 67ms 多目标槽表，openspec `byd-radar-multitarget-port`）。
+默认 level=1（显示级）：槽表点进 liveTracks（measured=False，radarState 不消费）——
+行为与 b7-only 逐字节一致，本节纯观察。**控制消费二段（level=2）只在前项全绿后启用。**
+
+- [ ] **默认零变更回归**：level=1 下 `radarState.leadOne/leadTwo` 候选与 b7-only 现状一致（离线 diff 报告先行，车上复核 leadOne 无新增切换）
+- [ ] **leadOne/leadTwo 切换频率**：开启 level=2 前先统计 level=1 显示流里 trackId 201+ 的生命周期（槽位重排 generation 跳变率）——抖动大则先调 `PAIR_MAX_JUMP_M`/`TRACK_MISS_CYCLES`，不带着闪烁上控制
+- [ ] **cut-in 捕获时延**（level=2）：邻车道逼近目标从进表到成为 leadTwo 候选的时延，对照 vision 确认时刻
+- [ ] **track 抖动观察**（level=2）：dRel 序列 vs b7 同目标对照（1/32m 细分辨率），差分 vRel 的 0.47 m/s 量化台阶是否被 KF 平掉
+- [ ] **横向字段状态**：yRel 仍为 NaN（未定案隔离）；阶段一定案入库后本项升级为「yRel vs 视觉 leadsV3 y 同屏」
+- [ ] **回滚演练**：`BydRadarSlotTable=0` → radarcan 重启 → liveTracks 无 201+ 点、radarState 与 b7-only 一致（零残留）；确认切换未触发 CarParams 重生成（红线）
+
 ## 退路（任意趟爆雷，按序，不即兴）
 
 1. **雷达链出事**（假 lead 进控制/leadOne 异常）：`radarUnavailable` 翻回 True——interface.py:141 一行，是回退到 d5fc77c4 前零变更状态的**唯一开关**
@@ -76,6 +89,7 @@
 | 参数 | 位置 | 生效方式 | 现值 |
 |---|---|---|---|
 | `BydRadarGapGate` | desire_helper_byd 三 hook | card 重启（下次点火） | 0（关） |
+| `BydRadarSlotTable` | radarcan.py 注入 RI，clamp [0,2] | **重启 radarcan** | 1（显示级；2=控制消费二段） |
 | `BydRadarDistScale` | radarcan.py 注入 RI | **重启 radarcan**，clamp [0.1,0.5] | 0.25（钉定待实测） |
 | `AlphaLongitudinalEnabled` | interface `_get_params`（safetyParam bit2） | 下次点火；禁 onroad cycle | 0 |
 | `DriverMonitoringEnabled` | selfdrived | — | 0（无摄像头） |

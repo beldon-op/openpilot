@@ -89,6 +89,9 @@ class CarInterface(CarInterfaceBase):
     # able to kill the loop; worst case the gap fields stay False.
     try:
       ret.radarGapClosing, ret.radarGapNew = self.CS.update_radar_gap(can_packets, ret.vEgo)
+      # stage-3 lane discrimination (0=unknown/1=own/2=adjacent); telemetry
+      # for the road test, and the gate-3 consumer in desire_helper_byd
+      ret.radarGapLane = self.CS.gap_mon.lane
     except Exception:
       pass
     return ret

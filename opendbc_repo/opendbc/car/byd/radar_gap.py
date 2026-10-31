@@ -54,6 +54,18 @@ NEW_HOLD = 10.0      # radar capture leads the HUD gear by >=10 s (④e) - keep 
                      # "new target" flag this long after the visible rising edge
 STALE_TIME = 0.5     # 0x109 silent this long -> not fresh, treat as invisible
 
+# --- lane discrimination (byd-radar-multitarget-port stage 3, design D5) -----
+# Relative lateral only (v1): the slot table's yRel decides own vs adjacent
+# band; no absolute installation-angle calibration exists. Values are
+# PLACEHOLDER priors - task 3.5 re-calibrates them from V2 road telemetry and
+# replaces these numbers (thresholds stay road-test-tunable, no recompile of
+# semantics).
+LANE_UNKNOWN = 0     # yRel invalid (slot table off / fields 未定案 / NaN)
+LANE_OWN = 1         # |yRel| inside the own-lane band
+LANE_ADJACENT = 2    # beyond the band + hysteresis margin
+LANE_WIDTH_M = 1.75  # own-lane half-width PLACEHOLDER (±1.75 m prior, 3.5)
+LANE_HYST_M = 0.25   # band-exit margin: leave own-band past width+HYST (chatter guard)
+
 
 class RadarGapMonitor:
   def __init__(self):
@@ -61,6 +73,8 @@ class RadarGapMonitor:
     self.closing = False
     self.new_target = False
     self.visible = False
+    self.lane = LANE_UNKNOWN        # classification of the current target
+    self.degraded = 0               # closing episodes with no lane data (spec 计数)
     self._below_t = 0.0
     self._above_t = 0.0
     self._invisible_t = 0.0
@@ -76,9 +90,22 @@ class RadarGapMonitor:
       return BAND_BOUNDARY_DOWN[3]
     return BAND_BOUNDARY_DOWN[2]
 
+  def _classify_lane(self, y_rel, lane_width: float) -> int:
+    """Own/adjacent classification with a hysteresis exit margin. Invalid yRel
+    never guesses (spec: 禁止在无横向数据时猜测车道归属) -> UNKNOWN."""
+    if y_rel is None or y_rel != y_rel:   # None / NaN -> degrade
+      return LANE_UNKNOWN
+    if self.lane == LANE_OWN:
+      return LANE_OWN if abs(y_rel) <= lane_width + LANE_HYST_M else LANE_ADJACENT
+    return LANE_OWN if abs(y_rel) <= lane_width else LANE_ADJACENT
+
   def update(self, dt: float, b7: int, presence: int, hud_cls: int,
-             v_ego: float, frame_fresh: bool) -> None:
+             v_ego: float, frame_fresh: bool, y_rel=None,
+             lane_width: float = LANE_WIDTH_M) -> None:
     self.t += dt
+
+    was_closing = self.closing
+    self.lane = self._classify_lane(y_rel, lane_width)
 
     if not frame_fresh:
       self._stale_t += dt
@@ -129,3 +156,8 @@ class RadarGapMonitor:
     else:
       if self._above_t >= REL_TIME or not visible:
         self.closing = False
+
+    # 降级 telemetry (spec): a closing episode that fired without lane data -
+    # the consumer treats it with the pre-lane conservative semantics
+    if self.closing and not was_closing and self.lane == LANE_UNKNOWN:
+      self.degraded += 1

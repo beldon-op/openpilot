@@ -351,5 +351,10 @@ class CarState(CarStateBase):
     presence = int(self.gap_cp.vl[266]["Presence_10A"])
     hud = self.adas_msg
     cls = int(hud.get("HasLead", 0)) * int(hud.get("LeadingDistance", 0))
-    self.gap_mon.update(0.01, b7, presence, cls, float(v_ego), fresh)
+    # y_rel wiring point (stage-3 lane discrimination): the slot table's
+    # lateral fields stay 未定案 (NaN-isolated, radar_multitarget.py), so the
+    # monitor runs degraded (LANE_UNKNOWN) until the phase-1 定案 lands and the
+    # gap CANParser gains the lateral signal - the conservative pre-lane
+    # semantics is exactly the specified fallback, and `degraded` counts it.
+    self.gap_mon.update(0.01, b7, presence, cls, float(v_ego), fresh, y_rel=None)
     return self.gap_mon.closing, self.gap_mon.new_target

@@ -1,6 +1,7 @@
-"""BYD Song Plus DM-i radar interface: b7 continuous lead + MRR track slots + HUD-bar fallback.
+"""BYD Song Plus DM-i radar interface: b7 continuous lead + MRR track slots + HUD-bar fallback + 67ms slot table.
 
-Three sources, in priority order (docs/byd-radar-010x.md ②/⑧/⑨, docs/byd-lane-change.md §8.5):
+Four sources (docs/byd-radar-010x.md ②/⑧/⑨, docs/byd-lane-change.md §8.5,
+docs/byd-radar-slot67-2026-10-18.md):
 
   1. 0x351-0x354 RADAR_TRACK_35x on bus 1 - MRR target slots, ~25 Hz, layout
      taken verbatim from the mypilot community byd_tangdm_radar.dbc. On the
@@ -27,6 +28,16 @@ Three sources, in priority order (docs/byd-radar-010x.md ②/⑧/⑨, docs/byd-l
      fork's radard never consumes it (see _update_hud) - position-only
      fallback, matching the source project's intent (docs/byd-radar-010x.md ⑩).
 
+  4. bus1 67ms multi-target slot table (blocks B/C/D, radar_multitarget.py) -
+     the ARS410-class multi-target broadcast (distance PINNED 1/32 m; lateral
+     and attribute fields HYPOTHESIS-isolated until the phase-1 probe 定案).
+     Independent of the priority chain above: its points coexist with the
+     b7 lead (namespaced track ids 201+) for multi-target context, cut-in
+     capture and leadOne/leadTwo candidates. BydRadarSlotTable raw param
+     gates the layer (0=off, 1=display default measured=False, 2=control) -
+     radarcan.py injects it like BydRadarDistScale; level 0 reproduces the
+     pre-slot-table behavior byte-for-byte (rollback spec: 零残留).
+
 Vendor branch sets, extracted from the decompiled _create_radar_can_parser
 bytecode (co_names, 2026-10-11): {BYD_TANG_GAS, BYD_TANG_DM} parse (849,852)
 @25Hz on CanBus.BYD_AUX=bus 1 - this IS the tangdm slot protocol; the Song is
@@ -50,6 +61,7 @@ from statistics import median
 from opendbc.can import CANParser
 from opendbc.car import Bus, structs
 from opendbc.car.common.conversions import Conversions as CV
+from opendbc.car.byd.radar_multitarget import MultitargetDecoder, TRACK_ID_BASE as SLOT_TRACK_ID_BASE
 from opendbc.car.byd.values import DBC, RADAR_DIST_SCALE_DEFAULT, RADAR_HUD_BARS_TO_M
 from opendbc.car.interfaces import RadarInterfaceBase
 
@@ -64,7 +76,21 @@ HUD_BUS = 2
 # switching sources mid-drive never aliases a KF-tracked point; the b7 lead
 # IS the HUD lead (same fused target), so it shares HUD_TRACK_ID
 TRACK_ID_BASE = 101
+# slot-table (67ms multi-target) points live at 201+ (radar_multitarget.py) -
+# strictly above the tang-slot block so the tang cleanup below never touches
+# them and neither namespace can alias the other
 HUD_TRACK_ID = 1
+
+# BydRadarSlotTable raw param (radarcan.py injection, like BydRadarDistScale):
+#   0 = off (b7-only, byte-identical to the pre-slot-table behavior)
+#   1 = display level (default): slot points enter RadarData.points with
+#       measured=False -> liveTracks for display/telemetry; the radard
+#       snapshot drops measured=False wholesale, so control candidates are
+#       unchanged (consume spec: 默认仅显示)
+#   2 = control level (second-stage enable, V2 road test): quality-gated slot
+#       points are measured=True and become leadOne/leadTwo candidates
+SLOT_TABLE_LEVEL_MAX = 2
+SLOT_TABLE_DEFAULT = 1
 
 # ④f/④a lead gate + diff window (radar_dvrel_quality.py quantification)
 PRESENCE_VISIBLE = 7
@@ -99,6 +125,13 @@ class RadarInterface(RadarInterfaceBase):
     self.radar_dist_scale = RADAR_DIST_SCALE_DEFAULT
     self._lead_hist: deque[int] = deque(maxlen=VREL_DIFF_FRAMES + 1)  # b7 counts
     self._lead_visible = False
+    # 67ms multi-target slot table (blocks B/C/D): pure-python assembler, no
+    # DBC entries until the phase-1 定案 lands (design D3). Level injected by
+    # radarcan.py from the BydRadarSlotTable raw param; default here keeps the
+    # constructor param-free for the 38-platform truth-table probes.
+    self.slot_table_level = SLOT_TABLE_DEFAULT
+    self._slot_decoder = MultitargetDecoder()
+    self._slot_pending: list[dict] = []
 
   def _update_tracks(self) -> bool:
     """Refresh points from valid MRR slots. True if any slot is valid."""
@@ -128,11 +161,43 @@ class RadarInterface(RadarInterfaceBase):
     # slots that dropped or went invalid this cycle are stale (community _update
     # keeps zero-filled invalid points; we drop them - radarState only wants
     # targets). live_ids is empty when nothing is valid, so this also wipes the
-    # slot block the moment the last target leaves.
+    # slot block the moment the last target leaves. Scoped below 201: the
+    # slot-table namespace (SLOT_TRACK_ID_BASE) cleans up independently.
     for track_id in list(self.pts.keys()):
-      if track_id >= TRACK_ID_BASE and track_id not in live_ids:
+      if TRACK_ID_BASE <= track_id < SLOT_TRACK_ID_BASE and track_id not in live_ids:
         del self.pts[track_id]
     return any_valid
+
+  def _update_slot_points(self) -> None:
+    """Fold finished slot-table cycles into self.pts (layer 4). Points persist
+    across ticks while the decoder's track stays paired (misses == 0); a track
+    that missed its last cycle wipes immediately (tang-slot semantics).
+    Display level keeps measured=False - the radard snapshot drops
+    measured=False wholesale (consume spec: 默认仅显示). Control level (2)
+    publishes a point only with a diffable vRel: a NaN vRel coerced through
+    radard's _finite() would read as vLead=vEgo (the _update_hud hazard), so
+    no-history points stay display-only. Unpinned fields (lateral/attributes)
+    stay NaN-isolated until the phase-1 定案."""
+    for o in self._slot_pending:
+      if not o['valid'] or o['d'] is None:
+        continue
+      tid = o['track_id']
+      if tid not in self.pts:
+        self.pts[tid] = structs.RadarData.RadarPoint()
+        self.pts[tid].trackId = tid
+      pt = self.pts[tid]
+      pt.dRel = o['d']
+      pt.yRel = float('nan')     # 横向字段未定案：NaN 隔离（spec 定案门禁）
+      has_v = o['v_rel'] is not None
+      pt.vRel = o['v_rel'] if has_v else float('nan')  # 0.47 m/s quantized
+      pt.aRel = float('nan')
+      pt.yvRel = float('nan')
+      pt.measured = self.slot_table_level >= SLOT_TABLE_LEVEL_MAX and has_v
+    live = {t.track_id for t in self._slot_decoder.tracks if t.misses == 0}
+    for tid in list(self.pts.keys()):
+      if tid >= SLOT_TRACK_ID_BASE and tid not in live:
+        del self.pts[tid]
+    self._slot_pending = []
 
   def _update_lead_b7(self) -> bool:
     """Continuous fused lead from 0x109 b7 + 0x10A presence. True if visible."""
@@ -200,6 +265,12 @@ class RadarInterface(RadarInterfaceBase):
     if self.rcp_hud is None:
       return super().update(can_packets)
 
+    # the slot-table assembler sees every packet regardless of the watch-gate
+    # below: its 67ms cycles close independent of the 0x10x/HUD cadence, and
+    # finished observations wait in _slot_pending for the next RadarData
+    if self.slot_table_level > 0:
+      self._slot_pending.extend(self._slot_decoder.update(can_packets))
+
     self.updated_messages.update(self.rcp_tracks.update(can_packets))
     self.updated_messages.update(self.rcp_hud.update(can_packets))
     self.updated_messages.update(self.rcp_dist.update(can_packets))
@@ -219,6 +290,7 @@ class RadarInterface(RadarInterfaceBase):
     if not self._update_tracks():
       if not self._update_lead_b7():
         self._update_hud()
+    self._update_slot_points()
 
     ret.points = list(self.pts.values())
     return ret

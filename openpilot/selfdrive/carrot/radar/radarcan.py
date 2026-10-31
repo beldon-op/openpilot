@@ -5,7 +5,7 @@ import time
 
 from openpilot.cereal import car, messaging
 from openpilot.common.params import Params
-from openpilot.common.raw_params import get_float_param
+from openpilot.common.raw_params import get_float_param, get_int_param
 from openpilot.common.realtime import Priority, config_realtime_process
 from openpilot.common.runtime_diagnostics import RuntimeDiagnostics
 from openpilot.common.swaglog import cloudlog
@@ -41,6 +41,13 @@ def _rebuild_radar_interface(radar_interface, CP, previous=None):
   if hasattr(radar, "radar_dist_scale"):
     u = get_float_param(Params(), "BydRadarDistScale", radar.radar_dist_scale)
     radar.radar_dist_scale = min(0.5, max(0.1, u))
+  # BYD 67ms slot-table layer level (0=off / 1=display default / 2=control).
+  # Same injection story as the dist scale: opendbc stays params-free, this
+  # hook covers initial construction and every input-fault rebuild. Clamped
+  # to [0, 2] whatever the file says; 0 = b7-only rollback (零残留).
+  if hasattr(radar, "slot_table_level"):
+    lvl = get_int_param(Params(), "BydRadarSlotTable", radar.slot_table_level)
+    radar.slot_table_level = min(2, max(0, int(lvl)))
   return radar
 
 

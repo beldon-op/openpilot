@@ -21,7 +21,9 @@ import pytest
 
 from opendbc.car import CanData, structs
 from opendbc.car.byd.carstate import CarState
-from opendbc.car.byd.radar_gap import RadarGapMonitor, BAND_BOUNDARY_DOWN, SET_MARGIN, SET_TIME
+from opendbc.car.byd.radar_gap import (LANE_ADJACENT, LANE_OWN, LANE_UNKNOWN,
+                                       LANE_HYST_M, LANE_WIDTH_M,
+                                       RadarGapMonitor, BAND_BOUNDARY_DOWN, SET_MARGIN, SET_TIME)
 from opendbc.car.byd.values import CAR
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.controls.lib import desire_helper_byd
@@ -33,8 +35,8 @@ R = {2: 2.92, 3: 4.79, 4: 6.61}  # plateau medians (monitor header)
 DT = 0.01                    # card loop step, matches CarState.update_radar_gap
 
 
-def step(mon, dt, b7, presence=7, cls=3, v_ego=V, fresh=True):
-  mon.update(dt, b7, presence, cls, v_ego, fresh)
+def step(mon, dt, b7, presence=7, cls=3, v_ego=V, fresh=True, y=None):
+  mon.update(dt, b7, presence, cls, v_ego, fresh, y_rel=y)
   return mon.closing
 
 
@@ -283,5 +285,137 @@ class TestDesireGate:
       assert BydDesireHelper().radar_gap_gate == desire_helper_byd.RADAR_GAP_LEVEL_MAX
       desire_helper_byd.get_int_param = lambda params, key, default: -3
       assert BydDesireHelper().radar_gap_gate == 0
+    finally:
+      desire_helper_byd.get_int_param = orig
+
+
+class TestLaneDiscrimination:
+  """Stage-3 lane discrimination (byd-radar-multitarget-port): relative yRel
+  bands + hysteresis in the monitor, gate-3 consumption at the hooks."""
+
+  def run_closing(self, mon, y, cycles=400):
+    """Drive a sustained closure with the given lateral offset."""
+    out = False
+    for k in range(cycles):
+      r = R[3] - 0.4 * k * DT
+      out = step(mon, DT, int(r * V), y=y)
+      if mon.closing:
+        break
+    return out
+
+  def test_classification_bands(self):
+    mon = RadarGapMonitor()
+    self.run_closing(mon, y=1.0)                    # inside ±1.75 m
+    assert mon.lane == LANE_OWN
+    mon2 = RadarGapMonitor()
+    self.run_closing(mon2, y=2.5)                   # beyond band + margin
+    assert mon2.lane == LANE_ADJACENT
+
+  def test_hysteresis_exit_margin(self):
+    mon = RadarGapMonitor()
+    self.run_closing(mon, y=1.0)
+    assert mon.lane == LANE_OWN
+    # inside width+hysteresis: still own (no chatter at the band edge)
+    step(mon, DT, int(R[3] * V), y=LANE_WIDTH_M + LANE_HYST_M - 0.01)
+    assert mon.lane == LANE_OWN
+    # past width+hysteresis: exits to adjacent
+    step(mon, DT, int(R[3] * V), y=LANE_WIDTH_M + LANE_HYST_M + 0.01)
+    assert mon.lane == LANE_ADJACENT
+    # re-entry uses the tighter width (hysteresis is asymmetric)
+    step(mon, DT, int(R[3] * V), y=LANE_WIDTH_M + 0.01)
+    assert mon.lane == LANE_ADJACENT
+    step(mon, DT, int(R[3] * V), y=LANE_WIDTH_M - 0.01)
+    assert mon.lane == LANE_OWN
+
+  def test_invalid_yrel_degrades_not_guesses(self):
+    mon = RadarGapMonitor()
+    assert self.run_closing(mon, y=None)            # closing still fires (conservative)
+    assert mon.lane == LANE_UNKNOWN
+    assert mon.degraded == 1                        # one counted episode
+    mon2 = RadarGapMonitor()
+    self.run_closing(mon2, y=float('nan'))
+    assert mon2.lane == LANE_UNKNOWN and mon2.degraded == 1
+
+  def test_closing_semantics_unchanged_by_lane_input(self):
+    # byte-identical regression: the same closing sequence alerts identically
+    # with and without a yRel (the lane layer is additive telemetry)
+    a = RadarGapMonitor()
+    b = RadarGapMonitor()
+    for k in range(1000):
+      r = R[3] - 0.4 * k * DT
+      ca = step(a, DT, int(r * V))
+      cb = step(b, DT, int(r * V), y=0.4)
+      assert ca == cb
+      if ca:
+        break
+    assert a.closing == b.closing and a.degraded == 1 and b.degraded == 0
+
+
+class TestGate3LaneConsumption:
+  """The gate-3 hooks: adjacent-lane closings are telemetry only; UNKNOWN
+  degrades to the level-2 conservative answer; levels 1/2 never read lane."""
+
+  def make_dh(self, gate):
+    from openpilot.selfdrive.controls.lib.desire_lib.constants import LaneChangeDirection
+    dh = BydDesireHelper()
+    dh.lane_change_direction = LaneChangeDirection.left
+    dh.radar_gap_gate = gate
+    return dh
+
+  def test_gate3_adjacent_does_not_block_window(self):
+    dh = self.make_dh(3)
+    dh.lane_change_clear_time = LANE_CHANGE_CLEAR_TIME_MIN
+    dh._update_clear_window(cs_state(leftBlinker=True, radarGapClosing=True,
+                                     radarGapLane=LANE_ADJACENT))
+    # telemetry only: the window keeps accumulating instead of resetting
+    assert dh.lane_change_clear_time == LANE_CHANGE_CLEAR_TIME_MIN + DT_MDL
+    assert dh._clear_window_ok()
+
+  def test_gate3_own_lane_keeps_level1_semantics(self):
+    dh = self.make_dh(3)
+    dh.lane_change_clear_time = LANE_CHANGE_CLEAR_TIME_MIN
+    dh._update_clear_window(cs_state(leftBlinker=True, radarGapClosing=True,
+                                     radarGapLane=LANE_OWN))
+    assert dh.lane_change_clear_time == 0.0
+    assert not dh._clear_window_ok()
+
+  def test_gate3_unknown_lane_degrades_to_level2(self):
+    # radarGapLane absent (pre-schema carstate) or 0 = UNKNOWN -> conservative
+    dh = self.make_dh(3)
+    dh.lane_change_clear_time = LANE_CHANGE_CLEAR_TIME_MIN
+    dh._update_clear_window(cs_state(leftBlinker=True, radarGapClosing=True))
+    assert dh.lane_change_clear_time == 0.0
+    assert not dh._clear_window_ok()
+
+  def test_gate12_ignore_lane_field(self):
+    # spec: gate=1/2 semantics byte-identical - an ADJACENT closing still
+    # blocks (the lane refinement only exists at level 3)
+    for gate in (1, 2):
+      dh = self.make_dh(gate)
+      dh.lane_change_clear_time = LANE_CHANGE_CLEAR_TIME_MIN
+      dh._update_clear_window(cs_state(leftBlinker=True, radarGapClosing=True,
+                                       radarGapLane=LANE_ADJACENT))
+      assert dh.lane_change_clear_time == 0.0
+
+  def test_gate3_abort_suppressed_for_adjacent(self):
+    dh = self.make_dh(3)
+    assert not dh._mid_maneuver_abort(cs_state(leftBlinker=True, radarGapClosing=True,
+                                               radarGapNew=True, radarGapLane=LANE_ADJACENT))
+    assert dh._mid_maneuver_abort(cs_state(leftBlinker=True, radarGapClosing=True,
+                                           radarGapNew=True, radarGapLane=LANE_OWN))
+    # UNKNOWN degrades conservative: aborts like level 2
+    assert dh._mid_maneuver_abort(cs_state(leftBlinker=True, radarGapClosing=True,
+                                           radarGapNew=True, radarGapLane=LANE_UNKNOWN))
+
+  def test_gate2_abort_ignores_lane(self):
+    dh = self.make_dh(2)
+    assert dh._mid_maneuver_abort(cs_state(leftBlinker=True, radarGapClosing=True,
+                                           radarGapNew=True, radarGapLane=LANE_ADJACENT))
+
+  def test_gate_param_clamped_to_three(self):
+    orig = desire_helper_byd.get_int_param
+    try:
+      desire_helper_byd.get_int_param = lambda params, key, default: 9
+      assert BydDesireHelper().radar_gap_gate == desire_helper_byd.RADAR_GAP_LEVEL_MAX
     finally:
       desire_helper_byd.get_int_param = orig

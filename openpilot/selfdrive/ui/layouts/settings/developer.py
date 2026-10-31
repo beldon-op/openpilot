@@ -1,5 +1,5 @@
 from openpilot.common.params import Params
-from openpilot.common.raw_params import get_float_param, put_raw_param
+from openpilot.common.raw_params import get_float_param, get_int_param, put_raw_param
 from openpilot.selfdrive.ui.widgets.ssh_key import ssh_key_item
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.system.ui.widgets import Widget
@@ -18,6 +18,16 @@ from openpilot.system.ui.widgets import DialogResult
 RADAR_SCALE_PARAM = "BydRadarDistScale"
 RADAR_SCALE_DEFAULT = 0.25
 RADAR_SCALE_CHOICES = [0.20, 0.25, 0.3048, 0.30]
+
+# BYD T8 forward-gap gate + slot-table layer, raw int params (radarcan /
+# desire_helper_byd clamp whatever the file says). Same manual-provisioning
+# story as the dist scale until params_pyx ships the keys.
+GAP_GATE_PARAM = "BydRadarGapGate"
+GAP_GATE_DEFAULT = 0
+GAP_GATE_CHOICES = [0, 1, 2, 3]
+SLOT_TABLE_PARAM = "BydRadarSlotTable"
+SLOT_TABLE_DEFAULT = 1
+SLOT_TABLE_CHOICES = [0, 1, 2]
 
 # Description constants
 DESCRIPTIONS = {
@@ -40,6 +50,20 @@ DESCRIPTIONS = {
     "Pinned at 0.25 m/count; adjust only if a measured stop-to-lead gap disagrees. " +
     "Lane-change gap gating is scale-free and unaffected. " +
     "Applies when the radar process (radarcan) restarts - a power cycle is the simplest path."
+  ),
+  'byd_gap_gate': tr_noop(
+    "BYD forward-gap lane-change gate. 0 = off (factory behavior). " +
+    "1 = a closing forward gap blocks a lane-change start. " +
+    "2 = also abort a started change when a NEW target closes in. " +
+    "3 = lane-aware: adjacent-lane closings are telemetry only (own-lane " +
+    "closings keep the level-2 behavior; without lateral data everything " +
+    "stays at level 2). Applies on next card restart."
+  ),
+  'byd_slot_table': tr_noop(
+    "BYD 67ms multi-target slot table. 0 = off (b7-only). " +
+    "1 = display: multi-target points feed the UI/telemetry only. " +
+    "2 = control: quality-gated slot points may become lead candidates. " +
+    "Applies when the radar process (radarcan) restarts."
   ),
 }
 
@@ -101,6 +125,26 @@ class DeveloperLayout(Widget):
       icon="speed_limit.png",
     )
 
+    self._gap_gate_item = multiple_button_item(
+      lambda: tr("BYD Forward Gap Gate"),
+      description=lambda: tr(DESCRIPTIONS["byd_gap_gate"]),
+      buttons=["Off", "Level 1", "Level 2", "Level 3 (lane)"],
+      button_width=180,
+      callback=lambda i: put_raw_param(self._params, GAP_GATE_PARAM, GAP_GATE_CHOICES[i]),
+      selected_index=self._int_param_index(GAP_GATE_PARAM, GAP_GATE_DEFAULT, GAP_GATE_CHOICES),
+      icon="speed_limit.png",
+    )
+
+    self._slot_table_item = multiple_button_item(
+      lambda: tr("BYD Radar Slot Table"),
+      description=lambda: tr(DESCRIPTIONS["byd_slot_table"]),
+      buttons=["Off", "Display", "Control"],
+      button_width=180,
+      callback=lambda i: put_raw_param(self._params, SLOT_TABLE_PARAM, SLOT_TABLE_CHOICES[i]),
+      selected_index=self._int_param_index(SLOT_TABLE_PARAM, SLOT_TABLE_DEFAULT, SLOT_TABLE_CHOICES),
+      icon="speed_limit.png",
+    )
+
     self._ui_debug_toggle = toggle_item(
       lambda: tr("UI Debug Mode"),
       description="",
@@ -117,6 +161,8 @@ class DeveloperLayout(Widget):
       self._long_maneuver_toggle,
       self._alpha_long_toggle,
       self._radar_scale_item,
+      self._gap_gate_item,
+      self._slot_table_item,
       self._ui_debug_toggle,
     ], line_separator=True, spacing=0)
 
@@ -218,3 +264,7 @@ class DeveloperLayout(Widget):
 
   def _on_radar_scale(self, button_index: int):
     put_raw_param(self._params, RADAR_SCALE_PARAM, RADAR_SCALE_CHOICES[button_index])
+
+  def _int_param_index(self, key: str, default: int, choices: list[int]) -> int:
+    v = get_int_param(self._params, key, default)
+    return min(range(len(choices)), key=lambda i: abs(choices[i] - v))

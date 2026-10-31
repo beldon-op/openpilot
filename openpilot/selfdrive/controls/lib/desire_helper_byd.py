@@ -61,7 +61,20 @@ LANE_CHANGE_CLEAR_TIME_MIN = 0.5
 #       "target-lane car we are diving in front of" from "own-lane car we are
 #       escaping", and swinging back across the line toward the latter is the
 #       worse failure. laneChangeFinishing is never aborted (10-11 discipline).
-RADAR_GAP_LEVEL_MAX = 2
+#   3 - stage-3 lane discrimination (byd-radar-multitarget-port): the monitor
+#       classifies the closing target by its slot-table yRel into own/adjacent
+#       lane (relative bands + hysteresis, radar_gap.py; CarState publishes
+#       radarGapLane). Adjacent-lane closings stop blocking the clear window
+#       and stop aborting - they are telemetry only. Levels 1/2 ignore the
+#       lane field entirely (byte-identical semantics, spec discipline), and
+#       lane==UNKNOWN (slot table off / lateral fields 未定案 / NaN) degrades
+#       to the exact level-2 conservative behavior with the monitor's
+#       `degraded` counter ticking for the road test.
+RADAR_GAP_LEVEL_MAX = 3
+
+# radarGapLane values (car.capnp / radar_gap.py); duplicated here to keep the
+# hook predicate self-contained
+_GAP_LANE_ADJACENT = 2
 
 
 class BydDesireHelper(DesireHelper):
@@ -94,13 +107,27 @@ class BydDesireHelper(DesireHelper):
   def _gap_closing(self, carstate) -> bool:
     # T8: only BYD's gap parser path sets these; every other brand leaves both
     # false, and the gate defaults 0, so today this is inert by two layers.
-    return self.radar_gap_gate >= 1 and getattr(carstate, "radarGapClosing", False)
+    # Level 3 refines with the lane field: an ADJACENT-lane closing is
+    # telemetry only (no window reset); UNKNOWN degrades to the level-2
+    # conservative answer. Levels 1/2 never read the lane field.
+    if self.radar_gap_gate < 1 or not getattr(carstate, "radarGapClosing", False):
+      return False
+    if self.radar_gap_gate >= 3 and \
+       getattr(carstate, "radarGapLane", 0) == _GAP_LANE_ADJACENT:
+      return False
+    return True
 
   def _gap_new(self, carstate) -> bool:
     # level 2 abort additionally requires radarGapNew (target was invisible at
-    # the start edge); getattr guards the field on pre-schema carstates
-    return (self.radar_gap_gate >= 2 and getattr(carstate, "radarGapNew", False)
-            and getattr(carstate, "radarGapClosing", False))
+    # the start edge); getattr guards the field on pre-schema carstates.
+    # Level 3: same, minus adjacent-lane targets (lane UNKNOWN = conservative).
+    if self.radar_gap_gate < 2 or not getattr(carstate, "radarGapNew", False) \
+       or not getattr(carstate, "radarGapClosing", False):
+      return False
+    if self.radar_gap_gate >= 3 and \
+       getattr(carstate, "radarGapLane", 0) == _GAP_LANE_ADJACENT:
+      return False
+    return True
 
   def _update_clear_window(self, carstate):
     # accumulate continuous same-side clearance, reset on any hit; T8 level>=1

@@ -387,6 +387,43 @@ BO_ 547 AXAY: 8 XXX
  SG_ AxOffset : 12|12@1+ (0.027127,-21.593) [-1.0|1.0] "m/s^2" XXX
  SG_ Counter : 48|4@1+ (1,0) [0|15] "" XXX
 
+; ---------------------------------------------------------------------------
+; bus1 67ms multi-target slot table, block C distance frames ONLY (F0 of the
+; six object rows; docs/byd-radar-slot67-2026-10-18.md §1/§2). x = (b3&0xF)<<8
+; | b2, 11 bit LSB-first (bit 27 = state/overflow), PINNED 2026-10-31 to the engine
+; decode d = 0.062319*x - 1.671 (probe ladder + rd_spec_table g1/sig0 + R2=1.0000
+; regression on the engine output, 221 rows). x=0 empty slot; bit27/decode-floor =
+; range edge. The 1/32 slope-8 model is retired (scene-dependent anchor).
+; F1-F3 (0x381+4k..0x383+4k), block B (0x340-0x34A) and block D (0x3C8-0x3E3)
+; are HYPOTHESIS-isolated and deliberately NOT in this dbc - they enter only
+; after the phase-1 probe 定案 (openspec byd-radar-multitarget-port; decode
+; path is the pure-python assembler radar_multitarget.py, which does not read
+; this dbc). No on-car CANParser subscribes to these addresses.
+BO_ 896 RADAR_SLOTC_380: 8 XXX
+ SG_ MSG_SLOTC_CheckSum : 0|8@1+ (1,0) [0|255] "" XXX
+ SG_ MSG_SLOTC_CycleCounter : 8|8@1+ (1,0) [0|255] "" XXX
+ SG_ LongDist_C380 : 16|11@1+ (0.062319,-1.671) [0|125.9] "m" XXX
+BO_ 900 RADAR_SLOTC_384: 8 XXX
+ SG_ MSG_SLOTC_CheckSum : 0|8@1+ (1,0) [0|255] "" XXX
+ SG_ MSG_SLOTC_CycleCounter : 8|8@1+ (1,0) [0|255] "" XXX
+ SG_ LongDist_C384 : 16|11@1+ (0.062319,-1.671) [0|125.9] "m" XXX
+BO_ 904 RADAR_SLOTC_388: 8 XXX
+ SG_ MSG_SLOTC_CheckSum : 0|8@1+ (1,0) [0|255] "" XXX
+ SG_ MSG_SLOTC_CycleCounter : 8|8@1+ (1,0) [0|255] "" XXX
+ SG_ LongDist_C388 : 16|11@1+ (0.062319,-1.671) [0|125.9] "m" XXX
+BO_ 908 RADAR_SLOTC_38C: 8 XXX
+ SG_ MSG_SLOTC_CheckSum : 0|8@1+ (1,0) [0|255] "" XXX
+ SG_ MSG_SLOTC_CycleCounter : 8|8@1+ (1,0) [0|255] "" XXX
+ SG_ LongDist_C38C : 16|11@1+ (0.062319,-1.671) [0|125.9] "m" XXX
+BO_ 912 RADAR_SLOTC_390: 8 XXX
+ SG_ MSG_SLOTC_CheckSum : 0|8@1+ (1,0) [0|255] "" XXX
+ SG_ MSG_SLOTC_CycleCounter : 8|8@1+ (1,0) [0|255] "" XXX
+ SG_ LongDist_C390 : 16|11@1+ (0.062319,-1.671) [0|125.9] "m" XXX
+BO_ 916 RADAR_SLOTC_394: 8 XXX
+ SG_ MSG_SLOTC_CheckSum : 0|8@1+ (1,0) [0|255] "" XXX
+ SG_ MSG_SLOTC_CycleCounter : 8|8@1+ (1,0) [0|255] "" XXX
+ SG_ LongDist_C394 : 16|11@1+ (0.062319,-1.671) [0|125.9] "m" XXX
+
 CM_ BO_ 257 "transport retransmission twin of 0x105 (99.7-100 pct byte-identical incl b0 checksum); do NOT use as redundancy/checksum source for 0x109";
 CM_ BO_ 258 "sensor-health channel A (pair with 0x106); b4 slow physical quantity ~152 counts, meaning UNKNOWN - all bytes MSG placeholders";
 CM_ BO_ 261 "transport retransmission twin of 0x101 (see BO_ 257)";
@@ -394,3 +431,4 @@ CM_ BO_ 262 "sensor-health channel B (pair with 0x102); b4 slow physical quantit
 CM_ BO_ 265 "PINNED 2026-10-19 (owner decision, recalled real stop gap): LongDist_109 scale u = 0.25 m/bit. Prior state: TWO-way choice (feet 0.3048 vs 0.25) with hard upper bound u<=0.42-0.44 from 13 stop-to-lead events in byd_logs_2026-10-05_07 (u<=D/delta_b7 per window, lead cannot reverse) -> METERS 1.0 AND 0.5/0.45 REFUTED; stopped-gap median 15 counts -> 3.75 m at 0.25 (4.6 m at feet). 247 = loss-edge transient, 0 = no target, continuous max 246 -> 61.5 m. Not consumed by any on-car CANParser.";
 CM_ BO_ 265 "block-wide: b0 MSG_10x_CheckSum = SAE J1850 CRC-8(poly 0x1D init 0xFF no-refl xorout 0xFF) over b1..b7 - CRACKED 2026-10-18, 100% on 2933 unique payloads + 80100/80100 different-day frames 101/102/106/109/10A; b1 MSG_10x_AliveCounter = rolling counter (low nibble +1/frame, high nibble ~8Hz carry); skip both when modeling";
 CM_ BO_ 266 "Presence_10A: value 7 (bits 111) = forward target visible; cross-segment agreement with HUD lead median 98.62 pct over 415 segments; remaining bits are MSG placeholders";
+CM_ BO_ 896 "block-C F0 distance frame of object row 0 (0x380; rows stride 4 -> BO_ 900/904/908/912/916 = rows 1-5). b0 = SAE J1850 CRC-8 over b1..b7 (same family as the 0x10x chain, 100 pct on the 415-segment archive + the 2026-10-31 probe carrier); b1 = GLOBAL cycle counter, step 0x11, identical on every slot-table address of a cycle. x raw 16|12@1+ LSB-first = (b3&0xF)<<8|b2. PINNED 2026-10-31: 0.062319 m per count, offset -1.671 (engine decode; the 1/32 model retired 2026-10-31, physical seal = V2 stop-gap); x=0 empty placeholder, bit27 = state/edge. F1-F3/block B/block D fields are HYPOTHESIS - see the block comment at BO_ 896";
