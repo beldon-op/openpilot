@@ -176,8 +176,8 @@ class RadarInterface(RadarInterfaceBase):
     measured=False wholesale (consume spec: 默认仅显示). Control level (2)
     publishes a point only with a diffable vRel: a NaN vRel coerced through
     radard's _finite() would read as vLead=vEgo (the _update_hud hazard), so
-    no-history points stay display-only. Unpinned fields (lateral/attributes)
-    stay NaN-isolated until the phase-1 定案."""
+    no-history points stay display-only. yRel is PINNED (2026-11-02, trusted
+    band 8-60 m); other unpinned fields (attributes) stay NaN-isolated."""
     for o in self._slot_pending:
       if not o['valid'] or o['d'] is None:
         continue
@@ -187,7 +187,10 @@ class RadarInterface(RadarInterfaceBase):
         self.pts[tid].trackId = tid
       pt = self.pts[tid]
       pt.dRel = o['d']
-      pt.yRel = float('nan')     # 横向字段未定案：NaN 隔离（spec 定案门禁）
+      # yRel PINNED 2026-11-02 (byd-radar-y-wire-port 2.7): C-F0 lateral code,
+      # trusted band 8-60 m (Y_BAND_*); outside it stays NaN-isolated
+      y = o.get('y_rel')
+      pt.yRel = y if y is not None else float('nan')
       has_v = o['v_rel'] is not None
       pt.vRel = o['v_rel'] if has_v else float('nan')  # 0.47 m/s quantized
       pt.aRel = float('nan')

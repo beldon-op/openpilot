@@ -12,7 +12,8 @@ Structure per docs/byd-radar-slot67-2026-10-18.md (415-segment reverse):
     distance x11 = bits 16..26 of (b3&0xF)<<8|b2, decoded by the engine as
     d = 0.062319*x - 1.671 (PINNED 2026-10-31: probe ladder + vendor
     rd_spec_table g1/sig0 + R^2=1.0000 regression on the engine output; the
-    1/32 slope-8 model is retired - its anchor was scene-dependent).
+    1/32 slope-8 model is retired - its anchor was scene-dependent). F0 also
+    carries the lateral code (bits 35..45) - PINNED 2026-11-02, see Y_* below.
   - Block B (0x340-0x34A minus 342/345/348): 4 objects x 2 frames, near-field
     coarse table, F0 distance = b3 at 1 dm (sparse 13-window fit).
   - Block D (0x3C8-0x3E3): 7 objects x 4 frames - semantics OPEN. The
@@ -23,9 +24,10 @@ Structure per docs/byd-radar-slot67-2026-10-18.md (415-segment reverse):
     rd_spec_table double-source agree; see the phase-1 RE document.
 
 Decoding discipline (spec byd-radar-multitarget-decode):
-  - Only the pinned distance fields feed output points. Every unpinned field
-    stays NaN-isolated: the LAYOUT table below is intentionally empty until
-    the phase-1 定案 lands (HYPOTHESIS entries must never reach a point).
+  - Only pinned fields feed output points: C distance (2026-10-31) and C
+    lateral code -> yRel (2026-11-02). Every other unpinned field stays
+    NaN-isolated: the LAYOUT table below is intentionally empty until its
+    定案 lands (HYPOTHESIS entries must never reach a point).
   - vRel comes from the in-slot distance differential. One count per 67 ms
     cycle is 0.062319/0.06716 = 0.93 m/s - the quantization floor that makes
     this a LOW-QUALITY source (D4: b7 stays the primary vRel; slot points
@@ -75,6 +77,30 @@ C_DIST_OFFSET = -1.671       # m
 C_DIST_MIN_M = 0.0           # decode floor (x11 below ~27 decodes negative)
 C_DIST_MAX_M = 125.9         # 0.062319*2047 - 1.671
 B_DIST_SCALE = 0.1           # b3, 8 bit, range 25.5 m near-field coarse
+
+# lateral y decode - PINNED 2026-11-02 (byd-radar-y-wire-port 2.7 定案).
+#   code = bits 35..45 of the C-F0 frame, 11-bit offset binary, zero at 1024:
+#     code11 = ((b4 >> 3) | (b5 << 5)) & 0x7FF;  code = code11 - 1024
+#   y = (base + Y_D_OFF) * Y_K * (code - Y_C0),  base = x11 * C_DIST_SCALE.
+#   Sources: (a) vendor rd_spec_table g1/sig1 (start 35, len 11, scale 0.000501,
+#   offset -0.505509 = -K*1009); (b) engine-label verification 427/427 records,
+#   |Δy| median 11.8 mm with code and d exact (tools/byd/radar_y_wire_decode.py
+#   vs radar_y_stream_labels.py verbatim vendor run); (c) vision aggregate gate
+#   (design D4 per-track medians, vendor envelope 8-60 m): holdout median
+#   |Δy| = 0.135 m, bias -0.006 m - gate 0.4/0.15 passed at 1/3 of it.
+#   S1's affine kill of bits35-45 was a functional-form error: the code is
+#   distance-modulated (y ∝ d·code), invisible to any affine test. Defaults
+#   (c0, d_off) ARE the verdict constants - no installation re-fit is burned in
+#   (the vendor learns the same two parameters online; road test re-checks).
+Y_CODE_ZERO = 1024
+Y_K = 0.00050091
+Y_C0 = -15.0
+Y_D_OFF = -1.671
+Y_BAND_MIN_M = 8.0           # trusted band = vendor calibration envelope
+Y_BAND_MAX_M = 60.0          # outside -> yRel None (NaN isolation semantics)
+# C-F0 carrier addresses (rows 0-5); the gap-side y supply (carstate) parses
+# these six messages as raw twins - factor-1, u-free discipline
+SLOT_Y_ADDRS = tuple(range(0x380, 0x398, 4))
 
 # track identity (radar_interface maps these onto RadarPoint.trackId; the
 # 201+ base is namespaced away from the tang slots (101+) and HUD fallback (1))
@@ -154,6 +180,15 @@ class MultitargetDecoder:
         empty = raw == 0
         edge = (raw & 0x800) != 0 or not (C_DIST_MIN_M <= d <= C_DIST_MAX_M)
         d = d if not empty and not edge else None
+        # lateral code (same F0 frame, bits 35..45): y_rel only inside the
+        # trusted band - outside it the vision gate has no support (NaN stays)
+        y_rel = None
+        y_code = None
+        if d is not None and Y_BAND_MIN_M <= d <= Y_BAND_MAX_M:
+          code11 = ((f0[4] >> 3) | (f0[5] << 5)) & 0x7FF
+          code = code11 - Y_CODE_ZERO
+          y_code = code
+          y_rel = (x11 * C_DIST_SCALE + Y_D_OFF) * Y_K * (code - Y_C0)
       elif block == 'B':
         raw = f0[3]
         empty = raw == 0
@@ -171,7 +206,9 @@ class MultitargetDecoder:
         # spec allows measured=False or discard; v1 discards)
         self.stats[f'{block}_edge'] += 1
         continue
-      obs.append({'block': block, 'obj': obj, 'd': d, 'valid': True})
+      obs.append({'block': block, 'obj': obj, 'd': d, 'valid': True,
+                  'y_rel': y_rel if block == 'C' else None,
+                  'y_code': y_code if block == 'C' else None})
 
     # distance-gated pairing across object rows (slot algebra, spec scenario:
     # same target may move rows between cycles; continuity is distance-based)

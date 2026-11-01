@@ -68,8 +68,41 @@
 - [ ] **leadOne/leadTwo 切换频率**：开启 level=2 前先统计 level=1 显示流里 trackId 201+ 的生命周期（槽位重排 generation 跳变率）——抖动大则先调 `PAIR_MAX_JUMP_M`/`TRACK_MISS_CYCLES`，不带着闪烁上控制
 - [ ] **cut-in 捕获时延**（level=2）：邻车道逼近目标从进表到成为 leadTwo 候选的时延，对照 vision 确认时刻
 - [ ] **track 抖动观察**（level=2）：dRel 序列 vs b7 同目标对照（1/32m 细分辨率），差分 vRel 的 0.47 m/s 量化台阶是否被 KF 平掉
-- [ ] **横向字段状态**：yRel 仍为 NaN（未定案隔离）；阶段一定案入库后本项升级为「yRel vs 视觉 leadsV3 y 同屏」
+- [x] **横向字段状态**（byd-radar-y-wire-port 2.7 定案 2026-11-02）：yRel 已定案上车——C 块 F0 bits35-45 码字，可信带 8-60m（带外 NaN）；本项升级为「yRel vs 视觉 leadsV3 y 同屏」（见 y 通道节）
 - [ ] **回滚演练**：`BydRadarSlotTable=0` → radarcan 重启 → liveTracks 无 201+ 点、radarState 与 b7-only 一致（零残留）；确认切换未触发 CarParams 重生成（红线）
+
+## y 通道实车对拍（byd-radar-y-wire-port 阶段三，随趟 2 执行）
+
+y 已离线定案（引擎对拍 |Δy| 中位 11.8mm + 视觉聚合 holdout 0.135m/−0.006m@8-60m）。
+实车只做复验，判据就是离线定案的同一对门。
+
+- [ ] **实车对拍（live oracle vs vision）**：跟车 ≥20min（含 ≥3 次完整停走），jsonl 取
+  `radarGapLane`≠0 的帧配 modelV2 leadsV3，**聚合口径复验**（每航迹窗内中位，航迹 ≥30 样本）：
+  航迹中位 |Δy| ≤ 0.4m 且 bias ≤ 0.15m → 过门；只统计 8-60m 带（带外 NaN 是规格语义，非故障）
+- [ ] **配对率首次读数**：`radarGapLane` 分布三态占比（0/1/2）；配对率 = 1 − lane==0 占比。
+  离线预测：跟车段 24-32%@1.5m 门、全库段中位 4%——实车 ACC 跟车场景显著低于 10% 时查
+  PAIR_GATE_M/槽表健康，**不要现场调门值**
+- [ ] **y 供源健康**：CarState.gap_y_pair 计数（台架/ssh 读）与 lane 占比互证；presence 有效但
+  长期 lane=0 → 槽表/0x109 链路体检（对照趟 1 的 V1 遥测项）
+- [ ] **gate=3 消费观察**（若本趟 `BydRadarGapGate=3`）：lane 从 0→1/2 的跳变与变道 hook 行为，
+  恶劣表现先回 gate=0 再归因，不带着异常升档
+
+## 统一出车验证清单（阶段三合并项；各源变更的遗留销项在此收口）
+
+- [ ] **multitarget-port 3.5**：lane_width/hyst 定标——y 实车对拍过门后，用实车 y 分布重定
+  `LANE_WIDTH_M`/`LANE_HYST_M`（radar_gap.py，当前 1.75/0.25 占位先验）
+- [ ] **multitarget-port 2.8 槽表观察项**：见上节（leadOne/leadTwo 切换、cut-in 时延、track 抖动）
+- [ ] **金字塔登记**：V0 台架报告 → V2 实测报告 → V3 alpha 登记（byd-roadmap 金字塔口径），
+  y 通道按本节判据走同一流程
+- [ ] **b7 链 V2 gate1**：stock dRel 标定（synth-lead-port 遗留）→ **V3 跟停**（alpha 纵向）
+- [ ] **常数重标回路**（只在超门时走）：重跑阶段一 harness（`tools/byd/radar_y_wire_decode.py`
+  + `radar_y_stream_labels.py`，docker aarch64），半天级；改常数必须带新验收数字与版本注释
+
+## 通过判据与归档条件（4.3）
+
+- [ ] y 实车聚合口径过门（0.4/0.15）→ multitarget-port 3.5/2.7 遗留销项、y-wire-port 3.x 转实测态、
+  **`byd-radar-y-wire-port` 与 `byd-radar-multitarget-port` 两变更可归档**
+- [ ] 不过门 → 常数重标（上半节回路），**禁止**现场改码；两变更维持不归档
 
 ## 退路（任意趟爆雷，按序，不即兴）
 
@@ -90,6 +123,7 @@
 |---|---|---|---|
 | `BydRadarGapGate` | desire_helper_byd 三 hook | card 重启（下次点火） | 0（关） |
 | `BydRadarSlotTable` | radarcan.py 注入 RI，clamp [0,2] | **重启 radarcan** | 1（显示级；2=控制消费二段） |
+| （y 常数） | radar_multitarget.py Y_*（非参数，编译期） | 随部署 | K=0.00050091, c0=−15, d_off=−1.671, 带 8-60m |
 | `BydRadarDistScale` | radarcan.py 注入 RI | **重启 radarcan**，clamp [0.1,0.5] | 0.25（钉定待实测） |
 | `AlphaLongitudinalEnabled` | interface `_get_params`（safetyParam bit2） | 下次点火；禁 onroad cycle | 0 |
 | `DriverMonitoringEnabled` | selfdrived | — | 0（无摄像头） |

@@ -66,6 +66,16 @@ LANE_ADJACENT = 2    # beyond the band + hysteresis margin
 LANE_WIDTH_M = 1.75  # own-lane half-width PLACEHOLDER (±1.75 m prior, 3.5)
 LANE_HYST_M = 0.25   # band-exit margin: leave own-band past width+HYST (chatter guard)
 
+# y supply pairing gate (byd-radar-y-wire-port 2.5 定门 2026-11-02, design D3):
+# the slot row feeding y_rel is the one whose distance best matches the b7 lead
+# (|d_row - b7*0.25| <= gate, nearest wins). 415-segment measurement: on real
+# ACC-following segments <=1.5 m pairs 75% of cycles (<=3 m: 94%); across the
+# whole archive presence-valid cycles pair 2.2% - the lead is often not
+# slot-tracked, and no-pair degrades to LANE_UNKNOWN by design. 1.5 m ~ 6x the
+# b7 quantization step and absorbs the F0-to-step closing slop.
+GAP_Y_PAIR_GATE_M = 1.5
+GAP_Y_FRESH_S = 0.15  # row latch older than this does not pair (F0 cadence 67 ms)
+
 
 class RadarGapMonitor:
   def __init__(self):

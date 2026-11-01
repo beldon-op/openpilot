@@ -9,7 +9,8 @@ from opendbc.car import CanData, structs
 from opendbc.car.byd.radar_interface import (ACC_HUD_ADAS_MSG, B7_HI, B7_LO, DIST_MSGS,
                                              HUD_TRACK_ID, RadarInterface, SLOT_TRACK_ID_BASE,
                                              TRACK_ID_BASE, TRACK_MSGS)
-from opendbc.car.byd.radar_multitarget import C_DIST_OFFSET, C_DIST_SCALE, j1850_crc8
+from opendbc.car.byd.radar_multitarget import (C_DIST_OFFSET, C_DIST_SCALE, j1850_crc8,
+                                               Y_C0, Y_D_OFF, Y_K)
 from opendbc.car.byd.values import CAR, RADAR_DIST_SCALE_DEFAULT, RADAR_HUD_BARS_TO_M
 
 MSG_T_NS = int(1e9 / 50)  # HUD rate; track frames ride the same tick, fine for tests
@@ -300,7 +301,16 @@ class TestSlotTable:
     slot_pts = [p for p in out.points if p.trackId >= SLOT_TRACK_ID_BASE]
     assert slot_pts and all(not p.measured for p in slot_pts)
     assert slot_pts[0].dRel == pytest.approx(400 * C_DIST_SCALE + C_DIST_OFFSET, abs=1e-6)
-    assert slot_pts[0].yRel != slot_pts[0].yRel          # NaN-isolated (未定案)
+    # yRel PINNED 2026-11-02 (byd-radar-y-wire-port 2.7): the frame's b4/b5 are
+    # zero -> code = -1024; d=23.3 m is inside the trusted band -> finite decode
+    assert slot_pts[0].yRel == pytest.approx(
+      (400 * C_DIST_SCALE + Y_D_OFF) * Y_K * (-1024 - Y_C0), abs=1e-5)
+
+  def test_slot_y_nan_outside_band(self):
+    # the trusted band (8-60 m) keeps NaN isolation outside it
+    out = self.slot_feed(make_ri(False), 24, x=1150)   # ~70 m > band
+    slot_pts = [p for p in out.points if p.trackId >= SLOT_TRACK_ID_BASE]
+    assert slot_pts and all(p.yRel != p.yRel for p in slot_pts)
 
   def test_b7_semantics_unchanged_by_slot_table(self):
     # rollback regression: the b7 point is byte-identical with the slot table

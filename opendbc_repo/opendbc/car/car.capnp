@@ -301,9 +301,11 @@ struct CarState {
   radarGapNew @106 :Bool;      # target newly became radar-visible (capture leads the HUD gear by >=10 s)
   # BYD T8 lane discrimination (byd-radar-multitarget-port stage 3): relative
   # lateral classification of the closing target, hysteresis in radar_gap.py.
-  # 0 = unknown (yRel invalid: slot table off / lateral fields 未定案 / NaN) -
-  # consumers degrade to the pre-lane conservative semantics and the road-test
-  # telemetry counts these frames; 1 = own lane band; 2 = adjacent lane band.
+  # 0 = unknown (yRel unavailable: slot table off / no row pairs with the b7
+  # lead / y outside the 8-60 m trusted band) - consumers degrade to the
+  # pre-lane conservative semantics; the share of lane==0 frames is the
+  # pairing-rate telemetry surface (byd-radar-y-wire-port 2.5/3.5, no new
+  # fields); 1 = own lane band; 2 = adjacent lane band.
   radarGapLane @107 :UInt8;
 
   # Optional original vehicle receive signal. Separate from torque/override.

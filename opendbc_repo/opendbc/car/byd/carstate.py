@@ -2,7 +2,10 @@ from opendbc.can import CANDefine, CANParser
 from opendbc.car import Bus, structs
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.interfaces import CarStateBase
-from opendbc.car.byd.radar_gap import RadarGapMonitor
+from opendbc.car.byd.radar_gap import (GAP_Y_FRESH_S, GAP_Y_PAIR_GATE_M,
+                                       PRESENCE_VISIBLE, RadarGapMonitor)
+from opendbc.car.byd.radar_multitarget import (SLOT_Y_ADDRS, Y_BAND_MAX_M, Y_BAND_MIN_M,
+                                               Y_C0, Y_CODE_ZERO, Y_K)
 from opendbc.car.byd.values import DBC, CarControllerParams
 
 # Boot-mid-cruise engage hold (see the latch block in update): when the device
@@ -88,8 +91,17 @@ class CarState(CarStateBase):
     # until the BydRadarGapGate param flips (road-test gate, desire_helper_byd).
     self.gap_cp = None
     if Bus.radar in DBC[CP.carFingerprint]:
-      self.gap_cp = CANParser(DBC[CP.carFingerprint][Bus.radar], [(265, 25), (266, 25)], 1)
+      # stage-3 y supply (byd-radar-y-wire-port 3.2): the C-F0 rows ride this
+      # same independent parser (canValid/canTimeout semantics untouched).
+      gap_msgs = [(265, 25), (266, 25)] + [(a, 15) for a in SLOT_Y_ADDRS]
+      self.gap_cp = CANParser(DBC[CP.carFingerprint][Bus.radar], gap_msgs, 1)
     self.gap_mon = RadarGapMonitor()
+    # D3 y pairing state: per-row (d, y) latched at its own F0 frame, plus
+    # pairing counters for the gap telemetry surface (3.5, no new capnp)
+    self._gap_y_rows: dict[int, tuple[float, float]] = {}
+    self._gap_y_steps: dict[int, int] = {}
+    self._gap_step = 0
+    self.gap_y_pair = (0, 0)  # (paired, seen) steps
 
   def update(self, can_parsers) -> structs.CarState:
     cp = can_parsers[Bus.pt]
@@ -351,10 +363,46 @@ class CarState(CarStateBase):
     presence = int(self.gap_cp.vl[266]["Presence_10A"])
     hud = self.adas_msg
     cls = int(hud.get("HasLead", 0)) * int(hud.get("LeadingDistance", 0))
-    # y_rel wiring point (stage-3 lane discrimination): the slot table's
-    # lateral fields stay 未定案 (NaN-isolated, radar_multitarget.py), so the
-    # monitor runs degraded (LANE_UNKNOWN) until the phase-1 定案 lands and the
-    # gap CANParser gains the lateral signal - the conservative pre-lane
-    # semantics is exactly the specified fallback, and `degraded` counts it.
-    self.gap_mon.update(0.01, b7, presence, cls, float(v_ego), fresh, y_rel=None)
+    y_rel = self._slot_y_rel(updated, b7, presence)
+    self.gap_mon.update(0.01, b7, presence, cls, float(v_ego), fresh, y_rel=y_rel)
     return self.gap_mon.closing, self.gap_mon.new_target
+
+  def _slot_y_rel(self, updated, b7: int, presence: int):
+    """byd-radar-y-wire-port 3.2: distance-gated slot-row y supply (design D3).
+
+    The C-F0 lateral code is PINNED (2026-11-02, radar_multitarget.py Y_*) and
+    rides the gap parser as a factor-1 raw twin. Each row's (d, y) latches at
+    its own F0 frame (F0-instant data, y trusted only inside the 8-60 m band).
+    At each step the fresh rows pair against the current b7 lead: nearest
+    |d_row - b7*0.25| within GAP_Y_PAIR_GATE_M wins; no pair -> None, which is
+    exactly the monitor's LANE_UNKNOWN degradation. The lead-validity gate
+    mirrors the monitor's b7 source (presence==7 AND 0 < b7 <= 245). Counters
+    feed the gap telemetry surface (3.5)."""
+    self._gap_step += 1
+    seen = self.gap_y_pair[1] + 1
+    y_rel = None
+    if presence == PRESENCE_VISIBLE and 0 < b7 <= 245:
+      b7_m = b7 * 0.25
+      best = None
+      for addr in SLOT_Y_ADDRS:
+        if addr in updated:
+          vl = self.gap_cp.vl[addr]
+          d = float(vl[f"LongDist_C{addr:X}"])
+          code = int(vl[f"MSG_SLOTC_LatCodeRaw_C{addr:X}"]) - Y_CODE_ZERO
+          if Y_BAND_MIN_M <= d <= Y_BAND_MAX_M:
+            # (base + d_off) = d: the dbc distance already carries the offset
+            self._gap_y_rows[addr] = (d, d * Y_K * (code - Y_C0))
+            self._gap_y_steps[addr] = self._gap_step
+        row = self._gap_y_rows.get(addr)
+        step = self._gap_y_steps.get(addr)
+        if row is None or self._gap_step - step > round(GAP_Y_FRESH_S / 0.01):
+          continue
+        dj = abs(row[0] - b7_m)
+        if dj <= GAP_Y_PAIR_GATE_M and (best is None or dj < best[0]):
+          best = (dj, row[1])
+      if best is not None:
+        y_rel = best[1]
+        self.gap_y_pair = (self.gap_y_pair[0] + 1, seen)
+        return y_rel
+    self.gap_y_pair = (self.gap_y_pair[0], seen)
+    return None
