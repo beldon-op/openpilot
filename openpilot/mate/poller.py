@@ -5,8 +5,9 @@ mate 事件源：订阅 cereal 总线，推导边沿事件与周期状态帧并�
   opstate selfdriveState 状态机跳转 {"state", "enabled", "active", "engageable"}
   button  方向盘按键边沿           {"button", "pressed"}
   sound   播报声音变化             {"sound", "file", "loop", "alertText1", "alertText2"}
-  frame   2Hz 周期状态帧           {"car"?, "radar"?}：驾驶屏连续值，段与快照同源；
-          窗口内 carState/radarState 均无更新（offroad）则不推
+  frame   2Hz 周期状态帧           {"car"?, "radar"?, "carrot"?}：驾驶屏连续值，
+          段与快照同源；窗口内 carState/radarState/carrotMan 均无更新（offroad）则不推；
+          carrot 段为协议 v4 新增（carrotMan 遥测），仅进 frame 不进快照
 
 v3 起不再有 navi kind：其输入 carrotNavi 即 carrotmate（客户端）经 7706/7714 上行
 推送的导航数据，回推属回声——服务定位原则：mate 只推 op 独有数据，客户端自产的
@@ -183,15 +184,36 @@ def radar_snapshot(rs) -> dict:
 
 # ---------------- frame：周期状态帧 ----------------
 
-def frame_payload(car: dict | None, radar: dict | None) -> dict | None:
-  """frame 帧组装（纯函数）：仅出现有数据的段；两段全空（窗口无更新）返回 None。"""
-  if car is None and radar is None:
+def carrot_snapshot(cm) -> dict:
+  """carrotMan → frame carrot 段（协议 v4 新增，JSON-able）。字段名与 cereal
+  carrotMan 一致，源数据即 carrot_man 20Hz 聚合输出；Text 字段 None 归一空串。
+  仅进 frame 不进快照（快照段集合不变，客户端初始化由首帧 frame 补齐）。"""
+  return {
+    "nRoadLimitSpeed": int(cm.nRoadLimitSpeed),
+    "xSpdLimit": int(cm.xSpdLimit),
+    "xSpdDist": int(cm.xSpdDist),
+    "xSpdCountDown": int(cm.xSpdCountDown),
+    "xDistToTurn": int(cm.xDistToTurn),
+    "xTurnCountDown": int(cm.xTurnCountDown),
+    "desiredSpeed": int(cm.desiredSpeed),
+    "desiredSource": str(cm.desiredSource or ""),
+    "szPosRoadName": str(cm.szPosRoadName or ""),
+    "leftSec": int(cm.leftSec),
+    "trafficState": int(cm.trafficState),
+  }
+
+
+def frame_payload(car: dict | None, radar: dict | None, carrot: dict | None = None) -> dict | None:
+  """frame 帧组装（纯函数）：仅出现有数据的段；各段全空（窗口无更新）返回 None。"""
+  if car is None and radar is None and carrot is None:
     return None
   out: dict = {}
   if car is not None:
     out["car"] = car
   if radar is not None:
     out["radar"] = radar
+  if carrot is not None:
+    out["carrot"] = carrot
   return out
 
 
@@ -205,13 +227,14 @@ class FrameTicker:
     self.next_t = now + period_s
     self.car: Optional[dict] = None
     self.radar: Optional[dict] = None
+    self.carrot: Optional[dict] = None
 
   def tick(self, now: float) -> Optional[dict]:
     if now < self.next_t:
       return None
     self.next_t = max(self.next_t + self.period_s, now + self.period_s)
-    payload = frame_payload(self.car, self.radar)
-    self.car = self.radar = None
+    payload = frame_payload(self.car, self.radar, self.carrot)
+    self.car = self.radar = self.carrot = None
     return payload
 
 
@@ -374,6 +397,10 @@ class MatePoller:
         if self.set_state is not None:
           self.set_state("radar", radar)
         ticker.radar = radar
+
+      # carrot 遥测：20Hz 输入随轮喂 frame 窗口（协议 v4 carrot 段）；不进快照
+      if sm.updated["carrotMan"]:
+        ticker.carrot = carrot_snapshot(sm["carrotMan"])
 
       payload = ticker.tick(now)
       if payload:

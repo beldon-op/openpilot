@@ -19,8 +19,10 @@ mate — 车机事件实时推送服务（局域网）
 
 WS 客户端也可发 {"type":"snapshot"} 走同一条连接拿快照。协议文档见 mate/API.md。
 
-协议 v3：hello.version=3；kind 白名单 events/opstate/button/sound/frame；
+协议 v4：hello.version=4；kind 白名单 events/opstate/button/sound/frame；
 WS 鉴权失败在升级后发 {"type":"error"} 帧再关闭（SSE 仍为 HTTP 401）。
+v4 在 v3 基础上为 frame 增加 carrot 段（carrotMan 遥测）；纯加法，v3 客户端按
+「未知字段忽略」约定兼容。
 
 可选鉴权：params 写 MateToken 后，/ws /stream /state /sounds 必须带 ?token=xxx 或
 Authorization: Bearer xxx。白名单外的 key 走 /data/params/d 文件直读。
@@ -49,7 +51,7 @@ from openpilot.selfdrive.ui.soundd import (
 )
 
 PORT = int(os.environ.get("MATE_PORT", "8083"))
-PROTOCOL_VERSION = 3  # v3：移除回声 navi kind、新增 frame 周期状态帧；客户端按 hello.version 探测能力
+PROTOCOL_VERSION = 4  # v4：在 v3 基础上为 frame 增加 carrot 段（carrotMan 遥测）；版本号是能力标签，与能力同一变更落地（见 design D3）
 ALL_KINDS = ("events", "opstate", "button", "sound", "frame")
 STATE_KINDS = ("events", "opstate", "sound")  # emit 时同步写进 /state 快照的类型；
 # frame 不在其中——其 car/radar 段由 poller 显式喂快照，kind 本身只广播不进快照

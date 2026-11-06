@@ -25,16 +25,18 @@ class TestHubSnapshot:
     assert snap["data"]["opstate"]["data"]["state"] == "enabled"
     assert "button" not in snap["data"]  # 边沿瞬时事件不进快照
 
-  def test_frame_kind_and_v3_whitelist(self):
+  def test_frame_kind_and_v4_whitelist(self):
     # v3：navi 移除（回声——输入即客户端上行数据）；frame 为周期状态帧，
     # kind 本身不进快照也不补发（car/radar 段由 poller 显式喂快照）
+    # v4：frame 增加 carrot 段（carrotMan 遥测），kind 白名单不变
     hub = Hub()
-    hub.emit("frame", {"car": {"vEgo": 10.0}, "radar": {"leadOne": {"status": False}}})
+    hub.emit("frame", {"car": {"vEgo": 10.0}, "radar": {"leadOne": {"status": False}},
+                       "carrot": {"nRoadLimitSpeed": 100}})
     snap = hub.state_snapshot()
-    assert "frame" not in snap["data"]
+    assert "frame" not in snap["data"]  # carrot 段随 kind 整体排除，不进快照
     assert hub.replay_snapshot() == []
     assert "navi" not in ALL_KINDS and "frame" in ALL_KINDS
-    assert PROTOCOL_VERSION == 3
+    assert PROTOCOL_VERSION == 4
 
   def test_frame_reaches_only_subscribed_clients(self):
     hub = Hub()

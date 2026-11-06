@@ -1,10 +1,11 @@
 # mate 接口文档
 
 车机事件实时推送服务。订阅 cereal 消息总线，把告警事件、openpilot 状态机跳转、
-方向盘按键、播报声音四类**边沿事件**与 2Hz 的 **frame 周期状态帧**（car/radar 段）
+方向盘按键、播报声音四类**边沿事件**与 2Hz 的 **frame 周期状态帧**（car/radar/carrot 段）
 通过 **WebSocket** 或 **SSE** 推给局域网客户端，并提供一次性状态快照 `GET /state`。
 
-> **协议版本：v3**（`hello.version = 3`）。v2 → v3 迁移要点见 §9。
+> **协议版本：v4**（`hello.version = 4`）。客户端迁移要点见 §9；v3 → v4 变更：
+> `frame` 新增 `carrot` 段（carrotMan 遥测），kind 白名单与鉴权语义不变。
 
 ## 0. 服务定位原则与架构
 
@@ -83,7 +84,7 @@ rm /data/params/d/MateToken                          # 关
 | `opstate` | openpilot 状态机跳转 / enabled/active/engageable 变化 | ✔ | ✘ |
 | `button` | 方向盘按键按下/松开（边沿帧） | ✘ | ✘ |
 | `sound` | 播报声音切换（含 carrot 倒计时报数） | ✔ | ✔（正在播报时） |
-| `frame` | **2Hz 周期状态帧**（car/radar 段，驾驶屏连续值） | ✘（段进快照） | ✘（走快照） |
+| `frame` | **2Hz 周期状态帧**（car/radar/carrot 段，驾驶屏连续值） | ✘（段进快照） | ✘（走快照） |
 
 ---
 
@@ -99,7 +100,7 @@ rm /data/params/d/MateToken                          # 关
 
 | type | 触发时机 | 说明 |
 |---|---|---|
-| `hello` | 连接建立后第一条 | `{"service":"mate","version":3,"port":8083,"kinds":[...]}`；`version` 供客户端探测能力 |
+| `hello` | 连接建立后第一条 | `{"service":"mate","version":4,"port":8083,"kinds":[...]}`；`version` 供客户端探测能力 |
 | `events` / `opstate` / `button` / `sound` / `frame` | 见 §4 | 事件/状态本体 |
 | `snapshot` | 响应 snapshot 请求 | 见 §5 |
 | `subscribed` | 响应 subscribe 请求 | `{"kinds":[...]}` 当前生效过滤 |
@@ -107,8 +108,8 @@ rm /data/params/d/MateToken                          # 关
 | `pong` | 响应 ping | `{"ts": <monotonic>}` |
 
 > **版本约定**：`hello.version` 升级代表 kind 集或语义变化。客户端**必须忽略未知
-> type**（未升级的客户端连 v3 服务会多收到 `frame` 消息，按此约定静默忽略即可），
-> 据此实现前后向兼容。
+> type 与未知字段**（未升级的客户端连 v4 服务会多收到 `frame` 消息及其中 v4 新增的
+> `carrot` 字段，按此约定静默忽略即可），据此实现前后向兼容。
 
 连接建立后依次收到：`hello` → （当前活跃告警的 `events` 补发，有则发）→
 （当前正在播报的 `sound` 补发，有则发）。**按键与 frame 不补发**——客户端拿当前
@@ -165,6 +166,7 @@ ws.onmessage = (e) => {
       // 2Hz 驾驶屏连续值：车速/挡位/巡航/前车距离（last-wins，丢帧无害）
       if (msg.data.car) console.log("车速:", msg.data.car.vEgoKph);
       if (msg.data.radar) console.log("前车距离:", msg.data.radar.leadOne?.dRel);
+      if (msg.data.carrot) console.log("道路限速:", msg.data.carrot.nRoadLimitSpeed);
       break;
     default:
       // 未知 type 一律忽略（协议向前兼容的关键约定）
@@ -322,9 +324,9 @@ onroad 告警集合**发生变化时**推送（出现/消失去抖，不每帧�
 - **与 soundd 的唯一差异**：soundd 会等有限长音效播完才转 `none`，mate 没有音频时钟，
   推导结束即推 `none`（客户端只会提前停播，不会漏停）
 
-### 4.5 `frame` 周期状态帧（v3 新增）
+### 4.5 `frame` 周期状态帧（v3 新增；v4 增加 `carrot` 段）
 
-**2Hz 周期推送** `{car?, radar?}`，喂驾驶屏的连续值（车速/挡位/巡航/前车距离）。
+**2Hz 周期推送** `{car?, radar?, carrot?}`，喂驾驶屏的连续值（车速/挡位/巡航/前车距离）。
 段与快照 `car`/`radar` 段**同源同函数**——一个拉（快照）一个推（frame），结构一致。
 last-wins 语义：允许丢帧（客户端直接以最新帧覆盖状态即可），offroad（数据源停止）
 自动停推。
@@ -334,13 +336,14 @@ last-wins 语义：允许丢帧（客户端直接以最新帧覆盖状态即可�
   "type": "frame",
   "data": {
     "car":   { "vEgoKph": 54.0, "gearShifter": "drive", "...": "..." },
-    "radar": { "leadOne": { "status": true, "dRel": 32.5, "...": "..." } }
+    "radar": { "leadOne": { "status": true, "dRel": 32.5, "...": "..." } },
+    "carrot": { "nRoadLimitSpeed": 100, "leftSec": 3, "...": "..." }
   }
 }
 ```
 
 段出现规则：仅包含有数据的段——`radarState` 从未见数据（offroad 启动初期）时
-`radar` 段不出现；两段都无更新（offroad）则整帧不推。
+`radar` 段不出现；各段都无更新（offroad）则整帧不推。
 
 #### `car` 段字段
 
@@ -374,6 +377,29 @@ Lead 对象（字段名与 carrotmate `Lead` 模型一致，`trackId` 即 cereal
 
 典型用法：`leadOne.dRel` → 前车距离条；`vRel<0` 持续 → 接近趋势；
 `leadLeft/leadRight.status` → 邻车道车可视化。
+
+#### `carrot` 段字段（**v4 新增**）
+
+取自 `carrotMan`（carrot_man 20Hz 聚合输出，frame 取窗口内最新值）。
+`carrot_man` 进程未运行（或未开搭子）时该段不出现。**仅进 frame 不进快照**——
+客户端初始化由首帧 frame（≤0.5s）补齐。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `nRoadLimitSpeed` | int | 当前道路限速 km/h（AMap road 源，0=无效） |
+| `xSpdLimit` | int | 当前生效的测速/电子眼限速 km/h（0=无） |
+| `xSpdDist` | int | 距测速点距离 m |
+| `xSpdCountDown` | int | 测速倒计时 s |
+| `xDistToTurn` | int | 距下一转向距离 m |
+| `xTurnCountDown` | int | 转向倒计时 s |
+| `desiredSpeed` | int | carrot 多源最小决策目标速度 km/h |
+| `desiredSource` | string | 胜出来源（road/sdi/atc/vturn…），空串=无 |
+| `szPosRoadName` | string | 当前路名（高德），空串=无 |
+| `leftSec` | int | 测速倒计时秒（驱动 1-10s beep，0=长切告警） |
+| `trafficState` | int | 红绿灯状态 0-3（无/红灯/绿-将停/绿灯） |
+
+典型用法：手机端 SpeedLimitDetector/语音包告警改吃本段，不再依赖
+`car.speedLimitKph`（BYD 上恒 0——本仓 BYD carstate 无 CAN 限速源）。
 
 ---
 
@@ -536,7 +562,17 @@ cd /data/openpilot && source launch_env.sh && python -m openpilot.mate
 
 ---
 
-## 9. v2 → v3 客户端迁移要点
+## 9. 客户端迁移要点
+
+### v3 → v4
+
+| 变化 | v3 | v4 | 客户端动作 |
+|---|---|---|---|
+| `frame.carrot` 段 | ✘ | 2Hz 帧新增可选 `carrot` 段（carrotMan 遥测） | **v3 客户端零迁移**：未知字段忽略即可；需要限速/测速/转向遥测的客户端新增 `frame.carrot` 消费分支（BYD 上 `car.speedLimitKph` 恒 0，限速显示走本段） |
+| `hello.version` | 3 | 4 | 按版本探测能力，未知 type/字段一律忽略 |
+| 快照 / 白名单 / 鉴权 | — | 不变 | 无 |
+
+### v2 → v3
 
 | 变化 | v2 | v3 | 客户端动作 |
 |---|---|---|---|

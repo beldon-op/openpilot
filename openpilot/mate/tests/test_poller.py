@@ -8,6 +8,7 @@ from openpilot.mate.poller import (
   FrameTicker,
   SoundTracker,
   button_payloads,
+  carrot_snapshot,
   car_snapshot,
   diff_events,
   enum_name,
@@ -258,13 +259,40 @@ class TestRadarSnapshot:
     assert snap["leadsCenterCount"] == 0 and snap["radarErrors"] == []
 
 
+class TestCarrotSnapshot:
+  def test_field_mapping(self):
+    # 字段名与 cereal CarrotMan 一致直传（协议 v4 carrot 段，11 字段）
+    cm = custom.CarrotMan.new_message(
+      nRoadLimitSpeed=100, xSpdLimit=80, xSpdDist=1234, xSpdCountDown=56,
+      xDistToTurn=200, xTurnCountDown=7, desiredSpeed=60, desiredSource="road",
+      szPosRoadName="京港澳高速", leftSec=3, trafficState=2,
+    )
+    snap = carrot_snapshot(cm)
+    assert snap == {
+      "nRoadLimitSpeed": 100, "xSpdLimit": 80, "xSpdDist": 1234, "xSpdCountDown": 56,
+      "xDistToTurn": 200, "xTurnCountDown": 7, "desiredSpeed": 60,
+      "desiredSource": "road", "szPosRoadName": "京港澳高速", "leftSec": 3,
+      "trafficState": 2,
+    }
+    json.dumps(snap)  # 必须始终可序列化
+
+  def test_defaults_readable_and_text_none_normalized(self):
+    # 全默认 CarrotMan（carrot_man 刚启动/未开搭子）不能抛；Text 空值归一空串
+    snap = carrot_snapshot(custom.CarrotMan.new_message())
+    assert snap["desiredSource"] == "" and snap["szPosRoadName"] == ""
+    assert snap["nRoadLimitSpeed"] == 0 and snap["leftSec"] == 0
+    json.dumps(snap)
+
+
 class TestFramePayload:
   def test_segments(self):
     car = {"vEgo": 10.0}
     radar = {"leadOne": {"status": True}}
-    assert frame_payload(car, radar) == {"car": car, "radar": radar}
+    carrot = {"nRoadLimitSpeed": 100}
+    assert frame_payload(car, radar, carrot) == {"car": car, "radar": radar, "carrot": carrot}
     assert frame_payload(car, None) == {"car": car}          # 单段出现
     assert frame_payload(None, radar) == {"radar": radar}
+    assert frame_payload(None, None, carrot) == {"carrot": carrot}  # v4: carrot 段独立出现
     assert frame_payload(None, None) is None                 # 窗口全空不出帧
 
 
@@ -288,6 +316,13 @@ class TestFrameTicker:
     t = FrameTicker(FRAME_PERIOD_S, now=100.0)
     t.radar = {"leadOne": {"status": False}}
     assert t.tick(100.5) == {"radar": {"leadOne": {"status": False}}}
+
+  def test_carrot_segment_only(self):
+    # v4：carrot_man 发布而 car/radar 窗口无更新 → 纯 carrot 段出帧，tick 后清空
+    t = FrameTicker(FRAME_PERIOD_S, now=100.0)
+    t.carrot = {"nRoadLimitSpeed": 80, "leftSec": 3}
+    assert t.tick(100.5) == {"carrot": {"nRoadLimitSpeed": 80, "leftSec": 3}}
+    assert t.carrot is None and t.car is None and t.radar is None
 
   def test_lag_catches_up_without_burst(self):
     # 轮询阻塞落后多个周期：追一个节拍（不积压连发），窗口照常清空
