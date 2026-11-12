@@ -1,0 +1,39 @@
+name: Mirror to CNB
+
+on:
+  push:
+    branches: [carrot-byd]
+    tags: ["**"]
+  workflow_dispatch:
+
+concurrency:
+  group: mirror-cnb
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  mirror:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # 保证 tags 也被拉取，便于完整镜像
+      - name: Fetch tags
+        run: git fetch --tags --force origin
+
+      - name: Push all branches and tags to CNB
+        env:
+          CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
+        # checkout@v4 只检出当前分支的本地引用，
+        # 因此用 refspec 把 origin 的全部分支映射推送，避免 --all 只推单分支
+        run: |
+          set -euo pipefail
+          REMOTE="https://cnb:${CNB_TOKEN}@cnb.cool/beldon-op/carrotpilot.git"
+          git push "$REMOTE" "+refs/remotes/origin/*:refs/heads/*" --force --progress
+          git push "$REMOTE" "+refs/tags/*:refs/tags/*" --force --progress
+          echo "Mirror completed."
