@@ -16,24 +16,30 @@ permissions:
 jobs:
   mirror:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 15
     steps:
-      - name: Checkout full history
+      # CNB 端已有完整镜像，这里只做增量同步：
+      # 浅克隆后仅补齐当前 ref 的完整历史（不拉其他分支/标签），
+      # 只推送触发本次运行的分支或 tag，且不带 --force（正常 fast-forward）
+      - name: Checkout (shallow)
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
-          # 保证 tags 也被拉取，便于完整镜像
-      - name: Fetch tags
-        run: git fetch --tags --force origin
+          fetch-depth: 1
 
-      - name: Push all branches and tags to CNB
+      - name: Unshallow current ref
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          git fetch --unshallow --no-tags origin "+${REF}"
+          git fetch origin "+${REF}"
+
+      - name: Push incrementally to CNB (no force)
         env:
           CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
-        # checkout@v4 只检出当前分支的本地引用，
-        # 因此用 refspec 把 origin 的全部分支映射推送，避免 --all 只推单分支
+          REF: ${{ github.ref }}
         run: |
           set -euo pipefail
           REMOTE="https://cnb:${CNB_TOKEN}@cnb.cool/beldon-op/carrotpilot.git"
-          git push "$REMOTE" "+refs/remotes/origin/*:refs/heads/*" --force --progress
-          git push "$REMOTE" "+refs/tags/*:refs/tags/*" --force --progress
-          echo "Mirror completed."
+          git push "$REMOTE" "${REF}:${REF}" --progress
+          echo "Incremental mirror of ${REF} completed."
