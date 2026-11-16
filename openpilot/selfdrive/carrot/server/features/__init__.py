@@ -1,6 +1,10 @@
 from aiohttp import web
 
 from . import (
+  assistant_connection,
+  assistant_drive,
+  assistant_settings,
+  assistant_tools,
   bluetooth,
   carrot_navi,
   cars,
@@ -8,6 +12,7 @@ from . import (
   egpu_model,
   intro,
   mapbox_tokens,
+  navigation,
   params,
   screenrecord,
   settings,
@@ -31,6 +36,10 @@ from . import (
 
 
 def register_all(app: web.Application) -> None:
+  assistant_connection.register(app)
+  assistant_drive.register(app)
+  assistant_settings.register(app)
+  assistant_tools.register(app)
   bluetooth.register(app)
   static.register(app)
   intro.register(app)
@@ -54,6 +63,7 @@ def register_all(app: web.Application) -> None:
   tools.register(app)
   xiaoge.register(app)
   mapbox_tokens.register(app)
+  navigation.register(app)
   vision_test.register(app)
   vision_diag.register(app)
   web_sound.register(app)

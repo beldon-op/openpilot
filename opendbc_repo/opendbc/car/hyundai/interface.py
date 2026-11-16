@@ -1,6 +1,6 @@
 from opendbc.car import Bus, get_safety_config, structs
 from opendbc.car.hyundai.hyundaicanfd import CanBus
-from opendbc.car.hyundai.values import HyundaiFlags, CAR, DBC, CANFD_RADAR_SCC_CAR, \
+from opendbc.car.hyundai.values import HyundaiFlags, CAR, DBC, CANFD_RADAR_SCC_CAR, KICK_CARS, \
                                                    CANFD_UNSUPPORTED_LONGITUDINAL_CAR, \
                                                    UNSUPPORTED_LONGITUDINAL_CAR, HyundaiSafetyFlags, HyundaiExtFlags, \
                                                    CANFD_HYBRID_STATUS_ADDR, CANFD_HYBRID_STATUS_DLC, \
@@ -11,6 +11,8 @@ from opendbc.car.disable_ecu import disable_ecu
 from opendbc.car.hyundai.carcontroller import CarController
 from opendbc.car.hyundai.carstate import CarState
 from opendbc.car.hyundai.radar_interface import RadarInterface
+from opendbc.car.hyundai.values import PEDAL_INTERCEPTOR_PARAMS, get_pedal_interceptor_params
+from opendbc.car.pedal_interceptor import PEDAL_INTERCEPTOR_SENSOR_ADDR, PEDAL_INTERCEPTOR_BUS
 
 from openpilot.common.params import Params
 
@@ -144,6 +146,20 @@ class CarInterface(CarInterfaceBase):
       if CAN.ECAN >= 4:
         cfgs.insert(0, get_safety_config(structs.CarParams.SafetyModel.noOutput))
       ret.safetyConfigs = cfgs
+      from opendbc.car.hyundai.spas import compatible
+      # CanfdBlinkerKick (carcontroller.aprk_blinkers): KICK_CARS on the camera-SCC harness only, the one whose Kick buses
+      # are known. It and this path both pause APRK and send 0x16A; Kick wins and switches this one off at boot so the
+      # menu shows what is actually running
+      kick = candidate in KICK_CARS and bool(ret.flags & HyundaiFlags.CAMERA_SCC) and params.get_bool("CanfdBlinkerKick")
+      if not docs and kick and params.get_bool("CanfdBlinkerControl"):
+        params.put_bool("CanfdBlinkerControl", False)
+      if params.get_bool("CanfdBlinkerControl") and compatible(fingerprint, CAN.ECAN) and not ret.flags & HyundaiFlags.ENABLE_BLINKERS:
+        ret.flags |= HyundaiFlags.CANFD_SPAS_BLINKERS.value
+        ret.safetyConfigs[-1].safetyParam |= HyundaiSafetyFlags.CANFD_SPAS_BLINKERS.value
+      if kick:
+        # panda admits the Kick ids only with this flag; read at fingerprint time, so it applies from the next onroad start
+        ret.safetyConfigs[-1].safetyParam |= HyundaiSafetyFlags.CANFD_BLINKER_KICK.value
+
 
       if ret.flags & HyundaiFlags.CANFD_HDA2:
         ret.safetyConfigs[-1].safetyParam |= HyundaiSafetyFlags.CANFD_LKA_STEERING.value
@@ -255,6 +271,25 @@ class CarInterface(CarInterfaceBase):
     elif ret.flags & HyundaiFlags.FCEV:
       ret.safetyConfigs[-1].safetyParam |= HyundaiSafetyFlags.FCEV_GAS.value
 
+    # Only explicitly configured, ACC-less classic-CAN adapters use the new
+    # protocol. The toggle leaves all existing vehicle paths unchanged otherwise.
+    pedal_interceptor_params = PEDAL_INTERCEPTOR_PARAMS.get(candidate)
+    if (ret.flags & HyundaiFlags.CC_ONLY_CAR and pedal_interceptor_params is not None and
+        params.get_bool("CommaPedalEnabled") and
+        not ret.flags & (HyundaiFlags.CANFD | HyundaiFlags.LEGACY | HyundaiFlags.CAMERA_SCC) and
+        fingerprint[PEDAL_INTERCEPTOR_BUS].get(PEDAL_INTERCEPTOR_SENSOR_ADDR) == 6 and
+        not any(addr in fingerprint[bus] for bus in (0, 2) for addr in (0x420, 0x421))):
+      ret.flags |= HyundaiFlags.PEDAL_INTERCEPTOR.value
+      ret.enableGasInterceptorDEPRECATED = True
+      ret.alphaLongitudinalAvailable = True
+      ret.openpilotLongitudinalControl = True
+      ret.pcmCruise = False
+      ret.radarUnavailable = True
+      ret.autoResumeSng = False
+      ret.minEnableSpeed = pedal_interceptor_params.min_enable_speed
+      ret.safetyConfigs[-1].safetyParam |= (HyundaiSafetyFlags.LONG | HyundaiSafetyFlags.PEDAL_INTERCEPTOR).value
+      ret.safetyConfigs[-1].safetyParam |= pedal_interceptor_params.safety_profile
+
     # Car specific configuration overrides
 
     if candidate == CAR.KIA_OPTIMA_G4_FL:
@@ -273,13 +308,14 @@ class CarInterface(CarInterfaceBase):
 
     params = Params()
     bosch_passive = bool(CP.extFlags & HyundaiExtFlags.BOSCH_RADAR) and params.get_int("EnableRadarTracks") > 0
-    if CP.openpilotLongitudinalControl and not (CP.flags & HyundaiFlags.CANFD_CAMERA_SCC) and not bosch_passive:
+    pedal_interceptor = get_pedal_interceptor_params(CP) is not None
+    if CP.openpilotLongitudinalControl and not (CP.flags & HyundaiFlags.CANFD_CAMERA_SCC) and not pedal_interceptor and not bosch_passive:
       addr, bus = 0x7d0, 0
       if CP.flags & HyundaiFlags.CANFD_HDA2.value:
         addr, bus = 0x730, CanBus(CP).ECAN
       disable_ecu(can_recv, can_send, bus=bus, addr=addr, com_cont_req=b'\x28\x83\x01')
 
-    if params.get_int("EnableRadarTracks") > 0 and not CP.flags & HyundaiFlags.CANFD and not bosch_passive:
+    if params.get_int("EnableRadarTracks") > 0 and not CP.flags & HyundaiFlags.CANFD and not pedal_interceptor and not bosch_passive:
       result = enable_radar_tracks(CP, can_recv, can_send)
       params.put_bool("EnableRadarTracksResult", result)
 

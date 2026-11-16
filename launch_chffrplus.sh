@@ -496,8 +496,17 @@ function heal_scons_cache {
 # remove them. Request creation must not require a working build environment.
 REBUILD_REQUEST="/data/rebuild_all.request"
 REBUILD_LOG="/data/rebuild_all.last.log"
+# Present from the Params build until the main build finishes. Left behind by a power cut mid-build,
+# whose empty or truncated outputs (e.g. a .so) SCons still treats as up to date.
+BUILD_MARKER="/data/carrot_build.inprogress"
 
 function consume_rebuild_request {
+  if [ -f "$BUILD_MARKER" ] && [ ! -f "$REBUILD_REQUEST" ]; then
+    echo "Previous build did not finish (power loss?); requesting Rebuild All"
+    echo "interrupted build" > "$REBUILD_REQUEST" || return 1
+  fi
+  # Armed right before the Params build; sync -f so it is on disk before SCons writes outputs.
+  : > "$BUILD_MARKER" && sync -f "$BUILD_MARKER" || echo "Cannot write $BUILD_MARKER; power-loss rebuild disabled"
   [ -f "$REBUILD_REQUEST" ] || return 0
   # Keep the request if cleanup fails or is interrupted. This function never
   # reboots; successful cleanup consumes it before compilation starts.
@@ -677,6 +686,8 @@ function launch {
   FORCE_REBUILD=0
   # A reset before the Params build must still force the full build below.
   [ "$BUILD_STATE_RESET" = "1" ] && FORCE_REBUILD=1
+  # Accept the pending external model once per real boot, before either backend.
+  flock /tmp/big_model_selection.lock python3 -m openpilot.common.big_model_catalog || exit 1
   prepare_big_model_if_needed
   invalidate_modeld_build_if_needed
   invalidate_native_build_if_needed
@@ -701,6 +712,7 @@ function launch {
       fi
     fi
   fi
+  rm -f "$BUILD_MARKER"
   # Never start driving services if a rebuild left the Params registry stale.
   if ! run_startup_command python3 "$DIR/openpilot/system/manager/params_check.py"; then
     echo "Native Params still do not match this checkout; not starting manager."

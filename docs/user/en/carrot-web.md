@@ -1,5 +1,7 @@
 # Carrot Web User Guide
 
+For Android device discovery and the ChatGPT voice setting assistant, see the [CarrotAssist guide](carrot-assist.md). Live setting reads and changes require both local device permission and ChatGPT connection authorization.
+
 [한국어](../ko/carrot-web.md)
 
 Carrot Web is a local web interface for viewing and managing carrotpilot from a phone, tablet, or PC connected to the same network as the device. It provides driving status, settings, logs, updates, and diagnostic tools.
@@ -121,8 +123,28 @@ from active inference losing its connection, a real error or excessive heat.
 Do not suppress real faults to clear a warning. The eGPU model compilation button
 is unavailable for a Jetson-only installation.
 
-Use the [short Korean installation guide](https://github.com/ajouatom/carrot-jetson/blob/main/docs/INSTALL-WINDOWS-KO.md):
-extract the installer ZIP and run 01, then 02. Image preparation and the USB-C fix are automatic. Wi-Fi settings come from the connected
+Jetson runtimes with automatic power setup select the board's installed NVIDIA
+`MAXN_SUPER` profile at startup and configure its clocks. Power-mode selection
+is automatic. A missing-profile or firmware-clock-limit message on the status
+card calls for checking image and board boot-firmware compatibility. If the
+message requests a reboot, fully reboot Jetson while parked. Setup results and
+available profiles are also recorded in the route log.
+`Non-Super boot firmware` indicates that the board is running a regular-mode
+boot configuration. Check the Super boot configuration. GitPull on existing
+images updates power-mode selection. Initial model preparation also takes time
+to build the recipient's TensorRT engine.
+
+The `v0.6.0-super-auto-preview` checks the Orin Nano 8GB developer kit
+on SD startup. When needed, it stages the included NVIDIA 36.4.7 Super capsule
+and automatically reboots. The next boot verifies firmware status, Super identity
+and GPU clocks before model preparation. Keep power connected throughout the
+firmware update. The USB boot screen reports failures, and DATA retains installation progress.
+Boards unable to boot a JetPack 6.x SD require NVIDIA's prerequisite firmware
+upgrade. Physical firmware installation and boot remain unverified for this preview.
+See the [automatic firmware SD download and validation scope](https://github.com/ajouatom/openpilot/releases/tag/jetson-super-auto-sd-20261112).
+
+Download the installer ZIP from the release above, extract it fully, and run 01,
+then 02. Image preparation and the USB-C fix are automatic. Wi-Fi settings come from the connected
 comma, so changing its SSID/password does not require removing the SD card.
 The existing P-gear summary display remains intentional. See the guide's preview
 notice for physical validation limits of each installation path.
@@ -228,3 +250,25 @@ If only video is missing, check whether another browser owns the stream, whether
 - [Speed and Deceleration](speed-deceleration.md)
 - [Cruise and Following Gap](cruise-gap.md)
 - [Radar Tracks and Corner Radar](radar.md)
+
+### External driving model selection (`carrot-wip`)
+
+In Tools, choose N16 Nav, Flip Flop, Light speed or Light speed 2 under **External driving model**. The choice saves automatically.
+The choice applies to both eGPU and Jetson; the internal model stays fixed at CD210.
+Saving does not switch a running model. With ignition off and internet available, reboot
+both comma and Jetson to download, verify, and apply the choice. A new Jetson model also
+needs engine preparation. The eGPU downloads the official precompiled PKL without
+recompiling the driving model itself.
+
+`NOO supported` identifies models accepting route images and navigation inputs. Currently
+N16 supports these inputs; Flip Flop, Light speed and Light speed 2 do not. This label does not establish current
+route validity or driving performance. MD v3 has been retired from the list. Flip Flop uses
+the official ONNX replaced on 2026-10-24; its hash differs from the historical MD v3 ONNX.
+
+Choose a model in the dropdown to save it for the next reboot. The list is maintained by
+the developers; user hide, delete and restore controls are not available. Catalog updates
+arrive through Git Pull. Retired choices disappear from the list and their unused files
+are cleaned up automatically while offroad. A running retired model remains protected
+until the next boot selects the default and delivery switches the installed active model.
+Jetson cleanup waits for an offroad connection and preserves an ONNX used by any available
+model. Only the selected model is loaded into GPU memory.

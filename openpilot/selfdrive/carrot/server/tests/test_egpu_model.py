@@ -197,3 +197,111 @@ def test_diagnostic_download_preserves_original_failure_after_reboot(feature, tm
   assert json.loads(response.text)['failure'] == failure
   (folder / 'installed.json').write_text(json.dumps({'pickle': {'sha256': 'c' * 64}}))
   assert asyncio.run(feature.api_diagnostics(None)).status == 404
+
+
+@pytest.mark.parametrize('flag', [None, 'IsOnroad', 'IsEngaged', 'UsbGpuActive', 'UsbGpuLoading', 'no_offroad'])
+def test_retry_api_schedules_only_offroad_without_deleting_evidence_or_rebooting(feature, monkeypatch, tmp_path, flag):
+  from openpilot.selfdrive.modeld import egpu_rejection
+  from openpilot.selfdrive.modeld.egpu_usb_wait import LIGHT_SPEED_RUNTIME_SHA
+  monkeypatch.setattr(egpu_rejection, 'boot_identity', lambda: 'boot-now')
+  folder = tmp_path / 'precompiled' / ('a' * 64)
+  folder.mkdir(parents=True)
+  (folder / 'installed.json').write_text(json.dumps({'pickle': {'sha256': 'a' * 64}, 'runtime': {'sha256': LIGHT_SPEED_RUNTIME_SHA}}))
+  (folder / 'rejected').write_text('a' * 64)
+  failure = {'pickle_sha256': 'a' * 64, 'rejected': True, 'boot_id': 'old', 'phase': 'boot_validation',
+             'error': 'RuntimeError: AMD failed with -7\nRuntimeError: Device hang detected'}
+  (folder / 'last_failure.json').write_text(json.dumps(failure))
+  original = {p.name: p.read_bytes() for p in folder.iterdir()}
+  flags = {'UsbGpuHardwareSeen', 'IsOffroad'}
+  if flag == 'no_offroad':
+    flags.remove('IsOffroad')
+  elif flag:
+    flags.add(flag)
+  writes = []
+  params = SimpleNamespace(get_bool=lambda key: key in flags, put_bool=lambda *args: writes.append(args))
+  monkeypatch.setattr(feature, 'HAS_PARAMS', True)
+  monkeypatch.setattr(feature, 'Params', lambda: params)
+  class Request:
+    async def json(self): return {'sha256': 'a' * 64}
+  status = feature.build_status_payload(params)
+  assert status['rejection']['reason'] == 'device_restart_required'
+  assert status['rejection']['can_request'] == (flag is None)
+  response = asyncio.run(feature.api_retry_verification(Request()))
+  assert response.status == (200 if flag is None else 409)
+  assert not writes
+  assert all((folder / name).read_bytes() == data for name, data in original.items())
+  assert (folder / egpu_rejection.REQUEST).exists() == (flag is None)
+  if flag is None:
+    assert feature.build_status_payload(params)['rejection']['retry_pending']
+
+
+@pytest.mark.parametrize('body', [{'sha256': 'b' * 64}, {'sha256': '../../test'}, {}, [], {'sha256': 'a' * 64, 'force': True}])
+def test_retry_api_rejects_stale_model_and_unexpected_payload(feature, monkeypatch, body):
+  monkeypatch.setattr(feature, 'HAS_PARAMS', True)
+  monkeypatch.setattr(feature, 'Params', lambda: None)
+  class Request:
+    async def json(self): return body
+  assert asyncio.run(feature.api_retry_verification(Request())).status == 409
+
+
+def test_rejection_cannot_be_attributed_to_another_downloading_model(feature, tmp_path):
+  folder = tmp_path / 'precompiled' / ('a' * 64)
+  folder.mkdir(parents=True)
+  (folder / 'rejected').write_text('a' * 64)
+  write_big_model_status(tmp_path, 'downloading', sha256='b' * 64)
+  result = payload(feature)
+  assert result['state'] == 'downloading' and not result['rejection']['blocked']
+
+def test_library_only_allows_curated_selection_even_offroad(feature, monkeypatch, tmp_path):
+  from openpilot.common import big_model_catalog as C
+  monkeypatch.setenv('CARROT_BIG_MODEL_DIR', str(tmp_path))
+  monkeypatch.setattr(C, 'boot_id', lambda: 'same-boot')
+  C.freeze_boot()
+  monkeypatch.setattr(feature, 'HAS_PARAMS', True)
+  monkeypatch.setattr(feature, 'Params', lambda: SimpleNamespace(get_bool=lambda key: key == 'IsOnroad'))
+  class Request:
+    def __init__(self, action, model): self.body = {'action': action, 'model': model}
+    async def json(self): return self.body
+  response = asyncio.run(feature.api_library(Request('select', 'flip-flop')))
+  assert response.status == 200
+  value = json.loads(response.body)['library']
+  assert value['selected'] == 'flip-flop' and value['effective'] == 'n16' and value['reboot_required']
+  assert asyncio.run(feature.api_library(Request('delete', 'md-v3'))).status == 409
+  monkeypatch.setattr(feature, 'Params', lambda: SimpleNamespace(get_bool=lambda key: key == 'IsOffroad'))
+  assert asyncio.run(feature.api_library(Request('delete', 'n16'))).status == 409
+  assert asyncio.run(feature.api_library(Request('delete', 'md-v3'))).status == 409
+  assert asyncio.run(feature.api_library(Request('restore', 'md-v3'))).status == 409
+  assert asyncio.run(feature.api_library(Request('select', '../../anything'))).status == 409
+
+
+def test_library_maintenance_runs_off_request_thread_and_stops(feature, monkeypatch):
+  from aiohttp import web
+  calls = []
+  monkeypatch.setattr(feature, 'maintain_library_once', lambda: calls.append('run'))
+  app = web.Application()
+  feature.register(app)
+  assert feature.library_maintenance in app.cleanup_ctx
+  async def run():
+    context = feature.library_maintenance(app)
+    await anext(context)
+    for _ in range(100):
+      if calls:
+        break
+      await asyncio.sleep(.01)
+    assert calls == ['run']
+    await context.aclose()
+    await asyncio.sleep(.01)
+    assert calls == ['run']
+  asyncio.run(run())
+
+
+def test_library_retired_entry_cannot_be_selected(feature, monkeypatch, tmp_path):
+  from openpilot.common import big_model_catalog as C
+  monkeypatch.setenv('CARROT_BIG_MODEL_DIR', str(tmp_path))
+  models = C.catalog()
+  models['md-v3']['retired'] = True
+  monkeypatch.setattr(C, 'catalog', lambda: models)
+  class Request:
+    async def json(self): return {'action': 'select', 'model': 'md-v3'}
+  assert asyncio.run(feature.api_library(Request())).status == 409
+  assert not (tmp_path / 'selection.json').exists()

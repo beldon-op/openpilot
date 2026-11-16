@@ -29,6 +29,7 @@ from openpilot.selfdrive.selfdrived.proximity_alert import (
 from openpilot.selfdrive.controls.lib.assist_less_lane_change import get_assist_less_lane_change
 from openpilot.selfdrive.selfdrived.state import StateMachine
 from openpilot.selfdrive.selfdrived.impact_detector import ImpactDetector
+from openpilot.selfdrive.selfdrived.vehicle_faults import VehicleFaultMonitor
 from openpilot.selfdrive.controls.lib.radar_only_warning import RadarOnlyWarning
 from openpilot.selfdrive.carrot.radar_motion.timing import front_radar_distance_delay_s
 from openpilot.selfdrive.selfdrived.alertmanager import AlertManager, set_offroad_alert
@@ -155,6 +156,7 @@ class SelfdriveD:
     self.enabled = False
     self.active = False
     self.mismatch_counter = 0
+    self.vehicle_fault_monitor = VehicleFaultMonitor()
     self.cruise_mismatch_counter = 0
     self.last_steering_pressed_frame = 0
     self.distance_traveled = 0
@@ -188,6 +190,8 @@ class SelfdriveD:
     self.rk = Ratekeeper(100, print_delay_threshold=None)
 
     self.atc_type_last = ""
+    self.atc_turn_start = 0
+    self.atc_turn_direction = LaneChangeDirection.none
 
 
     # some comma three with NVMe experience NVMe dropouts mid-drive that
@@ -421,17 +425,7 @@ class SelfdriveD:
       self.events.add(EventName.excessiveActuation)
     # ******************************************************************************************
 
-    if self.sm.alive['carrotMan']:
-      atc_type = self.sm['carrotMan'].atcType
-      if atc_type != self.atc_type_last:
-        if "prepare" not in atc_type and "prepare" in self.atc_type_last: # fork left/right prepare -> fork left/right
-          if "fork" in atc_type:
-            self.events.add(EventName.audioLaneChange)
-        elif "prepare" in atc_type:
-          pass
-        elif "turn" in atc_type and "turn" not in self.atc_type_last:   # fork left/right -> turn left/right
-          self.events.add(EventName.audioTurn)
-        self.atc_type_last = atc_type
+    self.update_atc_events()
 
     # Handle lane change
     if self.sm['modelV2'].meta.laneChangeState == LaneChangeState.preLaneChange:
@@ -454,6 +448,14 @@ class SelfdriveD:
     # enabled (LaneChangeAssistSpeed > 0, where the desire machine owns it).
     if self.assist_less_lane_change.update(CS):
       self.events.add(EventName.laneChange)
+
+    if self.vehicle_fault_monitor.update_pandas(
+        self.sm['pandaStates'], self.sm.logMonoTime['pandaStates'] * 1e-9,
+        valid=self.sm.all_checks(['pandaStates'])):
+      self.events.add(EventName.pandaCanFault)
+    if self.vehicle_fault_monitor.update_scc(
+        CS.stockSccFault, CS.radarInput.receiveMonoTime * 1e-9, valid=CS.canValid and not CS.canTimeout):
+      self.events.add(EventName.stockSccFault)
 
     for i, pandaState in enumerate(self.sm['pandaStates']):
       # All pandas must match the list of safetyConfigs, and if outside this list, must be silent or noOutput
@@ -823,6 +825,23 @@ class SelfdriveD:
     self.AM.add_many(self.sm.frame, alerts)
     self.AM.process_alerts(self.sm.frame, clear_event_types)
 
+  def update_atc_events(self):
+    if self.sm.alive['carrotMan']:
+      atc_type = self.sm['carrotMan'].atcType
+      if atc_type != self.atc_type_last:
+        if "prepare" not in atc_type and "prepare" in self.atc_type_last: # fork left/right prepare -> fork left/right
+          if "fork" in atc_type:
+            self.events.add(EventName.audioLaneChange)
+        elif "prepare" in atc_type:
+          pass
+        elif "turn" in atc_type and "turn" not in self.atc_type_last:   # fork left/right -> turn left/right
+          self.events.add(EventName.audioTurn)
+          direction = {"turn left": LaneChangeDirection.left, "turn right": LaneChangeDirection.right}.get(atc_type)
+          if direction is not None:
+            self.atc_turn_start = time.monotonic_ns()
+            self.atc_turn_direction = direction
+        self.atc_type_last = atc_type
+
   def publish_selfdriveState(self, CS):
     # selfdriveState
     ss_msg = messaging.new_message('selfdriveState')
@@ -844,6 +863,8 @@ class SelfdriveD:
     ss.alertHudVisual = self.AM.current_alert.visual_alert
 
     ss.distanceTraveled = float(self.distance_traveled)
+    ss.atcTurnStartMonoTime = self.atc_turn_start
+    ss.atcTurnDirection = self.atc_turn_direction
 
     self.pm.send('selfdriveState', ss_msg)
 

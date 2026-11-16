@@ -1,8 +1,52 @@
 import json
+import subprocess
 
 import pytest
 
 from openpilot.common import jetlink_status as status
+
+
+@pytest.mark.parametrize('active', [False, True])
+def test_status_replaced_during_read_is_not_a_future_timestamp(monkeypatch, active):
+  clock = [100.]
+  monkeypatch.setattr(status.time, 'monotonic', lambda: clock[0])
+
+  def concurrent_read(path):
+    # The writer atomically replaces the report after the UI starts reading.
+    clock[0] += .001
+    if path == status.MODEL_STATUS:
+      return {'updated': clock[0], 'active': active, 'warp_preparing': not active}
+    return {'updated': clock[0], 'state': 'ready', 'peer': {'carrot_host': 'jetson'},
+            'telemetry_updated': clock[0],
+            'telemetry': {'carrot_health': {'age_s': 0., 'severity': 'ok'}}}
+
+  monkeypatch.setattr(status, '_read', concurrent_read)
+  expected = ('jetSON 사용 중', 'active') if active else ('jetSON 콤마 영상 준비 중', 'loading')
+  assert status.badge() == expected
+  assert status.diagnostics()['severity'] == 'ok'
+
+
+@pytest.mark.parametrize('reason', [
+  '[adb-handoff:opt_in_missing] ADB handoff permission is missing (/data/jetlink-adb-handoff)',
+  "[adb-handoff:offroad] Offroad required: IsOffroad='0', IsOnroad='1' (pre-write recheck)",
+  '[adb-handoff:io_error] unbind g1 UDC: PermissionError, errno=13',
+])
+def test_handoff_subprocess_error_reaches_screen_diagnostics(tmp_path, monkeypatch, reason):
+  from openpilot.selfdrive.modeld.jetlink import mobile
+  def rejected(command, **kwargs):
+    raise subprocess.CalledProcessError(1, command, stderr=f'jetlink: {reason}\n')
+  monkeypatch.setattr(mobile.subprocess, 'run', rejected)
+  monkeypatch.setattr(mobile.os, 'geteuid', lambda: 0, raising=False)
+  with pytest.raises(mobile.MobileLinkError) as error:
+    mobile._root('setup_gadget.sh')
+  link, model = tmp_path / 'link', tmp_path / 'model'
+  monkeypatch.setattr(status, 'LINK_STATUS', link)
+  monkeypatch.setattr(status, 'MODEL_STATUS', model)
+  monkeypatch.setattr(status.time, 'monotonic', lambda: 10.)
+  link.write_text(json.dumps({'updated': 10., 'state': 'retrying', 'error': str(error.value)[:300]}))
+  diagnostic = status.diagnostics()
+  assert diagnostic['severity'] == 'error'
+  assert reason in diagnostic['reason']
 
 
 @pytest.mark.parametrize(('peer', 'expected'), (

@@ -148,7 +148,6 @@
 </head>
 
 <body class="notranslate" translate="no">
-
   <div class="wrap swipe-container" id="swipeContainer">
     <!-- ════════════ CAR SELECT ════════════ -->
     <div id="pageCar" class="page page--bounded" hidden style="display:none;">
@@ -296,32 +295,42 @@
       </div>
 
       <div class="tools-scroll-stack">
-        <section id="egpuModelCard" class="egpu-model-card" hidden aria-live="polite">
-          <div class="egpu-model-card__icon" aria-hidden="true">HB</div>
-          <div class="egpu-model-card__body">
-            <div class="egpu-model-card__heading">
-              <strong id="egpuModelTitle">eGPU big model</strong>
-              <span id="egpuModelState" class="egpu-model-card__state">Checking</span>
-            </div>
-            <p id="egpuModelDetail" class="egpu-model-card__detail"></p>
-            <p id="egpuModelRecovery" class="egpu-model-card__detail" hidden></p>
-            <div id="egpuModelProgress" class="egpu-model-card__progress" hidden>
-              <div class="egpu-model-card__track"><span id="egpuModelProgressBar"></span></div>
-            </div>
-            <div class="egpu-model-card__footer">
-              <span id="egpuModelAmount" class="egpu-model-card__amount"></span>
-              <a id="egpuModelDiagnostics" class="btn egpu-model-card__action" href="/api/egpu/model/diagnostics" download hidden>Download diagnostics</a>
-              <button id="btnEgpuCompileRestart" class="btn egpu-model-card__action" type="button" hidden>Restart &amp; compile</button>
-            </div>
+        <section id="externalModelLibrary" class="model-library" hidden></section>
+        <dialog id="modelLibraryDialog" class="model-library-dialog" aria-labelledby="modelLibraryTitle">
+          <div class="model-library-dialog__heading">
+            <h2 id="modelLibraryTitle"></h2>
+            <button id="btnCloseModelLibrary" class="btn" type="button"></button>
           </div>
-        </section>
+          <div id="modelLibraryEditor"></div>
+          <section id="egpuModelCard" class="egpu-model-card" hidden aria-live="polite">
+            <div class="egpu-model-card__icon" aria-hidden="true">HB</div>
+            <div class="egpu-model-card__body">
+              <div class="egpu-model-card__heading">
+                <strong id="egpuModelTitle">eGPU big model</strong>
+                <span id="egpuModelState" class="egpu-model-card__state">Checking</span>
+              </div>
+              <p id="egpuModelDetail" class="egpu-model-card__detail"></p>
+              <p id="egpuModelRecovery" class="egpu-model-card__detail" hidden></p>
+              <div id="egpuModelProgress" class="egpu-model-card__progress" hidden>
+                <div class="egpu-model-card__track"><span id="egpuModelProgressBar"></span></div>
+              </div>
+              <div class="egpu-model-card__footer">
+                <span id="egpuModelAmount" class="egpu-model-card__amount"></span>
+                <a id="egpuModelDiagnostics" class="btn egpu-model-card__action" href="/api/egpu/model/diagnostics" download hidden>Download diagnostics</a>
+                <button id="btnEgpuCompileRestart" class="btn egpu-model-card__action" type="button" hidden>Restart &amp; compile</button>
+              </div>
+            </div>
+          </section>
+        </dialog>
 
         <div id="toolsPrimaryActions" class="tools-primary-actions ui-action-grid ui-action-grid--quick mb-md" role="group" aria-label="Tools shortcuts">
+          <a class="btn" href="/navigation" target="_blank" rel="noopener">Nav Map / 지도 검색</a>
           <button id="btnToolsCarSelect" class="btn" type="button">Car Select</button>
           <button id="btnToolsLanguage" class="btn" type="button" aria-haspopup="dialog">Language</button>
           <button id="btnToolsWebSettings" class="btn" type="button">Web Settings</button>
           <button id="btnDeviceInfo" class="btn" type="button">Info</button>
           <button id="btnToolsBluetooth" class="btn" type="button" aria-haspopup="dialog">Bluetooth</button>
+          <button id="btnToolsAssistant" class="btn" type="button" aria-haspopup="dialog"><span aria-hidden="true">&#9881;</span> <span id="toolsAssistantLabel">ChatGPT 설정 도우미</span></button>
         </div>
 
         <div class="section tools-group is-open" data-tools-group="git">

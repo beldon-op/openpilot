@@ -1,3 +1,4 @@
+import time
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -9,6 +10,39 @@ from openpilot.selfdrive.controls.lib.desire_lib.constants import TurnDirection
 
 LCS = log.LaneChangeState
 LCD = log.LaneChangeDirection
+
+
+def test_manual_turn_signal_remains_isolated_during_acceleration_with_atc_off():
+  from openpilot.cereal import car
+
+  for lateral_active in (False, True):
+    harness = TestDesireHelperStalkRequest()
+    harness.setup_method()
+    helper = harness.helper
+    helper.boundary_indicator_supported = True
+    helper.manual_turn_indicator_enabled = True
+    cs = car.CarState.new_message(canValid=True, gearShifter='drive', vEgo=5.)
+    md = log.ModelDataV2.new_message()
+    md.laneLines = [{'x': [0., 5., 10., 15.], 'y': [y] * 4} for y in (-5., -1.8, 1.8, 5.)]
+    md.laneLineProbs = [0.] * 4
+    md.meta.desireState = [1., 0., 0., 0., 0., 0., 0., 0.]
+    saw_request = False
+    with patch('openpilot.selfdrive.controls.lib.desire_helper.read_json', return_value={}):
+      for i in range(90):
+        now = 10 + i * .05
+        md.frameId = i
+        cs.steeringPressed = 25 <= i < 55
+        cs.steeringTorque = 400. if cs.steeringPressed else 0.
+        cs.steeringAngleDeg = min(100., max(0, i - 25) * 8.)
+        cs.vEgo = 12. if i >= 55 else 5.
+        cs.leftBlinker = i >= 50
+        with patch('openpilot.selfdrive.controls.lib.desire_helper.time.monotonic', return_value=now):
+          helper.update(cs, md, lateral_active, 0., harness.carrot_man, SimpleNamespace(),
+                        indicator_valid=True, indicator_yaw_rate=-.2 if i >= 29 else 0.)
+        saw_request |= helper.model_indicator.active is not None
+        assert helper.lane_change_state == LCS.off
+        assert helper.desire == log.Desire.none
+    assert saw_request and helper.model_indicator.active.source == 'manual_turn'
 
 
 class TestDesireHelperStalkRequest:
@@ -43,15 +77,17 @@ class TestDesireHelperStalkRequest:
     self.carrot_man = SimpleNamespace(atcType="", carrotCmdIndex=0, carrotCmd="", carrotArg="")
     self.left_count = 0
 
-  def update(self, left_blinker=True, lane_change_prob=0.5, press=False, counters=True, lever=0, v_kph=90.0, lines=None):
+  def update(self, left_blinker=True, lane_change_prob=0.5, press=False, counters=True, lever=0, v_kph=90.0, lines=None,
+             driver_valid=False, driver_direction=0, indicator_fresh=True):
     if press:
       self.left_count = (self.left_count + 1) % 256
     car = SimpleNamespace(canValid=True, leftBlinker=left_blinker, rightBlinker=False, vEgo=v_kph / 3.6, aEgo=0.0,
-                          trailerConnected=False, steeringTorque=0.0, steeringPressed=False, blinkerLever=lever)
+                          trailerConnected=False, steeringTorque=0.0, steeringPressed=False, blinkerLever=lever,
+                          turnSignalDriverValid=driver_valid, turnSignalDriverDirection=driver_direction)
     if counters:
       car.leftBlinkerStalkCount, car.rightBlinkerStalkCount = self.left_count, 0
     model = SimpleNamespace(laneLines=[SimpleNamespace(y=[y]) for y in (-5.0, *lines, 5.0)]) if lines else SimpleNamespace()
-    self.helper.update(car, model, True, lane_change_prob, self.carrot_man, SimpleNamespace())
+    self.helper.update(car, model, True, lane_change_prob, self.carrot_man, SimpleNamespace(), indicator_valid=indicator_fresh)
     return self.helper.lane_change_state
 
   def start_and_cross(self, counters=True):
@@ -340,3 +376,109 @@ class TestLaneChangeLeverWait:
     self.press()
     assert self.wait(LEVER_REQUEST_WAIT_S + 1.0) == LCS.preLaneChange
     assert self.helper.blinker_hold_direction == LCD.none
+
+
+class TestAtcPhysicalIndicator:
+  setup_method = TestDesireHelperStalkRequest.setup_method
+  update = TestDesireHelperStalkRequest.update
+  start_and_cross = TestDesireHelperStalkRequest.start_and_cross
+  def test_turn_origin_persists_through_lamp_feedback_and_ends_with_desire(self):
+    self.carrot_man.atcType = "turn left"
+    self.helper.left.dist_to_edge_far = 8.0
+    self.update(left_blinker=False, v_kph=10)
+    self.update(left_blinker=False, v_kph=10)
+    assert self.helper.desire == log.Desire.turnLeft
+    assert self.helper.auto_turn_signal == LCD.left
+    assert not self.helper.auto_turn_signal_lane_change
+    self.update(left_blinker=True, v_kph=10)
+    assert self.helper.auto_turn_signal == LCD.left
+    self.helper.turn_disable_count = 20
+    self.update(left_blinker=True, v_kph=10)
+    assert self.helper.desire != log.Desire.turnLeft
+    assert self.helper.auto_turn_signal == LCD.none
+
+  def test_driver_lane_change_does_not_become_atc_indicator(self):
+    self.start_and_cross()
+    assert self.helper.auto_turn_signal == LCD.none
+
+  def test_atc_waits_until_actual_start_and_holds_through_finishing(self):
+    self.carrot_man.atcType = "atc right"
+    self.update(left_blinker=False)
+    self.update(left_blinker=False)
+    assert self.helper.lane_change_state == LCS.preLaneChange
+    for _ in range(5):
+      self.update(left_blinker=False)
+      assert self.helper.auto_turn_signal == LCD.none
+    self.helper.right.lane_line_info_edge_detect = True
+    self.update(left_blinker=False)
+    assert self.helper.lane_change_state == LCS.laneChangeStarting
+    assert self.helper.auto_turn_signal == LCD.right
+    assert self.helper.auto_turn_signal_lane_change
+    for _ in range(12):
+      self.update(left_blinker=False,lane_change_prob=0.)
+    assert self.helper.lane_change_state == LCS.laneChangeFinishing
+    assert self.helper.auto_turn_signal == LCD.right
+    for _ in range(24):
+      self.update(left_blinker=False,lane_change_prob=0.)
+    assert self.helper.auto_turn_signal == LCD.none
+
+
+def test_kick_lamp_isolated_but_real_same_side_press_starts_without_twelve_second_wait():
+  harness = TestDesireHelperStalkRequest()
+  harness.setup_method()
+  h = harness.helper
+  h.kick_supported = True
+  harness.update(left_blinker=False, driver_valid=True)
+  h.boundary_indicator.own(time.monotonic(), 1)
+  for _ in range(10):
+    assert harness.update(driver_valid=True) == LCS.off
+  assert harness.update(press=True, lever=1, driver_valid=True, driver_direction=1) == LCS.preLaneChange
+  assert harness.update(driver_valid=True) == LCS.laneChangeStarting
+  assert h.boundary_indicator.blocked == 1
+  assert time.monotonic() < h.boundary_indicator.isolate_until
+
+
+def test_kick_short_press_uses_verified_counter_and_preserves_lane_admission():
+  harness = TestDesireHelperStalkRequest()
+  harness.setup_method()
+  h = harness.helper
+  h.kick_supported = True
+  harness.update(left_blinker=False, driver_valid=True)
+  h.boundary_indicator.own(time.monotonic(), 1)
+  harness.update(driver_valid=True)
+  h.left.lane_change_available = False
+  assert harness.update(press=True, driver_valid=True) == LCS.preLaneChange
+  for _ in range(10):
+    assert harness.update(driver_valid=True) == LCS.preLaneChange
+  h.left.lane_change_available = True
+  assert harness.update(driver_valid=True) == LCS.laneChangeStarting
+
+
+def test_unverified_stalk_and_external_adapter_echo_remain_isolated():
+  for kick_supported, driver_valid, fresh in ((True, False, True), (False, True, True), (True, True, False)):
+    harness = TestDesireHelperStalkRequest()
+    harness.setup_method()
+    h = harness.helper
+    h.kick_supported = kick_supported
+    harness.update(left_blinker=False, driver_valid=driver_valid)
+    h.boundary_indicator.own(time.monotonic(), 1)
+    for _ in range(10):
+      assert harness.update(press=True, lever=1, driver_valid=driver_valid, driver_direction=1, indicator_fresh=fresh) == LCS.off
+
+
+def test_driver_can_request_next_lane_during_kick_isolation():
+  harness = TestDesireHelperStalkRequest()
+  harness.setup_method()
+  harness.start_and_cross()
+  h = harness.helper
+  h.kick_supported = True
+  h.boundary_indicator.own(time.monotonic(), 1)
+  harness.update(driver_valid=True, driver_direction=1)
+  for _ in range(20):
+    if harness.update(lane_change_prob=0., driver_valid=True) == LCS.laneChangeFinishing:
+      break
+  assert h.lane_change_state == LCS.laneChangeFinishing
+  for _ in range(int(STALK_QUEUE_GUARD_S / DT_MDL) + 2):
+    harness.update(lane_change_prob=0., driver_valid=True)
+  harness.update(lane_change_prob=0., press=True, driver_valid=True, driver_direction=1)
+  assert h.queued_lane_change == 1

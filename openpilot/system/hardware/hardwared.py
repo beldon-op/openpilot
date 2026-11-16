@@ -3,6 +3,7 @@ import fcntl
 import os
 import queue
 import struct
+import subprocess
 import threading
 import time
 from collections import OrderedDict, namedtuple
@@ -22,6 +23,7 @@ from openpilot.system.hardware import HARDWARE, TICI, AGNOS, PC
 from openpilot.system.loggerd.config import get_available_percent
 from openpilot.system.statsd import statlog
 from openpilot.common.swaglog import cloudlog
+from openpilot.system.memory_trace import FullGCTrace
 from openpilot.system.hardware.power_monitoring import PowerMonitoring
 from openpilot.system.hardware.fan_controller import FanController
 from openpilot.system.hardware.tici.pins import GPIO
@@ -104,6 +106,7 @@ def hw_state_thread(end_event, hw_queue):
   prev_hw_state = None
 
   modem_version = None
+  modem_missing_count = 0
 
   while not end_event.is_set():
     # these are expensive calls. update every 10s
@@ -120,6 +123,11 @@ def hw_state_thread(end_event, hw_queue):
 
           if modem_version is not None:
             cloudlog.event("modem version", version=modem_version)
+          elif TICI and HARDWARE.get_device_type() == "tici":
+            modem_missing_count += 1
+            if modem_missing_count == 4:
+              cloudlog.event("restarting ModemManager")
+              subprocess.run(["sudo", "-n", "systemctl", "restart", "--no-block", "ModemManager"], timeout=5, check=True)
 
         tx, rx = HARDWARE.get_modem_data_usage()
 
@@ -475,6 +483,11 @@ def hardware_thread(end_event, hw_queue) -> None:
 
 
 def main():
+  with FullGCTrace('hardwared') as trace:
+    run_hardware(trace)
+
+
+def run_hardware(trace):
   hw_queue = queue.Queue(maxsize=1)
   end_event = threading.Event()
 
@@ -492,6 +505,9 @@ def main():
   try:
     while True:
       time.sleep(1)
+      now = time.monotonic()
+      if trace.due(now):
+        trace.report(now, hw_queue=hw_queue.qsize())
       if not all(t.is_alive() for t in threads):
         break
   finally:

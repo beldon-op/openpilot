@@ -9,6 +9,7 @@ import time
 import uuid
 
 from openpilot.cereal import messaging
+from openpilot.system.memory_trace import FullGCTrace
 from openpilot.selfdrive.carrot.bluetooth.model import RUNTIME, CommandWriter, Decoder, address, atomic_json, config, read_json
 
 EVENT = struct.Struct('@llHHi')
@@ -55,7 +56,18 @@ def open_input(path):
     raise
 
 
+def initial_buttons(fd):
+  bitmap = bytearray(96)  # Linux KEY_MAX=0x2ff, including BTN_TOUCH.
+  fcntl.ioctl(fd, 0x80604518, bitmap, True)  # EVIOCGKEY(96)
+  return {key for key in range(768) if bitmap[key // 8] & (1 << (key % 8))}
+
+
 def main():
+  with FullGCTrace('carrot_bluetooth') as trace:
+    run_reader(trace)
+
+
+def run_reader(trace):
   RUNTIME.mkdir(parents=True, exist_ok=True)
   lock = (RUNTIME / 'reader.lock').open('w')
   fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -74,7 +86,7 @@ def main():
   for channel in writer.events:
     writer.publish(channel)
 
-  def emit(path, mac, decoder, tokens, now):
+  def emit(path, mac, decoder, tokens, now, input_time=None):
     nonlocal last_event
     device = settings['devices'][mac]
     testing = learning.get('address') == mac
@@ -89,7 +101,8 @@ def main():
         if token not in decoder.repeated:
           writer.attention(mac, action, now)
         if action != 'none':
-          writer.send(mac, action, now, hold=f'{path}:{token}' if token in held else None, repeat=token in decoder.repeated)
+          created = input_time if input_time is not None and action in ('blinkerLeft', 'blinkerRight') else now
+          writer.send(mac, action, created, hold=f'{path}:{token}' if token in held else None, repeat=token in decoder.repeated)
           last_fire[mac, token] = now
           emitted, reason = True, 'sent'
       last_event = {'id': uuid.uuid4().hex, 'time': now, 'address': mac, 'button': token,
@@ -134,7 +147,15 @@ def main():
           if path in opened or not device or not (device['enabled'] or learning.get('address') == mac):
             continue
           try:
-            opened[path] = (open_input(path), mac, Decoder(device['profile'], device['mapping'], learning.get('address') == mac))
+            fd = open_input(path)
+            try:
+              decoder = Decoder(device['profile'], device['mapping'], learning.get('address') == mac, gestures=device.get('gestures'))
+              if device.get('gestures') is not None:
+                decoder.synchronize_pressed(initial_buttons(fd), time.monotonic())
+              opened[path] = (fd, mac, decoder)
+            except BaseException:
+              os.close(fd)
+              raise
           except (OSError, subprocess.SubprocessError) as exc:
             errors[mac] = str(exc)
       ready, _, _ = select.select([entry[0] for entry in opened.values()], [], [], 0.01)
@@ -158,7 +179,7 @@ def main():
           if not 0 <= now - stamp < 0.4:
             decoder.feed(0, 3, 0, now)
             continue
-          emit(path, mac, decoder, decoder.feed(kind, code, value, stamp), now)
+          emit(path, mac, decoder, decoder.feed(kind, code, value, stamp), now, input_time=stamp)
         emit(path, mac, decoder, decoder.flush(now), now)
       now = time.monotonic()
       writer.prune({mac for _, mac, _ in opened.values()
@@ -166,6 +187,10 @@ def main():
                    {f'{path}:{token}' for path, (_, _, decoder) in opened.items() for token in decoder.active_longs})
       if now - last_status >= 0.2:
         last_status = now
+        if trace.due(now):
+          trace.report(now, devices=len(settings['devices']), opened=len(opened), recent=len(recent_events),
+                       last_events=len(last_events), last_fire=len(last_fire), commands=sum(map(len, writer.events.values())),
+                       pending_keys=sum(len(decoder.pending_keys) for _, _, decoder in opened.values()))
         atomic_json(RUNTIME / 'status.json', {'time': now, 'stationary': bool(stationary), 'started': bool(started),
                     'grabbed': sorted({entry[1] for entry in opened.values()}), 'errors': errors,
                     'last_event': last_event, 'last_events': last_events, 'recent_events': recent_events, 'learning': learning})

@@ -4,14 +4,23 @@ import os
 import argparse
 import subprocess
 import sys
+import logging
 
 
 def migrate_running_release(runtime=Path('/opt/carrot-jetlink')):
   """A signed runtime can migrate its own updater without per-car SSH setup.
 
   Published images already grant the jetlink service account passwordless sudo.
-  Enable only next boot so installing never interrupts the current session.
+  Updater migration takes effect next boot. The power check runs at the server
+  entry point before backend imports and inference, once per boot.
   """
+  try:
+    subprocess.run(['sudo', '-n', sys.executable, str(runtime / 'current/tools/jetlink/install_updates.py'),
+                    '--performance-runtime'], check=True, timeout=45)
+  except (OSError, subprocess.SubprocessError) as exc:
+    logging.getLogger('jetlink').warning('Jetson startup power setup or performance observer unavailable: %s', type(exc).__name__)
+  if Path('/etc/systemd/system/carrot-jetlink-boot-display.service').is_file():
+    migrate_boot_display(runtime)
   if not (runtime / 'current/tools/jetlink/boot_update.py').is_file():
     return
   if (runtime / 'boot-update-required').is_file():
@@ -20,13 +29,76 @@ def migrate_running_release(runtime=Path('/opt/carrot-jetlink')):
                   '--bootstrap-only'], check=True, timeout=30)
 
 
+BOOT_DISPLAY_DROPIN = Path('/run/systemd/system/carrot-jetlink-boot-display.service.d/runtime.conf')
+BOOT_DISPLAY_OVERRIDE = """[Service]
+ExecStart=
+ExecStart=/opt/carrot-jetlink/venv/bin/python /opt/carrot-jetlink/current/tools/jetlink/boot_display.py
+"""
+
+PERFORMANCE_UNIT = """[Unit]
+Description=Read-only Jetson performance samples for route diagnostics
+PartOf=carrot-jetlink.service
+ConditionPathExists=/opt/carrot-jetlink/current/tools/jetlink/host_performance.py
+[Service]
+ExecStart=/usr/bin/python3 /opt/carrot-jetlink/current/tools/jetlink/host_performance.py
+Restart=on-failure
+RestartSec=5
+RuntimeDirectory=carrot-jetlink-performance
+RuntimeDirectoryMode=0755
+Nice=19
+IOSchedulingClass=idle
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ReadWritePaths=/run/carrot-jetlink-performance
+"""
+
+
+def configure_runtime_performance(unit=Path('/run/systemd/system/carrot-jetlink-performance-observer.service')):
+  # /run survives signed-runtime activation but is recreated at boot, including
+  # protected images. Root is needed only to read BPMP debugfs and nvpmodel.
+  temporary = unit.with_suffix('.new')
+  temporary.write_text(PERFORMANCE_UNIT)
+  temporary.replace(unit)
+  subprocess.run(['systemctl', 'daemon-reload'], check=True, timeout=5)
+  subprocess.run(['systemctl', 'restart', unit.name], check=True, timeout=5)
+
+
+def migrate_boot_display(runtime):
+  # Keep the immutable recovery screen for early boot/storage failures. Once
+  # the signed runtime is available, both screens must use its stable /run lock.
+  try:
+    if BOOT_DISPLAY_DROPIN.read_text() == BOOT_DISPLAY_OVERRIDE:
+      return
+  except OSError:
+    pass
+  subprocess.run(['sudo', '-n', sys.executable, str(runtime / 'current/tools/jetlink/install_updates.py'),
+                  '--boot-display-runtime'], check=True, timeout=30)
+
+
+def configure_runtime_boot_display():
+  BOOT_DISPLAY_DROPIN.parent.mkdir(parents=True, exist_ok=True)
+  temporary = BOOT_DISPLAY_DROPIN.with_suffix('.new')
+  temporary.write_text(BOOT_DISPLAY_OVERRIDE)
+  temporary.replace(BOOT_DISPLAY_DROPIN)
+  subprocess.run(['systemctl', 'daemon-reload'], check=True, timeout=10)
+  subprocess.run(['systemctl', 'try-restart', 'carrot-jetlink-boot-display'], check=True, timeout=15)
+
+
 def bootstrap(root, source, defer_this_boot=False):
   root, source = Path(root), Path(source)
   target = root / 'opt/carrot-jetlink/updater'
   target.mkdir(parents=True, exist_ok=True)
   # Dependencies first, entry point last; enable only after every file is durable.
-  for name in ('finalize_sd_image.py', 'hud_protocol.py', 'release-signing-public.pem',
-               'wifi_protocol.py', 'boot_update.py', 'update_host.py'):
+  names = ['finalize_sd_image.py', 'hud_protocol.py', 'release-signing-public.pem',
+           'wifi_protocol.py', 'local_release.py', 'boot_update.py', 'update_host.py']
+  # Older offline patch payloads do not include the optional USB receiver.
+  # Copying its code never enables the locally selected USB policy.
+  if (source / 'usb_release.py').is_file():
+    names.insert(-2, 'usb_release.py')
+  for name in names:
     temporary = target / (name + '.new')
     with temporary.open('wb') as stream:
       stream.write((source / name).read_bytes())
@@ -45,6 +117,10 @@ def bootstrap(root, source, defer_this_boot=False):
 def configure(root, source):
   root = Path(root)
   bootstrap(root, source)
+  # Optional only for older offline payloads that predate automatic power setup.
+  if (Path(source) / 'power_setup.py').is_file():
+    from power_setup import configure as configure_power
+    configure_power(root, source)
   systemd = root / 'etc/systemd/system'
   command = '/opt/carrot-jetlink/venv/bin/python /opt/carrot-jetlink/updater/update_host.py'
   units = {
@@ -93,9 +169,17 @@ WantedBy=timers.target
 
 if __name__ == '__main__':
   parser = argparse.ArgumentParser(description=__doc__)
+  parser.add_argument('--boot-display-runtime', action='store_true', help='Use the signed display runtime for this boot only')
   parser.add_argument('--bootstrap-only', action='store_true', help='Migrate an installed runtime; enable from its next boot without OS writes')
+  parser.add_argument('--performance-runtime', action='store_true', help='Apply startup Super mode and start performance sampling')
   args = parser.parse_args()
-  if args.bootstrap_only:
+  if args.performance_runtime:
+    from power_setup import run_once
+    run_once()
+    configure_runtime_performance()
+  elif args.boot_display_runtime:
+    configure_runtime_boot_display()
+  elif args.bootstrap_only:
     source = Path('/opt/carrot-jetlink/current/tools/jetlink')
     if not (source / 'boot_update.py').is_file():
       raise RuntimeError('Install the boot-gated source release before enabling this policy')

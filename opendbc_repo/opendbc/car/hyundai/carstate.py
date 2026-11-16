@@ -12,11 +12,16 @@ from opendbc.car.hyundai.hyundaicanfd import CanBus
 from opendbc.car.hyundai.navi_speedcam import SpeedcamPolicy
 from opendbc.car.hyundai.section_average import DISTANCE_SCALE as SECTION_DISTANCE_SCALE, SectionAverage
 from opendbc.car.hyundai.steering_touch import HyundaiSteeringTouch
+from opendbc.car.hyundai.rear_gap import tbt_bsd_inputs
+from opendbc.car.hyundai.lane_line_time import lane_line_time
 from opendbc.car.hyundai.vehicle_gps import VehicleGPS, register_vehicle_gps
 from opendbc.car.hyundai.values import HyundaiFlags, CAR, DBC, Buttons, CarControllerParams, CAMERA_SCC_CAR, HyundaiExtFlags, \
-                                       EV_MODE_ACTIVE_VALUES, EV_MODE_STATUS_ADDR, EV_MODE_STATUS_DLC, EV_MODE_STATUS_MSG, \
+                                       HyundaiSafetyFlags, EV_MODE_ACTIVE_VALUES, EV_MODE_STATUS_ADDR, EV_MODE_STATUS_DLC, EV_MODE_STATUS_MSG, \
                                        EV_MODE_STATUS_SIGNAL
 from opendbc.car.interfaces import CarStateBase
+from opendbc.car.hyundai.values import get_pedal_interceptor_params
+from opendbc.car.pedal_interceptor import (PEDAL_INTERCEPTOR_BUS,
+                                         PEDAL_INTERCEPTOR_RX_FREQUENCY, PedalInterceptorState)
 
 from openpilot.common.params import Params
 
@@ -56,6 +61,7 @@ BUTTONS_DICT = {Buttons.RES_ACCEL: ButtonType.accelCruise, Buttons.SET_DECEL: Bu
 GearShifter = structs.CarState.GearShifter
 
 READY_COUNT_OK = 200
+STOCK_ADOPT_FRAMES = int(30. / DT_CTRL)  # restart hand-over window after the device starts
 CANFD_CAMERA_TX_MESSAGES = (
   ("LFA", "lfa", 121), ("LFA_ALT", "lfa_alt", 121),
   ("LFAHDA_CLUSTER", "lfahda_cluster", 121),
@@ -211,6 +217,10 @@ class CarState(CarStateBase):
     self.pv5_completed_camera_speed = 0
     self.tcs = None
     self.mdps = None
+    # CanfdBlinkerKick handoff (carcontroller.aprk_blinkers, CANFD_BLINKER_KICK only): last stock SPAS1/SPAS2 frame on
+    # ECAN and last positive UDS reply (50 03) from the parking ECU on ECAN or ACAN, in CAN nanos
+    self.can_nanos = self.aprk_stock_nanos = self.aprk_ack_nanos = 0
+    self.aprk_watch = False
     self.steer_touch_2af = None
     self.steering_touch = HyundaiSteeringTouch()
     self.vehicle_gps = VehicleGPS()
@@ -239,6 +249,20 @@ class CarState(CarStateBase):
     self.op_params.put_bool("HyundaiCameraSccHint", False)
 
     self.main_enabled = True if self.op_params.get_int("AutoEngage") == 2 else False
+    # The APRK ack watch (_update_aprk) adds optional SPAS1/SPAS2/APRK_DIAG_RESP parser entries, so it runs only when
+    # CANFD_BLINKER_KICK is set (CanfdBlinkerKick on at fingerprint time, KICK_CARS, camera-SCC harness: interface.py);
+    # without it the parsers stay exactly as in carrot-wip. Like panda's Kick allowlist, it follows the next start.
+    self.aprk_enabled = any(cfg.safetyParam & HyundaiSafetyFlags.CANFD_BLINKER_KICK for cfg in CP.safetyConfigs)
+    # Stock cruise hand-over: the device (re)started while the camera's stock SCC was cruising (e.g. it rebooted
+    # mid-drive). Keep stock driving and engage openpilot at the stock set speed instead of cutting it off with ACCMode 0.
+    # Always on for camera-SCC CAN-FD with openpilot longitudinal (no key since 11-15); see _update_stock_adopt.
+    self.stock_adopt_pending = (bool(CP.flags & HyundaiFlags.CANFD) and bool(CP.flags & HyundaiFlags.CAMERA_SCC)
+                                and CP.openpilotLongitudinalControl)
+    self.stock_adopt_kph = 0.
+    self.stock_adopt_frames = 0
+    self.pedal_interceptor_params = get_pedal_interceptor_params(CP)
+    self.pedal_interceptor_state = PedalInterceptorState() if self.pedal_interceptor_params is not None else None
+    self.pedal_interceptor_cruise_blocked = True
     self.manual_main_off_latched = False
     self.gear_shifter = GearShifter.drive # Gear_init for Nexo ?? unknown 21.02.23.LSW
 
@@ -286,6 +310,7 @@ class CarState(CarStateBase):
     self.ACCMode = 0
     self.LFA_ICON = 0
     self.paddle_button_prev = 0
+    self.paddle_hold_frames = 0
     self.canfdOemBrakeHoldLatched = False
     self.canfdAvhReleaseGraceFrames = 0
 
@@ -354,10 +379,47 @@ class CarState(CarStateBase):
       self.manual_main_off_latched = not self.main_enabled
       print(f"main_enabled = {self.main_enabled}")
 
-    # Camera SCC reports the MAIN change after the physical button release.
-    # Do not let that stale state immediately undo an explicit manual MAIN off.
-    if self.CP.openpilotLongitudinalControl and self.MainMode_ACC and not self.manual_main_off_latched:
+    # CameraSCC MAIN can be requested automatically for cluster objects. Driver
+    # intent comes from AutoEngage initialization and the physical buttons above.
+    # Importing that OEM state would raise cruiseState.available and arm steering.
+    if (self.CP.openpilotLongitudinalControl and not self.CP.flags & HyundaiFlags.CAMERA_SCC
+        and self.MainMode_ACC and not self.manual_main_off_latched):
       self.main_enabled = True
+
+  def _update_stock_adopt(self, camera_scc_seen, stock_set_speed_ms, off_requested=False):
+    """Restart hand-over of the camera's cruising stock SCC.
+
+    While pending, carcontroller sends no SCC_CONTROL (panda keeps forwarding the camera's own frame, so the car keeps
+    cruising as before the restart) and cruise.py requests an engage every 0.5 s at stock_adopt_kph, subject to the
+    normal interlocks and the cancel latch. The wait ends, and normal SCC_CONTROL (ACCMode 0 until openpilot engages)
+    resumes, when:
+      - off_requested: the driver's CANCEL / pause or any MAIN button activity on the car's buttons, or a cancel / off
+        request inside openpilot (cancel latch or activateCruise < 0 from the previous frame: Bluetooth remote cancel,
+        Carrot CRUISE OFF). The driver wants cruise off, so openpilot must not take it over, and our ACCMode 0 also
+        stops the stock cruise for the requests the camera never receives (remote, Carrot, NORMAL_CRUISE_MAIN_BTN,
+        which create_ccnc_messages does not forward).
+      - stock not cruising (MAIN off, or ACCMode not 1 enabled / 2 gas override) when the camera frame is first seen:
+        a normal start, never a hand-over.
+      - STOCK_ADOPT_FRAMES (30 s) after start: a normal start from then on (carrot-wip does this from the first frame).
+    Once openpilot engages, carcontroller clears stock_adopt_pending and normal control continues."""
+    self.stock_adopt_kph = 0.
+    if not self.stock_adopt_pending:
+      return
+    if off_requested:
+      self.stock_adopt_pending = False
+      return
+    self.stock_adopt_frames += 1
+    if self.stock_adopt_frames > STOCK_ADOPT_FRAMES:
+      self.stock_adopt_pending = False  # too late to be a restart hand-over: normal startup
+      return
+    if not camera_scc_seen:
+      return
+    if not (self.MainMode_ACC and self.ACCMode in (1, 2)):  # 1 enabled, 2 driver override (gas)
+      self.stock_adopt_pending = False  # stock is not cruising: normal startup
+      return
+    self.main_enabled = True
+    self.manual_main_off_latched = False
+    self.stock_adopt_kph = stock_set_speed_ms * CV.MS_TO_KPH
 
   def _update_camera_scc_hint(self, cp_cam, canfd):
     if self.camera_scc_hint_enabled and not self.camera_scc_hint:
@@ -567,9 +629,25 @@ class CarState(CarStateBase):
 
       ret.pcmCruiseGap = cp_cruise.vl["SCC11"]["TauGapSet"]
 
+    if self.pedal_interceptor_params is not None:
+      pedal_interceptor_params = self.pedal_interceptor_params
+      self.pedal_interceptor_state.update(can_parsers[Bus.party], pedal_interceptor_params)
+      message, signal = pedal_interceptor_params.cruise_ready
+      address, bit = pedal_interceptor_params.cruise_enabled_bit
+      payload = cp.dat.get(address, b"")
+      ret.cruiseState.enabled = len(payload) == 8 and bool(int.from_bytes(payload, "little") & (1 << bit))
+      cruise_valid = (cp.ts_nanos[message][signal] > 0 and len(payload) == 8 and
+                      cp.message_states[address].valid(cp._last_update_nanos, False))
+      self.pedal_interceptor_cruise_blocked = (not cruise_valid or bool(cp.vl[message][signal]) or ret.cruiseState.enabled)
+      # OEM Cruise ready/engaged takes priority. Keep Carrot's independent
+      # main-switch/controls-initialization gate as well.
+      ret.cruiseState.available = ret.cruiseState.available and not self.pedal_interceptor_cruise_blocked
+      message, signal = pedal_interceptor_params.cruise_speed
+      ret.cruiseState.speed = cp.vl[message][signal] * speed_conv
+
     # TODO: Find brake pressure
     ret.brake = 0
-    if not self.CP.flags & HyundaiFlags.CC_ONLY_CAR:
+    if not self.CP.flags & HyundaiFlags.CC_ONLY_CAR or self.pedal_interceptor_params is not None:
       ret.brakePressed = cp.vl["TCS13"]["DriverOverride"] == 2  # 2 includes regen braking by user on HEV/EV
       ret.brakeHoldActive = cp.vl["TCS15"]["AVH_LAMP"] == 2  # 0 OFF, 1 ERROR, 2 ACTIVE, 3 READY
       ret.parkingBrake = cp.vl["TCS13"]["PBRAKE_ACT"] == 1
@@ -577,6 +655,11 @@ class CarState(CarStateBase):
       ret.espActive = cp.vl["TCS11"]["ABS_ACT"] == 1
       ret.accFaulted = cp.vl["TCS13"]["ACCEnable"] != 0  # 0 ACC CONTROL ENABLED, 1-3 ACC CONTROL DISABLED
       ret.brakeLights = bool(cp.vl["TCS13"]["BrakeLight"] or ret.brakePressed)
+
+    if self.pedal_interceptor_state is not None:
+      # ACCEnable describes a nonexistent SCC in this adapter. Brake/hold,
+      # parking, ESP, main/READY and CAN health continue through Carrot's paths.
+      ret.accFaulted = self.pedal_interceptor_state.faulted
 
     if self.CP.flags & (HyundaiFlags.HYBRID | HyundaiFlags.EV | HyundaiFlags.FCEV):
       if self.CP.flags & HyundaiFlags.FCEV:
@@ -589,6 +672,9 @@ class CarState(CarStateBase):
     else:
       ret.gas = cp.vl["EMS12"]["PV_AV_CAN"] / 100.
       ret.gasPressed = bool(cp.vl["EMS16"]["CF_Ems_AclAct"])
+
+    if self.pedal_interceptor_state is not None and self.pedal_interceptor_state.valid:
+      ret.gasPressed = self.pedal_interceptor_state.gas_pressed
 
     # Gear Selection via Cluster - For those Kia/Hyundai which are not fully discovered, we can use the Cluster Indicator for Gear Selection,
     # as this seems to be standard over all cars, but is not the preferred method.
@@ -639,6 +725,7 @@ class CarState(CarStateBase):
       aeb_braking = cp_cruise.vl[aeb_src]["CF_VSM_DecCmdAct"] != 0 or cp_cruise.vl[aeb_src][aeb_sig] != 0
       if self.CP.carFingerprint == CAR.HYUNDAI_CASPER_EV and aeb_src == "FCA11":
         fca_fault = cp_cruise.vl["FCA11"]["FCA_Failinfo"] != 0 or cp_cruise.vl["FCA11"]["FCA_Status"] == 3
+        ret.stockSccFault = fca_fault
         if fca_fault:
           aeb_warning = False
           aeb_braking = False
@@ -1306,10 +1393,30 @@ class CarState(CarStateBase):
       self.speedLimitDistance = self.totalDistance
       ret.speedLimitDistance = 0.0
 
+  def _update_aprk(self, cp, cp_alt):
+    if not self.aprk_watch:
+      # Optional, counter and checksum ignored: only "did a frame arrive" matters, and a missing or restarting stream
+      # must never touch CAN validity
+      for parser, names in ((cp, ("SPAS1", "SPAS2", "APRK_DIAG_RESP")), (cp_alt, ("APRK_DIAG_RESP",))):
+        for name in names if parser is not None else ():
+          msg = parser.dbc.name_to_msg.get(name)
+          if msg is not None and msg.address not in parser.message_states:
+            parser._add_message(name, math.nan, ignore_counter=True)
+            parser.message_states[msg.address].ignore_checksum = True
+      self.aprk_watch = True
+    self.can_nanos = cp._last_update_nanos
+    self.aprk_stock_nanos = max((cp.ts_nanos[n]["COUNTER"] for n in ("SPAS1", "SPAS2") if n in cp.ts_nanos), default=0)
+    for parser in (cp, cp_alt):
+      replies = parser.vl_all.get("APRK_DIAG_RESP") if parser is not None else None
+      if replies and any(sid == 0x50 and sub == 0x03 for sid, sub in zip(replies["SID"], replies["SUB"])):
+        self.aprk_ack_nanos = parser._last_update_nanos
+
   def update_canfd(self, can_parsers) -> structs.CarState:
     cp = can_parsers[Bus.pt]
     cp_cam = can_parsers[Bus.cam]
     cp_alt = can_parsers[Bus.alt] if Bus.alt in can_parsers else None
+    if self.aprk_enabled:
+      self._update_aprk(cp, cp_alt)
 
     ret = structs.CarState()
     ret.steeringTouch = self.steering_touch.update(cp)
@@ -1436,6 +1543,9 @@ class CarState(CarStateBase):
       self.MainMode_ACC = cp_cam.vl["SCC_CONTROL"]["MainMode_ACC"] == 1
       self.ACCMode = cp_cam.vl["SCC_CONTROL"]["ACCMode"]
       self.LFA_ICON = cp_cam.vl["LFAHDA_CLUSTER"]["HDA_LFA_SymSta"]
+      self._update_stock_adopt(0x1A0 in cp_cam.seen_addresses, cp_cam.vl["SCC_CONTROL"]["VSetDis"] * speed_factor,
+                               cruise_button == Buttons.CANCEL or bool(self.main_buttons[-1]) or main_button_released
+                               or self.out.cruiseCancelState or self.out.activateCruise < 0)
     self._update_canfd_main_enabled(cruise_button, main_button_released)
     # CAN FD cars enable on main button press, set available if no TCS faults preventing engagement
     ret.cruiseState.available = self.main_enabled and self.controls_ready_count >= READY_COUNT_OK #cp.vl["TCS"]["ACCEnable"] == 0
@@ -1460,6 +1570,11 @@ class CarState(CarStateBase):
         ret.pcmCruiseGap = int(np.clip(cp_cruise_info.vl["SCC_CONTROL"]["DISTANCE_SETTING"], 1, 4))
       ret.cruiseState.standstill = cp_cruise_info.vl["SCC_CONTROL"]["InfoDisplay"] >= 4
       ret.cruiseState.speed = cp_cruise_info.vl["SCC_CONTROL"]["VSetDis"] * speed_factor
+
+    # The optional 250m trigger uses OEM BSD independently of corner display data.
+    if self.CP.enableBsm:
+      ret.tbtRearInputsAvailable, ret.tbtRightRearBlocked = tbt_bsd_inputs(
+        self.cp_bsm, max(cp._last_update_nanos, cp_cam._last_update_nanos))
 
     speed_limit_cam = False
     corner = False
@@ -1518,6 +1633,7 @@ class CarState(CarStateBase):
     ret.gearStep = cp.vl["GEAR_ALT"]["GEAR_STEP"] if self.GEAR_ALT else ret.gearStep
 
     lane_info = self.cam_0x2a4 if self.cam_0x2a4 is not None else self.cam_0x362
+    ret.laneLineInfoMonoTime = lane_line_time((self.cp_cam, self.cp_alt), lane_info)
 
     if lane_info is not None:
       left_lane_prob = lane_info["LEFT_LANE_PROB"]
@@ -1605,6 +1721,9 @@ class CarState(CarStateBase):
       paddle_button = 1 if cp.vl["CRUISE_BUTTONS"]["LEFT_PADDLE"] == 1 else 2 if cp.vl["CRUISE_BUTTONS"]["RIGHT_PADDLE"] == 1 else 0
     elif self.gear_msg_canfd == "GEAR":
       paddle_button = 1 if cp.vl["GEAR"]["LEFT_PADDLE"] == 1 else 2 if cp.vl["GEAR"]["RIGHT_PADDLE"] == 1 else 0
+    # A held paddle reads 0 for 0.1-0.2 s every few frames; bridge 0.3 s so SCC does not re-engage under the
+    # still-held paddle (that re-engage raised the cluster's "paddle shifter conditions not met" popup, 11-03 18:24).
+    self.paddle_hold_frames = 30 if paddle_button > 0 else max(0, self.paddle_hold_frames - 1)
 
     # Filter the Python list before the single capnp assignment: re-assigning a
     # capnp list field from itself clears the source first and zeroes every event.
@@ -1647,9 +1766,16 @@ class CarState(CarStateBase):
     if CP.flags & HyundaiFlags.CANFD:
       return self.get_can_parsers_canfd(CP)
 
-    return {
+    parsers = {
       # EMS21 carries SCR_UREA_LEVEL on diesel platforms. NaN frequency makes
       # it optional, so gasoline/EV platforms do not fail CAN validity.
       Bus.pt: register_vehicle_gps(CANParser(DBC[CP.carFingerprint][Bus.pt], [("EMS21", math.nan)], 0)),
       Bus.cam: CANParser(DBC[CP.carFingerprint][Bus.pt], [], 2),
     }
+    pedal_interceptor_params = get_pedal_interceptor_params(CP)
+    if pedal_interceptor_params is not None:
+      parsers[Bus.party] = CANParser(pedal_interceptor_params.dbc_name, [("GAS_SENSOR", PEDAL_INTERCEPTOR_RX_FREQUENCY)],
+                                    PEDAL_INTERCEPTOR_BUS)
+      # Register the configured OEM CC input at its actual receive rate.
+      parsers[Bus.pt]._add_message(pedal_interceptor_params.cruise_ready[0], 10)
+    return parsers

@@ -21,6 +21,23 @@ env:
   CI: 1
 
 jobs:
+  comma_connect:
+    name: comma Connect offline policy and C3 modem
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: python -m pip install pytest pytest-mock requests
+      - run: >-
+          python -m pytest -q -c /dev/null --confcutdir=openpilot/system/tests
+          openpilot/system/tests/test_comma_connect.py
+          openpilot/system/tests/test_c3_modem.py
+          openpilot/system/tests/test_setup_download.py
+          openpilot/system/tests/test_agnos_download_cache.py
+          openpilot/common/tests/test_repo_update.py
+
   egpu_startup:
     name: eGPU selected-model startup
     runs-on: ubuntu-24.04
@@ -68,7 +85,7 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
-      - run: python -m pip install pytest numpy
+      - run: python -m pip install pytest numpy pycapnp
       - name: Check speed mismatch, original deceleration and planner routing
         run: >-
           python -m pytest -c /dev/null --rootdir=. --confcutdir=openpilot/selfdrive/controls/tests -q
@@ -102,7 +119,36 @@ jobs:
       - run: ./tools/op.sh setup
       - name: Build openpilot
         run: scons
-      - name: Bosch provider regression tests
+      - name: Check native offline cloud boundaries and C3 modem routing
+        env:
+          NATIVE_DEVICE_TESTS: '1'
+        run: >-
+          python -m pytest -o addopts='' -q
+          openpilot/system/tests/test_comma_connect_native.py
+          openpilot/system/tests/test_c3_modem.py
+          openpilot/system/athena/tests/test_registration.py
+      - name: Check Tesla stop solver, gesture and shared defaults
+        run: |
+          python -c "import openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc"
+          python -m pytest -o addopts='' -q \
+            openpilot/selfdrive/controls/tests/test_tesla_traffic_stop_integration.py \
+            openpilot/selfdrive/car/tests/test_tesla_three_finger.py \
+            openpilot/selfdrive/controls/tests/test_lateral_startup_control.py \
+            openpilot/selfdrive/controls/tests/test_controlsd_publish.py \
+            openpilot/common/tests/test_params.py::test_always_lateral_manager_preserves_existing_default_and_saved_choice
+      - name: PR580 startup and restored longitudinal control
+        run: |
+          python -m pytest -o addopts='' -q \
+            openpilot/system/tests/test_build_cache.py \
+            openpilot/system/tests/test_rebuild_cleanup.py \
+            openpilot/selfdrive/carrot/tests/test_t_follow.py \
+            openpilot/selfdrive/controls/tests/test_longitudinal_preview.py \
+            openpilot/selfdrive/controls/tests/test_longitudinal_preview_release.py \
+            openpilot/selfdrive/controls/tests/test_longitudinal_gap_recovery.py \
+            openpilot/selfdrive/controls/tests/test_longitudinal_braking_gap.py \
+            opendbc_repo/opendbc/car/hyundai/tests/test_stock_cruise_adopt.py \
+            opendbc_repo/opendbc/car/hyundai/tests/test_camera_set_speed_sync.py
+      - name: Bosch provider replay regression tests
         run: |
           python -m pytest -o addopts='' -q \
             opendbc_repo/opendbc/car/hyundai/tests/test_radar.py \
@@ -111,6 +157,13 @@ jobs:
             opendbc_repo/opendbc/car/hyundai/tests/test_bosch_mirror_birth.py \
             opendbc_repo/opendbc/car/hyundai/tests/test_bosch_mirror_m3.py \
             opendbc_repo/opendbc/car/hyundai/tests/test_bosch_road_edge.py
+      - name: Check temporary navigation destinations and native Params
+        run: >-
+          python -m pytest -o addopts='' -q
+          openpilot/common/tests/test_params.py::TestParams::test_temporary_navigation_destination_lifecycle
+          openpilot/selfdrive/navigation/tests/test_route_engine.py
+          openpilot/selfdrive/carrot/server/tests/test_navigation_map.py
+          openpilot/selfdrive/navd/tests/test_instruction_serialization.py
       - name: Check passive camera SOF diagnostics
         run: openpilot/system/camerad/test/test_camera_event_timing
       - name: Check Hyundai navigation and lever features and RAV4 ARS integration
@@ -122,6 +175,8 @@ jobs:
           opendbc_repo/opendbc/car/hyundai/tests/test_blink_hold.py
           opendbc_repo/opendbc/car/hyundai/tests/test_blinker_stalks.py
           opendbc_repo/opendbc/car/hyundai/tests/test_ccnc_cluster.py
+          opendbc_repo/opendbc/car/hyundai/tests/test_carstate_buttons.py
+          openpilot/selfdrive/car/tests/test_camera_scc_steering_intent.py
           opendbc_repo/opendbc/car/toyota/tests/test_ars510_carrot.py
           opendbc_repo/opendbc/car/toyota/tests/test_ars510_display.py
           openpilot/selfdrive/car/tests/test_toyota_pcm_mode0.py
@@ -146,9 +201,16 @@ jobs:
           openpilot/common/tests/test_display_scheduling.py
           openpilot/system/tests/test_camera_cpu_placement.py
           openpilot/selfdrive/ui/tests/test_carrot_ui_sched.py
+      # Keep forked replay workers separate from threaded model artifact tests.
+      - name: Check radar replay worker integration
+        timeout-minutes: 4
+        run: >-
+          python -m pytest -o addopts='' -o faulthandler_timeout=60 -vv -s
+          openpilot/selfdrive/controls/tests/test_leads.py
       - name: Check model, monitoring and Bluetooth integration
+        timeout-minutes: 4
         run: |
-          python -m pytest -o addopts='' -q \
+          python -m pytest -o addopts='' -o faulthandler_timeout=60 -vv \
             openpilot/common/tests/test_egpu_diagnostics.py \
             openpilot/selfdrive/monitoring/test_monitoring.py \
             openpilot/selfdrive/monitoring/test_dm2.py \
@@ -167,6 +229,7 @@ jobs:
             openpilot/selfdrive/modeld/tests/test_precompiled_validation.py \
             openpilot/system/tests/test_model_build_cache.py \
             openpilot/system/tests/test_proclog_smaps.py \
+            openpilot/system/tests/test_memory_trace.py \
             openpilot/system/tests/test_panda_firmware_version.py \
             openpilot/selfdrive/modeld/tests/test_generic_model_runtime.py \
             openpilot/selfdrive/modeld/tests/test_dmonitoring_artifact.py \
@@ -176,10 +239,11 @@ jobs:
             openpilot/selfdrive/carrot/tests/test_radar_cutout_fast_path.py \
             openpilot/selfdrive/carrot/tests/test_cluster_performance_safeguards.py \
             openpilot/selfdrive/carrot/tests/test_cluster_autorun.py \
-            openpilot/selfdrive/controls/tests/test_leads.py \
             openpilot/selfdrive/carrot/bluetooth/tests \
+            tools/carrot_b1 \
             openpilot/selfdrive/car/tests/test_carrot_cruise_buttons.py \
             opendbc_repo/opendbc/car/volkswagen/tests/test_carstate_buttons.py \
+            opendbc_repo/opendbc/car/volkswagen/tests/test_volkswagen.py::test_golf_mk7_wheel_speed_update \
             opendbc_repo/opendbc/car/hyundai/tests/test_stopping.py \
             opendbc_repo/opendbc/car/hyundai/tests/test_jerk.py \
             openpilot/selfdrive/controls/tests/test_desire_helper.py \

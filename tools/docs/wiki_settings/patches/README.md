@@ -4,6 +4,18 @@ These patches preserve reviewed Wiki edits in the code branch when the author
 cannot push to the separate Wiki repository. Committing a patch here does not
 publish its content to the live Wiki.
 
+## P/R-only cluster screens
+
+`cluster-gear-screens.patch` contains only the KO/EN `ClusterHudScreenMode`
+manual regions for `thftgr/carrot-wip-cluster`. It applies to empty manual
+regions generated from this branch's catalog; reconcile existing manual text
+when integrating elsewhere. The clean driving layout and device-screen sleep
+changes are excluded. This patch is local and has not been published. It uses
+zero context lines; check/apply it with `git apply --unidiff-zero`.
+
+Follow the [authoring guide](../AUTHORING_GUIDE.md), regenerate with the staged
+pages as `--wiki-dir`, and validate before any later publication.
+
 ## Bosch passive reception
 
 `bosch-passive-reception.patch` changes only the Korean and English
@@ -30,6 +42,23 @@ The patch uses zero context lines, so `--unidiff-zero` is required. Follow the
 [authoring guide](../AUTHORING_GUIDE.md), validate the edited pages and regenerate
 the Wiki catalog before publishing. If the check fails after later Wiki edits,
 reconcile only the matching manual regions instead of forcing the patch.
+## Tesla automatic turn signals
+
+`tesla-auto-turn-signals.patch` fills only the Korean, English and Chinese
+`TeslaAutoTurnSignals` manual regions. Its base is the initial pages generated
+from the working catalog that introduces this setting. Generate those pages,
+then check and apply the patch from the staged Wiki directory:
+
+```sh
+git apply --check /absolute/path/to/tesla-auto-turn-signals.patch
+git apply /absolute/path/to/tesla-auto-turn-signals.patch
+```
+
+Regenerate with that directory as `--wiki-dir` to preserve the manual text,
+then validate following the authoring guide. The review marker deliberately
+remains unset; this patch and local verification do not publish or certify
+vehicle behavior.
+
 
 ## RAV4 PCM mode 0
 

@@ -13,6 +13,7 @@ import pytest
 from openpilot.selfdrive.carrot.server.services.settings import (
   build_menu_categories,
   current_vehicle_brand,
+  current_vehicle_settings_context,
   filter_settings_catalog_for_brand,
   group_index,
   with_vehicle_gap_limits,
@@ -41,6 +42,24 @@ def params(settings):
 def test_the_catalogue_is_readable_and_populated(params):
   assert len(params) > 100
   assert all(isinstance(p.get("name"), str) and p["name"] for p in params)
+
+
+def test_tesla_switches_have_a_dedicated_browser_group(settings):
+  _, by_name, _ = group_index(settings)
+  categories = build_menu_categories(settings, by_name)
+  driving = next(category for category in categories if category["id"] == "DRIVING")
+  tesla = next(group for group in driving["groups"] if group["id"] == "TESLA")
+  expected = ["TeslaAutoTurnSignals", "TeslaCanTrafficStop", "TeslaManualLaneSignals",
+              "TeslaModelDesireSignals", "TeslaModelPathSignals", "TeslaAutoSpeedLimit"]
+  assert tesla["count"] == 6
+  assert tesla["sections"][0]["items"] == expected
+  for category in categories:
+    for group in category["groups"]:
+      if group["id"] != "TESLA":
+        assert not set(expected).intersection(name for section in group["sections"] for name in section["items"])
+  wheel = by_name["TeslaAutoSpeedLimit"]
+  assert (wheel["control"], wheel["default"], wheel["min"], wheel["max"]) == ("toggle", 0, 0, 1)
+  assert '{"TeslaAutoSpeedLimit", {PERSISTENT, BOOL, "0"}}' in PARAMS_KEYS_PATH.read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize("maximum", (3, 4))
@@ -255,6 +274,89 @@ def test_vehicle_brand_does_not_hide_settings_for_other_car_name():
   assert current_vehicle_brand(FakeParams()) == ""
 
 
+@pytest.mark.parametrize("fingerprint,pedal,longitudinal,expected", [
+  ("KIA_RAY_EV", True, True, True),
+  ("KIA_RAY_EV", False, True, False),
+  ("KIA_RAY_EV", True, False, False),
+  ("HYUNDAI_CASPER_EV", True, True, False),
+])
+def test_ray_pedal_catalog_uses_identified_capability(settings, fingerprint, pedal, longitudinal, expected):
+  from openpilot.cereal import car
+  from opendbc.car.hyundai.values import HyundaiFlags
+  cp = car.CarParams.new_message(brand="hyundai", carFingerprint=fingerprint,
+                                openpilotLongitudinalControl=longitudinal)
+  cp.flags = int(HyundaiFlags.CC_ONLY_CAR | (HyundaiFlags.PEDAL_INTERCEPTOR if pedal else 0))
+  class FakeParams:
+    def get(self, name):
+      return {"CarParamsPersistent": cp.to_bytes(), "CarName": fingerprint,
+              "CommaPedalEnabled": b"1"}.get(name)
+  brand, active_pedal = current_vehicle_settings_context(FakeParams())
+  assert (brand, active_pedal) == ("hyundai", expected)
+  groups, by_name, groups_list = group_index(settings)
+  categories = build_menu_categories(settings, by_name)
+  filtered, counts, menu, hidden = filter_settings_catalog_for_brand(
+    groups, groups_list, categories, brand, ray_pedal_control=active_pedal)
+  tuning = {"LongTuningKpV", "LongTuningKiV", "LongTuningKf"}
+  visible = {item["name"] for items in filtered.values() for item in items}
+  menu_names = {name for category in menu for group in category["groups"]
+                for section in group["sections"] for name in section["items"]}
+  assert (tuning <= visible) == expected
+  assert (tuning <= menu_names) == expected
+  assert tuning <= {item["name"] for items in groups.values() for item in items}
+  assert all(group["count"] == sum(not item.get("detail_parent") and not item.get("search_only")
+                                  for item in filtered[group["group"]]) for group in counts)
+  assert hidden == (set() if expected else tuning)
+
+
+@pytest.mark.parametrize("car_params", [None, b"invalid"])
+def test_pending_pedal_toggle_alone_keeps_fixed_brand_catalog(car_params):
+  class FakeParams:
+    def get(self, name):
+      return {"CarParamsPersistent": car_params, "CarName": "KIA_RAY_EV", "CommaPedalEnabled": b"1"}.get(name)
+  assert current_vehicle_settings_context(FakeParams()) == ("hyundai", False)
+
+
+def test_settings_catalog_and_snapshot_follow_ray_capability_changes(monkeypatch, settings):
+  import importlib.util
+  import sys
+  import types
+  # Load the real settings feature independently of unrelated device/IPC routes.
+  package = "openpilot.selfdrive.carrot.server.features"
+  directory = Path(__file__).resolve().parents[1] / "features"
+  namespace = types.ModuleType(package)
+  namespace.__path__ = [str(directory)]
+  monkeypatch.setitem(sys.modules, package, namespace)
+  spec = importlib.util.spec_from_file_location(package + ".settings", directory / "settings.py")
+  feature = importlib.util.module_from_spec(spec)
+  spec.loader.exec_module(feature)
+  groups, by_name, groups_list = group_index(settings)
+  parts = settings, groups, by_name, groups_list
+  monkeypatch.setattr(feature, "get_settings_cached", lambda: parts)
+  monkeypatch.setitem(feature.settings_cache, "categories", build_menu_categories(settings, by_name))
+  monkeypatch.setattr(feature, "HAS_PARAMS", False)
+  for name, result in (
+    ("get_ssh_key_status", {}), ("read_setting_favorites", {"favorites": ["LongTuningKiV"]}),
+    ("read_setting_profiles", {}), ("read_popular_values_memory", {}), ("read_setting_unit_index", {}),
+    ("get_device_network_snapshot", {}), ("get_device_setting_group_names", []),
+  ):
+    monkeypatch.setattr(feature, name, lambda result=result: result)
+  monkeypatch.setattr(feature, "get_device_setting_values", lambda status: {})
+  monkeypatch.setattr(feature, "observe_param_values", lambda values: None)
+  monkeypatch.setattr(feature, "get_param_values", lambda names, defaults: {
+    name: 50 if name == "LongTuningKiV" else defaults[name] for name in names})
+  tuning = {"LongTuningKpV", "LongTuningKiV", "LongTuningKf"}
+  for active in (True, False, True):
+    monkeypatch.setattr(feature, "current_vehicle_settings_context", lambda active=active: ("hyundai", active))
+    catalog = feature._settings_catalog_payload()
+    snapshot = feature._settings_snapshot_payload()
+    visible = {item["name"] for items in catalog["items_by_group"].values() for item in items}
+    assert (tuning <= visible) == active
+    assert (tuning <= snapshot["values"].keys()) == active
+    assert snapshot["favorites"] == (["LongTuningKiV"] if active else [])
+    if active:
+      assert snapshot["values"]["LongTuningKiV"] == 50
+
+
 def test_c3x_lite_hardware_setting_is_exposed(settings, params):
   by_name = {p["name"]: p for p in params}
   c3x_lite = by_name["HardwareC3xLite"]
@@ -264,7 +366,26 @@ def test_c3x_lite_hardware_setting_is_exposed(settings, params):
 
   vehicle = next(category for category in settings["menu"] if category["id"] == "VEHICLE")
   device_hardware = next(group for group in vehicle["groups"] if group["id"] == "VEH_DEVICE")
-  assert device_hardware["params"] == ["HardwareC3xLite"]
+  assert device_hardware["params"] == ["CommaPedalEnabled", "HardwareC3xLite"]
+
+
+def test_comma_pedal_toggle_is_default_off_and_under_device_hardware(settings, params):
+  by_name = {p["name"]: p for p in params}
+  pedal = by_name["CommaPedalEnabled"]
+  assert pedal["title"] == "Comma Pedal사용"
+  assert pedal["descr"].startswith("ACC 미 장착 차량에서 Comma Pedal 장치를 통한 종방향 제어를 허용합니다.")
+  for key in ("descr", "edescr", "cdescr"):
+    assert "CC_ONLY_CAR" in pedal[key] and "Cruise ready" in pedal[key]
+    assert "HardwareC3xLite" not in pedal[key]
+  assert "순정 크루즈 컨트롤이 우선" in pedal["descr"]
+  assert (pedal["min"], pedal["max"], pedal["default"]) == (0, 1, 0)
+  assert pedal["control"] == "toggle"
+  assert pedal["risk"] == "high"
+  params_keys = PARAMS_KEYS_PATH.read_text(encoding="utf-8")
+  assert '{"CommaPedalEnabled", {PERSISTENT, INT, "0"}}' in params_keys
+  vehicle = next(category for category in settings["menu"] if category["id"] == "VEHICLE")
+  device_hardware = next(group for group in vehicle["groups"] if group["id"] == "VEH_DEVICE")
+  assert pedal["name"] in device_hardware["params"]
 
 
 def test_wide_camera_fallback_setting_is_exposed(settings, params):
@@ -443,7 +564,7 @@ def test_external_hud_brightness_and_orientation_use_catalog_controls(settings, 
     "Info left / driving right",
   ]
   screen_mode = by_name["ClusterHudScreenMode"]
-  assert (screen_mode["min"], screen_mode["max"], screen_mode["default"]) == (-1, 5, 0)
+  assert (screen_mode["min"], screen_mode["max"], screen_mode["default"]) == (-1, 7, 0)
   assert screen_mode["descr"].startswith("-1: 3D 전체화면\n0: 기본(내비/주행 리포트)")
   assert screen_mode["edescr"].startswith("-1: 3D fullscreen\n0: Default (navigation/driving report)")
   assert screen_mode["cdescr"].startswith("-1: 3D全屏\n0: 默认(导航/驾驶报告)")
@@ -601,3 +722,35 @@ def test_declared_numeric_bounds_stay_intact(params):
   assert (by_name["ApplyModelSpeed"]["min"], by_name["ApplyModelSpeed"]["max"]) == (-120, 120)
   assert by_name["ApplyModelSpeed"]["default"] == 0
   assert by_name["TFollowDecelBoost"]["unit"] == 10
+
+
+def test_live_geometry_has_zero_default_and_no_enable_switch(settings, params):
+  from openpilot.selfdrive.carrot.server.services.params import clamp_numeric
+  by_name = {p['name']: p for p in params}
+  assert 'CenterToFrontRatioEnabled' not in by_name
+  ratio = by_name['CenterToFrontRatio']
+  assert (ratio['min'], ratio['nonzero_min'], ratio['max'], ratio['default'], ratio['unit']) == (0, 31, 69, 0, 1)
+  assert ratio['display_unit'] == 'percent'
+  assert not ratio.get('detail_parent') and not ratio.get('hidden_brands')
+  assert ratio['risk'] == 'high'
+  keys = PARAMS_KEYS_PATH.read_text(encoding='utf-8')
+  assert '{"CenterToFrontRatio", {PERSISTENT, INT, "0"}}' in keys
+  assert '{"CenterToFrontRatioEnabled", {PERSISTENT, BOOL}}' in keys  # Migration only, no recreated default.
+  categories = build_menu_categories(settings, by_name)
+  section = next(section for category in categories for group in category['groups'] for section in group['sections']
+                 if 'SteerActuatorDelay' in section['items'])
+  assert section['items'].index(ratio['name']) == section['items'].index('SteerActuatorDelay') + 1
+  for raw, expected in ((0, 0), (1, 31), (30, 31), (40, 40), (60, 60), (99, 69)):
+    assert clamp_numeric(raw, ratio) == expected
+  assert clamp_numeric(1, by_name['SteerActuatorDelay']) == 1
+  assert '재시작 없이' in ratio['descr']
+  assert 'without restarting' in ratio['edescr']
+  assert set(ratio['zero_label']) == {'ko', 'en', 'zh'}
+
+
+def test_declared_nonzero_min_and_zero_labels_are_well_formed(params):
+  for item in params:
+    if 'nonzero_min' in item:
+      assert item['min'] == item['default'] == 0
+      assert 0 < item['nonzero_min'] <= item['max']
+      assert set(item['zero_label']) == {'ko', 'en', 'zh'}

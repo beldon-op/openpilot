@@ -78,8 +78,8 @@ _GAP_LANE_ADJACENT = 2
 
 
 class BydDesireHelper(DesireHelper):
-  def __init__(self):
-    super().__init__()
+  def __init__(self, **kwargs):
+    super().__init__(**kwargs)
     # stock floor is 30 KPH; the vendor param replaces it. Init read closes the
     # frame%100 boot window (modeld's first periodic pass lands 5 s in)
     self._read_assist_speed()
@@ -87,8 +87,8 @@ class BydDesireHelper(DesireHelper):
     # discipline; 0 until /data/params/d/BydRadarGapGate is written on-road
     self._read_gap_gate()
 
-  def _read_params(self):
-    super()._read_params()
+  def _update_params_periodic(self):
+    super()._update_params_periodic()
     self._read_assist_speed()
     self._read_gap_gate()
 
