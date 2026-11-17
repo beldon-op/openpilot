@@ -329,8 +329,11 @@ struct CarState {
   # BYD T8 forward-radar gap monitor (docs/byd-radar-010x.md §落地建议/T8,
   # design stats §④e/§④f): 0x109 b7 closing across its HUD-gear band boundary.
   # Telemetry only - consumers behind the BydRadarGapGate param (default off).
-  radarGapClosing @105 :Bool;  # gap ratio r=b7/vEgo crossed the band's lower boundary downward, debounced
-  radarGapNew @106 :Bool;      # target newly became radar-visible (capture leads the HUD gear by >=10 s)
+  # Ordinal @120-122: originally landed at @105-107, but carrot-wip's
+  # turn-signal PR (autoTurnSignalDirection/Status, turnSignalDriver*) already
+  # occupies @105-109. Moved above the current max (@119) to avoid collision.
+  radarGapClosing @120 :Bool;  # gap ratio r=b7/vEgo crossed the band's lower boundary downward, debounced
+  radarGapNew @121 :Bool;      # target newly became radar-visible (capture leads the HUD gear by >=10 s)
   # BYD T8 lane discrimination (byd-radar-multitarget-port stage 3): relative
   # lateral classification of the closing target, hysteresis in radar_gap.py.
   # 0 = unknown (yRel unavailable: slot table off / no row pairs with the b7
@@ -338,7 +341,7 @@ struct CarState {
   # pre-lane conservative semantics; the share of lane==0 frames is the
   # pairing-rate telemetry surface (byd-radar-y-wire-port 2.5/3.5, no new
   # fields); 1 = own lane band; 2 = adjacent lane band.
-  radarGapLane @107 :UInt8;
+  radarGapLane @122 :UInt8;
 
   # Optional original vehicle receive signal. Separate from torque/override.
   struct SteeringTouch {
