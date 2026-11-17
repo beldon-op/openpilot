@@ -14,13 +14,20 @@ v3 起不再有 navi kind：其输入 carrotNavi 即 carrotmate（客户端）�
 数据不回推。
 
 除边沿事件与 frame 外，poller 还维护一份最新状态快照，供 server.py 的 GET /state 与
-WS snapshot 请求做客户端初始化，避免客户端为了拿“当前值”而重引入周期推流：
+WS snapshot 请求做客户端初始化，避免客户端为了拿"当前值"而重引入周期推流：
 
   car/radar 每帧刷新（与 frame 的同名段共用同一构建函数）
   events/opstate/sound  随边沿更新
   meta      每轮心跳（frame 计数 + onroad 标志）——快照整体变旧 = poller 挂了
   services  每轮 SubMaster 健康度——topic seen=false = 数据源进程没跑（offroad 常态）
   panda     随 pandaStates 更新——pandad always_run，offroad 下唯一的活数据源
+
+v5 起 /state 与 WS snapshot 扩展 14 个纯快照段（只进快照，不广播、不补发，
+机制与 meta/services/panda 相同，段未收到过数据不出现）。按本 fork topic 实际
+存在性收敛（见 design D2），SP 独有段（carStateSP/carControlSP/carParamsSP/
+longitudinalPlanSP/modelDataV2SP/backupManagerSP/liveMapDataSP/extrinsicsCalibration/
+lateralTorqueParameters/vehicleParameters/liveLocationKalman）不订阅，对应段结构
+保留 `sp: null` 字段位以稳定客户端解析。
 
 参考实现是 cp_byd local_collector/collector.py；其 10Hz 周期帧不移植（frame 为
 2Hz 状态语义），admin API 也不在 mate 范围内。
@@ -41,7 +48,17 @@ from openpilot.selfdrive.ui.soundd import (
   sound_list,
 )
 
-SERVICES = ["carState", "selfdriveState", "onroadEvents", "carrotMan", "radarState", "pandaStates"]
+SERVICES = [
+  # 事件/状态推导骨干（v1 起即为 frame/边沿事件数据源）
+  "carState", "selfdriveState", "onroadEvents", "carrotMan", "radarState", "pandaStates",
+  # v5 快照段：设备/系统状态
+  "deviceState", "peripheralState", "managerState", "procLog", "temperatureSensor",
+  # v5 快照段：车辆/控制
+  "carParams", "controlsState", "carControl",
+  "longitudinalPlan", "lateralManeuverPlan",
+  # v5 快照段：定位/感知/模型
+  "gpsLocationExternal", "modelV2", "drivingModelData", "cameraOdometry",
+]
 
 EVENT_FLAGS = ("enable", "noEntry", "warning", "userDisable", "softDisable",
                "immediateDisable", "preEnable", "permanent",
@@ -179,6 +196,313 @@ def radar_snapshot(rs) -> dict:
       ("canError", err.canError), ("radarFault", err.radarFault),
       ("wrongConfig", err.wrongConfig),
       ("radarUnavailableTemporary", err.radarUnavailableTemporary)) if on],
+  }
+
+
+# ---------------- v5 纯快照段：设备/系统状态 ----------------
+
+
+def _round_list(values, nd: int = 3) -> list[float]:
+  return [round(float(v), nd) for v in values]
+
+
+def device_snapshot(ds) -> dict:
+  """deviceState → device 段（2Hz）：网络/存储/内存/温度/热状态/风扇/功耗。"""
+  return {
+    "networkType": enum_name(log.DeviceState.NetworkType, ds.networkType.raw),
+    "networkStrength": enum_name(log.DeviceState.NetworkStrength, ds.networkStrength.raw),
+    "networkMetered": ds.networkMetered,
+    "started": ds.started,
+    "freeSpacePercent": round(float(ds.freeSpacePercent), 1),
+    "memoryUsagePercent": int(ds.memoryUsagePercent),
+    "gpuUsagePercent": int(ds.gpuUsagePercent),
+    "cpuUsagePercent": _round_list(ds.cpuUsagePercent, 1),
+    "powerDrawW": round(float(ds.powerDrawW), 2),
+    "somPowerDrawW": round(float(ds.somPowerDrawW), 2),
+    "cpuTempC": _round_list(ds.cpuTempC, 1),
+    "gpuTempC": _round_list(ds.gpuTempC, 1),
+    "memoryTempC": round(float(ds.memoryTempC), 1),
+    "maxTempC": round(float(ds.maxTempC), 1),
+    "thermalZones": [{"name": z.name, "tempC": round(float(z.temp), 1)} for z in ds.thermalZones],
+    "thermalStatus": enum_name(log.DeviceState.ThermalStatus, ds.thermalStatus.raw),
+    "fanSpeedPercentDesired": int(ds.fanSpeedPercentDesired),
+  }
+
+
+def peripheral_snapshot(ps) -> dict:
+  """peripheralState → peripheral 段（2Hz）：panda 电压/电流/风扇转速。"""
+  return {
+    "pandaType": enum_name(log.PandaState.PandaType, ps.pandaType.raw),
+    "voltage": int(ps.voltage),
+    "current": int(ps.current),
+    "fanSpeedRpm": int(ps.fanSpeedRpm),
+  }
+
+
+def manager_snapshot(ms) -> dict:
+  """managerState → manager 段（2Hz）：各进程 running/shouldBeRunning/exitCode。"""
+  return {
+    "processes": [
+      {"name": p.name, "pid": int(p.pid), "running": p.running,
+       "shouldBeRunning": p.shouldBeRunning, "exitCode": int(p.exitCode)}
+      for p in ms.processes
+    ],
+  }
+
+
+def proc_snapshot(pl) -> dict:
+  """procLog → proc 段（0.5Hz）：内存总量 + 逐进程 CPU/内存（运维看板）。"""
+  mem = pl.mem
+  return {
+    "mem": {
+      "totalMb": round(mem.total / 1048576, 1),
+      "freeMb": round(mem.free / 1048576, 1),
+      "availableMb": round(mem.available / 1048576, 1),
+    },
+    "procs": [
+      {"name": p.name, "pid": int(p.pid),
+       "cpuUser": round(float(p.cpuUser), 2), "cpuSystem": round(float(p.cpuSystem), 2),
+       "threads": int(p.numThreads),
+       "rssMb": round(p.memRss / 1048576, 1), "pssMb": round(p.memPss / 1048576, 1)}
+      for p in pl.procs
+    ],
+  }
+
+
+def temp_snapshot(e) -> dict:
+  """temperatureSensor → temp 段（2Hz）。匿名 union 未选中温度分支时 pycapnp 抛异常，
+  兜底为 None（客户端判读为无效）。"""
+  try:
+    temperature = round(float(e.temperature), 2)
+  except Exception:
+    temperature = None
+  return {
+    "timestamp": int(e.timestamp),
+    "source": enum_name(log.SensorEventData.SensorSource, e.source.raw),
+    "temperatureC": temperature,
+  }
+
+
+# ---------------- v5 纯快照段：车辆/控制 ----------------
+
+
+def car_params_snapshot(cp) -> dict:
+  """carParams → carParams 段（0.02Hz 静态车辆身份/动力学参数）。本 fork 无
+  carParamsSP topic，sp 子对象填 null（design D2 字段位保留策略）。"""
+  return {
+    "brand": str(cp.brand or ""),
+    "carFingerprint": str(cp.carFingerprint or ""),
+    "fuzzyFingerprint": cp.fuzzyFingerprint,
+    "carVin": str(cp.carVin or ""),
+    "passive": cp.passive,
+    "pcmCruise": cp.pcmCruise,
+    "flags": int(cp.flags),
+    "minEnableSpeed": round(float(cp.minEnableSpeed), 2),
+    "minSteerSpeed": round(float(cp.minSteerSpeed), 2),
+    "maxLateralAccel": round(float(cp.maxLateralAccel), 2),
+    "wheelbase": round(float(cp.wheelbase), 3),
+    "centerToFront": round(float(cp.centerToFront), 3),
+    "steerRatio": round(float(cp.steerRatio), 3),
+    "steerControlType": enum_name(car.CarParams.SteerControlType, cp.steerControlType.raw),
+    "radarUnavailable": cp.radarUnavailable,
+    "steerActuatorDelay": round(float(cp.steerActuatorDelay), 3),
+    "longitudinalActuatorDelay": round(float(cp.longitudinalActuatorDelay), 3),
+    "openpilotLongitudinalControl": cp.openpilotLongitudinalControl,
+    "transmissionType": enum_name(car.CarParams.TransmissionType, cp.transmissionType.raw),
+    "networkLocation": enum_name(car.CarParams.NetworkLocation, cp.networkLocation.raw),
+    "sp": None,
+  }
+
+
+def controls_snapshot(cs) -> dict:
+  """controlsState → controls 段（100Hz 快照取最新）。本仓 ControlsState 的 state/alert
+  字段在 deprecated group 下（carrot 树遗留布局），此处按既有路径读取。"""
+  dep = cs.deprecated
+  return {
+    "state": enum_name(log.SelfdriveState.OpenpilotState, dep.state.raw),
+    "enabled": dep.enabled,
+    "active": dep.active,
+    "alertText1": str(dep.alertText1 or ""),
+    "alertText2": str(dep.alertText2 or ""),
+    "alertType": str(dep.alertType or ""),
+    "alertStatus": enum_name(log.SelfdriveState.AlertStatus, dep.alertStatus.raw),
+    "alertSize": enum_name(log.SelfdriveState.AlertSize, dep.alertSize.raw),
+    "alertSound": enum_name(car.CarControl.HUDControl.AudibleAlert, dep.alertSound2.raw),
+    "longControlState": enum_name(car.CarControl.Actuators.LongControlState, cs.longControlState.raw),
+    "curvature": round(float(cs.curvature), 5),
+    "desiredCurvature": round(float(cs.desiredCurvature), 5),
+    "forceDecel": cs.forceDecel,
+    "decelForTurn": dep.decelForTurn,
+    "decelForModel": dep.decelForModel,
+  }
+
+
+def control_snapshot(cc) -> dict:
+  """carControl → control 段（100Hz 快照取最新）：op 实际下发执行器指令与 HUD 提示。
+  本 fork 无 carControlSP topic，mads 子对象填 null。"""
+  a = cc.actuators
+  hud = cc.hudControl
+  cruise = cc.cruiseControl
+  return {
+    "enabled": cc.enabled,
+    "latActive": cc.latActive,
+    "longActive": cc.longActive,
+    "leftBlinker": cc.leftBlinker,
+    "rightBlinker": cc.rightBlinker,
+    "currentCurvature": round(float(cc.currentCurvature), 5),
+    "actuators": {
+      "torque": round(float(a.torque), 4),
+      "steeringAngleDeg": round(float(a.steeringAngleDeg), 2),
+      "curvature": round(float(a.curvature), 5),
+      "accel": round(float(a.accel), 3),
+      "jerk": round(float(a.jerk), 3),
+      "gas": round(float(a.gas), 3),
+      "brake": round(float(a.brake), 3),
+      "torqueOutputCan": round(float(a.torqueOutputCan), 2),
+      "speed": round(float(a.speed), 2),
+      "longControlState": enum_name(car.CarControl.Actuators.LongControlState, a.longControlState.raw),
+    },
+    "hud": {
+      "setSpeed": round(float(hud.setSpeed), 2),
+      "speedVisible": hud.speedVisible,
+      "lanesVisible": hud.lanesVisible,
+      "leadVisible": hud.leadVisible,
+      "leftLaneVisible": hud.leftLaneVisible,
+      "rightLaneVisible": hud.rightLaneVisible,
+      "leftLaneDepart": hud.leftLaneDepart,
+      "rightLaneDepart": hud.rightLaneDepart,
+      "visualAlert": enum_name(car.CarControl.HUDControl.VisualAlert, hud.visualAlert.raw),
+      "leadDistanceBars": int(hud.leadDistanceBars),
+    },
+    "cruise": {"cancel": cruise.cancel, "resume": cruise.resume, "override": cruise.override},
+    "mads": None,
+  }
+
+
+def plan_snapshot(lp, lmp) -> dict:
+  """longitudinalPlan + lateralManeuverPlan → plan 段（20Hz）。accels/speeds/jerks
+  为未来 2.5s 规划序列；desiredCurvature 取自 lateralManeuverPlan。本 fork 无
+  longitudinalPlanSP，sp 子对象填 null。"""
+  return {
+    "hasLead": lp.hasLead,
+    "fcw": lp.fcw,
+    "source": enum_name(log.LongitudinalPlan.LongitudinalPlanSource, lp.longitudinalPlanSource.raw),
+    "aTarget": round(float(lp.aTarget), 3),
+    "shouldStop": lp.shouldStop,
+    "allowThrottle": lp.allowThrottle,
+    "allowBrake": lp.allowBrake,
+    "accels": _round_list(lp.accels),
+    "speeds": _round_list(lp.speeds),
+    "jerks": _round_list(lp.jerks),
+    "processingDelay": round(float(lp.processingDelay), 3),
+    "solverExecutionTime": round(float(lp.solverExecutionTime), 3),
+    "desiredCurvature": round(float(lmp.desiredCurvature), 5),
+    "sp": None,
+  }
+
+
+# ---------------- v5 纯快照段：定位/感知/模型 ----------------
+
+
+def gps_snapshot(g) -> dict:
+  """gpsLocationExternal → gps 段（10Hz 原始 GNSS 兜底）。speed m/s、bearingDeg 度。"""
+  return {
+    "latitude": round(float(g.latitude), 7),
+    "longitude": round(float(g.longitude), 7),
+    "altitude": round(float(g.altitude), 2),
+    "speed": round(float(g.speed), 3),
+    "bearingDeg": round(float(g.bearingDeg), 2),
+    "horizontalAccuracy": round(float(g.horizontalAccuracy), 2),
+    "verticalAccuracy": round(float(g.verticalAccuracy), 2),
+    "bearingAccuracyDeg": round(float(g.bearingAccuracyDeg), 2),
+    "speedAccuracy": round(float(g.speedAccuracy), 2),
+    "unixTimestampMillis": int(g.unixTimestampMillis),
+    "source": enum_name(log.GpsLocationData.SensorSource, g.source.raw),
+    "vNED": _round_list(g.vNED),
+    "hasFix": g.hasFix,
+    "satelliteCount": int(g.satelliteCount),
+  }
+
+
+def _lead_summary(l) -> dict:
+  """LeadDataV3 取 t=0 首采样摘要（完整逐点序列体积大，不进快照）。"""
+  def _first(values, nd: int = 3) -> float:
+    vals = list(values)
+    return round(float(vals[0]), nd) if vals else 0.0
+  return {
+    "prob": round(float(l.prob), 3),
+    "probTime": round(float(l.probTime), 2),
+    "t": _first(l.t, 2),
+    "x": _first(l.x, 2),
+    "y": _first(l.y, 2),
+    "v": _first(l.v, 2),
+    "a": _first(l.a, 2),
+  }
+
+
+def model_snapshot(m) -> dict:
+  """modelV2 → model 段（20Hz）。leads 只留 t=0 首采样；本 fork 无
+  modelDataV2SP，sp 子对象填 null。"""
+  return {
+    "frameId": int(m.frameId),
+    "frameDropPerc": round(float(m.frameDropPerc), 1),
+    "modelExecutionTime": round(float(m.modelExecutionTime), 3),
+    "big": m.big,
+    "confidence": enum_name(log.ModelDataV2.ConfidenceClass, m.confidence.raw),
+    "engagedProb": round(float(m.meta.engagedProb), 3),
+    "hardBrakePredicted": m.meta.hardBrakePredicted,
+    "laneChangeState": enum_name(log.LaneChangeState, m.meta.laneChangeState.raw),
+    "laneChangeDirection": enum_name(log.LaneChangeDirection, m.meta.laneChangeDirection.raw),
+    "action": {
+      "desiredCurvature": round(float(m.action.desiredCurvature), 5),
+      "desiredAcceleration": round(float(m.action.desiredAcceleration), 3),
+      "shouldStop": m.action.shouldStop,
+    },
+    "laneLineProbs": _round_list(m.laneLineProbs),
+    "laneLineStds": _round_list(m.laneLineStds),
+    "leads": [_lead_summary(l) for l in m.leadsV3],
+    "sp": None,
+  }
+
+
+def dmodel_snapshot(dm) -> dict:
+  """drivingModelData → dmodel 段（20Hz UI 驾驶模型）。path 为多项式系数（非逐点）。"""
+  return {
+    "frameId": int(dm.frameId),
+    "frameDropPerc": round(float(dm.frameDropPerc), 1),
+    "modelExecutionTime": round(float(dm.modelExecutionTime), 3),
+    "big": dm.big,
+    "action": {
+      "desiredCurvature": round(float(dm.action.desiredCurvature), 5),
+      "desiredAcceleration": round(float(dm.action.desiredAcceleration), 3),
+      "shouldStop": dm.action.shouldStop,
+    },
+    "laneLineMeta": {
+      "leftY": round(float(dm.laneLineMeta.leftY), 2),
+      "rightY": round(float(dm.laneLineMeta.rightY), 2),
+      "leftProb": round(float(dm.laneLineMeta.leftProb), 3),
+      "rightProb": round(float(dm.laneLineMeta.rightProb), 3),
+    },
+    "laneChangeState": enum_name(log.LaneChangeState, dm.meta.laneChangeState.raw),
+    "laneChangeDirection": enum_name(log.LaneChangeDirection, dm.meta.laneChangeDirection.raw),
+    "path": {
+      "x": _round_list(dm.path.xCoefficients, 4),
+      "y": _round_list(dm.path.yCoefficients, 4),
+      "z": _round_list(dm.path.zCoefficients, 4),
+    },
+  }
+
+
+def odom_snapshot(co) -> dict:
+  """cameraOdometry → odom 段（20Hz 视觉里程计）。"""
+  return {
+    "frameId": int(co.frameId),
+    "trans": _round_list(co.trans),
+    "rot": _round_list(co.rot),
+    "transStd": _round_list(co.transStd),
+    "rotStd": _round_list(co.rotStd),
+    "wideFromDeviceEuler": _round_list(co.wideFromDeviceEuler),
+    "wideFromDeviceEulerStd": _round_list(co.wideFromDeviceEulerStd),
   }
 
 
@@ -401,6 +725,36 @@ class MatePoller:
       # carrot 遥测：20Hz 输入随轮喂 frame 窗口（协议 v4 carrot 段）；不进快照
       if sm.updated["carrotMan"]:
         ticker.carrot = carrot_snapshot(sm["carrotMan"])
+
+      # v5 纯快照段：只进 /state 与 WS snapshot（set_state），不进事件流。
+      # 高频 topic（100Hz）快照取最新值，与 car/radar 段同模式（O(1) 字典写入）；
+      # 多 topic 合成段（carParams/control/plan/model）任一来源更新即重建。
+      if sm.updated["deviceState"]:
+        self.set_state("device", device_snapshot(sm["deviceState"]))
+      if sm.updated["peripheralState"]:
+        self.set_state("peripheral", peripheral_snapshot(sm["peripheralState"]))
+      if sm.updated["managerState"]:
+        self.set_state("manager", manager_snapshot(sm["managerState"]))
+      if sm.updated["procLog"]:
+        self.set_state("proc", proc_snapshot(sm["procLog"]))
+      if sm.updated["temperatureSensor"]:
+        self.set_state("temp", temp_snapshot(sm["temperatureSensor"]))
+      if sm.updated["carParams"]:
+        self.set_state("carParams", car_params_snapshot(sm["carParams"]))
+      if sm.updated["controlsState"]:
+        self.set_state("controls", controls_snapshot(sm["controlsState"]))
+      if sm.updated["carControl"]:
+        self.set_state("control", control_snapshot(sm["carControl"]))
+      if sm.updated["longitudinalPlan"] or sm.updated["lateralManeuverPlan"]:
+        self.set_state("plan", plan_snapshot(sm["longitudinalPlan"], sm["lateralManeuverPlan"]))
+      if sm.updated["gpsLocationExternal"]:
+        self.set_state("gps", gps_snapshot(sm["gpsLocationExternal"]))
+      if sm.updated["modelV2"]:
+        self.set_state("model", model_snapshot(sm["modelV2"]))
+      if sm.updated["drivingModelData"]:
+        self.set_state("dmodel", dmodel_snapshot(sm["drivingModelData"]))
+      if sm.updated["cameraOdometry"]:
+        self.set_state("odom", odom_snapshot(sm["cameraOdometry"]))
 
       payload = ticker.tick(now)
       if payload:
