@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import concurrent.futures
 import hashlib
 import itertools
 import json
@@ -7,6 +8,7 @@ import os
 from pathlib import Path
 import struct
 import subprocess
+import threading
 import time
 from collections.abc import Generator
 from urllib.parse import urlsplit
@@ -26,6 +28,11 @@ VERIFY_FLASH_MAX_ATTEMPTS = 3
 DOWNLOAD_RETRY_ATTEMPTS = 5
 DOWNLOAD_RETRY_DELAY = 10.0
 DOWNLOAD_REQUEST_TIMEOUT = (10, 60)
+# Large images (system ~1 GB compressed) are bottlenecked by a single TCP flow to
+# the CDN. Split big downloads into parallel byte-range chunks to saturate the
+# link; small partitions (xbl/boot) stay on the original single-stream path.
+PARALLEL_MIN_SIZE = 50 * 1024 * 1024
+PARALLEL_CHUNKS = int(os.getenv("AGNOS_DOWNLOAD_CHUNKS", "8"))
 
 
 def manifest_digest(manifest_path: str | Path) -> str:
@@ -146,6 +153,82 @@ def file_checksum(path: Path) -> str:
   return digest.hexdigest()
 
 
+def _parallel_download(url: str, dest: Path, total_size: int, cloudlog) -> None:
+  """Download a large URL into dest using parallel byte-range chunks.
+
+  Each chunk is fetched independently so a single slow CDN edge flow does not
+  cap throughput. Chunks are written to their own .partNN files and joined in
+  order; partial progress per chunk is kept so a retry resumes instead of
+  restarting from zero.
+  """
+  chunk_size = max(1, (total_size + PARALLEL_CHUNKS - 1) // PARALLEL_CHUNKS)
+  ranges = []
+  for i in range(PARALLEL_CHUNKS):
+    start = i * chunk_size
+    if start >= total_size:
+      break
+    end = min(start + chunk_size - 1, total_size - 1)
+    ranges.append((i, start, end))
+
+  chunk_paths = [dest.with_suffix(f".part{i}") for i in range(len(ranges))]
+  progress = [0] * len(ranges)
+  progress_lock = threading.Lock()
+
+  def fetch(idx: int, start: int, end: int, chunk_path: Path) -> None:
+    have = chunk_path.stat().st_size if chunk_path.is_file() else 0
+    cur = start + have
+    headers = {'Accept-Encoding': None}
+    if have:
+      headers['Range'] = f"bytes={cur}-{end}"
+    last_reported = -1
+    while True:
+      try:
+        resp = requests.get(url, stream=True, headers=headers, timeout=DOWNLOAD_REQUEST_TIMEOUT)
+        if have and resp.status_code != 206:
+          # Server ignored resume; restart this chunk from its start.
+          have = 0
+          cur = start
+          chunk_path.unlink(missing_ok=True)
+          headers = {'Accept-Encoding': None}
+          resp = requests.get(url, stream=True, headers=headers, timeout=DOWNLOAD_REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        with chunk_path.open("ab" if have else "wb") as out:
+          for block in resp.iter_content(chunk_size=512 * 1024):
+            if not block:
+              continue
+            out.write(block)
+            with progress_lock:
+              progress[idx] += len(block)
+              done = sum(progress)
+              p = int(done / total_size * 100)
+              if p != last_reported:
+                last_reported = p
+                report_progress(f"Downloading ({PARALLEL_CHUNKS}x)", p)
+        resp.close()
+        if chunk_path.stat().st_size == (end - start + 1):
+          return
+        # Short read; loop to resume.
+        have = chunk_path.stat().st_size
+        cur = start + have
+        headers['Range'] = f"bytes={cur}-{end}"
+      except requests.RequestException:
+        time.sleep(DOWNLOAD_RETRY_DELAY)
+
+  with concurrent.futures.ThreadPoolExecutor(max_workers=len(ranges)) as pool:
+    futures = [pool.submit(fetch, i, s, e, cp) for (i, s, e), cp in zip(ranges, chunk_paths)]
+    for f in concurrent.futures.as_completed(futures):
+      f.result()  # propagate any exception
+
+  with dest.open("wb") as out:
+    for cp in chunk_paths:
+      with cp.open("rb") as src:
+        for block in iter(lambda: src.read(1024 * 1024), b""):
+          out.write(block)
+      cp.unlink(missing_ok=True)
+  dest.flush()
+  os.fsync(dest.fileno())
+
+
 def download_to_cache(partition: dict, cloudlog) -> Path | None:
   compressed_hash = partition.get("compressed_hash")
   if not isinstance(compressed_hash, str):
@@ -160,10 +243,27 @@ def download_to_cache(partition: dict, cloudlog) -> Path | None:
     cloudlog.warning(f"Discarding invalid cached {partition['name']} image")
     final_path.unlink()
 
-  offset = partial_path.stat().st_size if partial_path.is_file() else 0
   expected_size = partition.get("compressed_size")
   if not isinstance(expected_size, int):
     expected_size = None
+
+  # Large images: parallel chunked download into partial_path, then validate.
+  if expected_size is not None and expected_size >= PARALLEL_MIN_SIZE:
+    cloudlog.info(f"Parallel-downloading {partition['name']} ({expected_size} bytes, {PARALLEL_CHUNKS} chunks)")
+    report_progress(f"Connecting for {partition['name']}", 0)
+    _parallel_download(partition['url'], partial_path, expected_size, cloudlog)
+    if partial_path.stat().st_size != expected_size:
+      raise requests.ConnectionError(
+        f"Incomplete {partition['name']} download: {partial_path.stat().st_size} of {expected_size} bytes"
+      )
+    actual_hash = file_checksum(partial_path)
+    if actual_hash.lower() != compressed_hash.lower():
+      partial_path.unlink(missing_ok=True)
+      raise requests.ConnectionError(f"Compressed {partition['name']} cache hash mismatch: {actual_hash}")
+    os.replace(partial_path, final_path)
+    return final_path
+
+  offset = partial_path.stat().st_size if partial_path.is_file() else 0
   if expected_size is not None and offset >= expected_size:
     if offset == expected_size and file_checksum(partial_path).lower() == compressed_hash.lower():
       os.replace(partial_path, final_path)
