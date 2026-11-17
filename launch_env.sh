@@ -21,6 +21,15 @@ fi
 
 export STAGING_ROOT="/data/safe_staging"
 
+# AGNOS's /home is a tiny read-write overlay (100M on older tici 12.4 units).
+# uv's default cache lives there and fills it, which makes dependency installs
+# fail with "No space left on device" during the interpreter probe. /data has
+# ample space, so keep the uv cache there on device. Desktop/dev is unaffected.
+if [ -f /AGNOS ] && [ -d /data ]; then
+  export UV_CACHE_DIR="${UV_CACHE_DIR:-/data/.cache/uv}"
+  mkdir -p "$UV_CACHE_DIR" 2>/dev/null || true
+fi
+
 # BYD Song Plus DM-i: the DiPilot camera (MPC) faults with 'check multifunction
 # video controller' when it sees the UDS/isotp firmware-query frames that card
 # broadcasts on the powertrain bus during startup (relayed to bus 2 by the
