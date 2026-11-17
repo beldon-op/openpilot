@@ -195,21 +195,6 @@ function agnos_init {
     echo "MANIFEST=${MANIFEST}"
     echo "MODEL=${MODEL}"
 
-    # Some tici/C3 units still run an older but supported AGNOS (e.g. 12.4 on
-    # glibc 2.39). Their native toolchain plus this repo's bundled offline
-    # wheels are enough to build and run, so do not force a full A/B reflash on
-    # every boot -- that updater-UI loop is what presented as a stuck comma
-    # splash. Only these allowlisted legacy versions skip the upgrade; every
-    # other mismatch still goes through the normal updater below.
-    CURRENT_VERSION="$(tr -d '\000\r\n' 2>/dev/null < /VERSION)"
-    case "${MODEL}:${CURRENT_VERSION}" in
-      tici:12.4|c3:12.4)
-        echo "AGNOS ${CURRENT_VERSION} on ${MODEL} is a supported legacy release; skipping forced upgrade to ${AGNOS_VERSION}."
-        rm -f "$AGNOS_UPDATE_CONFIRMATION_FILE"
-        return 0
-        ;;
-    esac
-
     # A completed inactive slot only needs activation and a reboot. Check this
     # before any network or standalone-UI dependency work.
     if python3 "$AGNOS_PY" --verify "$MANIFEST"; then
